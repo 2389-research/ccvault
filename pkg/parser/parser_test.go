@@ -131,7 +131,7 @@ func TestParseTimestamp(t *testing.T) {
 
 func TestParseSessionReader(t *testing.T) {
 	input := `{"type":"file-history-snapshot","messageId":"msg1","snapshot":{}}
-{"uuid":"turn1","sessionId":"session1","type":"user","timestamp":"2026-02-02T20:00:00.000Z","message":{"role":"user","content":"Hello"}}
+{"uuid":"turn1","sessionId":"session1","type":"user","cwd":"/Users/harper/p/my-project","timestamp":"2026-02-02T20:00:00.000Z","message":{"role":"user","content":"Hello"}}
 {"uuid":"turn2","sessionId":"session1","type":"assistant","timestamp":"2026-02-02T20:01:00.000Z","message":{"model":"claude-opus-4-5-20251101","role":"assistant","content":[{"type":"text","text":"Hi there!"}],"usage":{"input_tokens":10,"output_tokens":5}}}`
 
 	turns, session, _, err := ParseSessionReader(strings.NewReader(input), "/test/session.jsonl")
@@ -161,6 +161,10 @@ func TestParseSessionReader(t *testing.T) {
 
 	if session.SourceFile != "/test/session.jsonl" {
 		t.Errorf("Expected source file /test/session.jsonl, got %s", session.SourceFile)
+	}
+
+	if session.ProjectPath != "/Users/harper/p/my-project" {
+		t.Errorf("Expected project path /Users/harper/p/my-project, got %s", session.ProjectPath)
 	}
 }
 
@@ -278,9 +282,9 @@ func TestGetDisplayName(t *testing.T) {
 		input    string
 		expected string
 	}{
-		{"/Users/harper/Public/src/2389/ccvault", "src/2389/ccvault"},
-		{"/short/path", "/short/path"},
-		{"/a/b/c/d/e", "c/d/e"},
+		{"/Users/harper/Public/src/2389/ccvault", "ccvault"},
+		{"/Users/harper/p/canvas-jira-summarizer", "canvas-jira-summarizer"},
+		{"/short/path", "path"},
 	}
 
 	for _, tc := range tests {

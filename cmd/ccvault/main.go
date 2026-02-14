@@ -23,6 +23,7 @@ import (
 	"github.com/2389-research/ccvault/internal/db"
 	"github.com/2389-research/ccvault/internal/export"
 	"github.com/2389-research/ccvault/internal/mcp"
+	"github.com/2389-research/ccvault/pkg/parser"
 	"github.com/2389-research/ccvault/internal/search"
 	"github.com/2389-research/ccvault/internal/sync"
 	"github.com/2389-research/ccvault/internal/tui"
@@ -475,8 +476,8 @@ Supports Gmail-like query syntax:
 
 		fmt.Printf("Found %d results:\n\n", len(results))
 		for i, r := range results {
-			fmt.Printf("%d. [%s] %s\n", i+1, r.Turn.Type, r.Turn.Timestamp.Format("2006-01-02 15:04"))
-			fmt.Printf("   Project: %s\n", r.ProjectPath)
+			fmt.Printf("%d. [%s] %s  Session: %s\n", i+1, r.Turn.Type, r.Turn.Timestamp.Format("2006-01-02 15:04"), r.Turn.SessionID)
+			fmt.Printf("   Project: %s\n", parser.GetDisplayName(r.ProjectPath))
 			if r.Model != "" {
 				fmt.Printf("   Model: %s\n", r.Model)
 			}
@@ -605,15 +606,24 @@ var listProjectsCmd = &cobra.Command{
 			return nil
 		}
 
-		fmt.Printf("%-50s %8s %10s %12s\n", "PROJECT", "SESSIONS", "TOKENS", "LAST ACTIVE")
-		fmt.Println(strings.Repeat("-", 85))
+		home, _ := os.UserHomeDir()
+
+		fmt.Printf("%-30s %-40s %8s %10s %12s\n", "PROJECT", "PATH", "SESSIONS", "TOKENS", "LAST ACTIVE")
+		fmt.Println(strings.Repeat("-", 105))
 		for _, p := range projects {
 			name := p.DisplayName
-			if len(name) > 48 {
-				name = "..." + name[len(name)-45:]
+			if len(name) > 28 {
+				name = "..." + name[len(name)-25:]
+			}
+			path := p.Path
+			if home != "" && strings.HasPrefix(path, home) {
+				path = "~" + path[len(home):]
+			}
+			if len(path) > 38 {
+				path = "..." + path[len(path)-35:]
 			}
 			lastActive := p.LastActivityAt.Format("2006-01-02")
-			fmt.Printf("%-50s %8d %10s %12s\n", name, p.SessionCount, formatTokens(p.TotalTokens), lastActive)
+			fmt.Printf("%-30s %-40s %8d %10s %12s\n", name, path, p.SessionCount, formatTokens(p.TotalTokens), lastActive)
 		}
 
 		return nil
@@ -683,16 +693,21 @@ var listSessionsCmd = &cobra.Command{
 			return nil
 		}
 
-		fmt.Printf("%-38s %16s %6s %10s %s\n", "SESSION ID", "STARTED", "TURNS", "TOKENS", "MODEL")
-		fmt.Println(strings.Repeat("-", 100))
+		fmt.Printf("%-38s %-25s %16s %6s %10s %s\n", "SESSION ID", "PROJECT", "STARTED", "TURNS", "TOKENS", "MODEL")
+		fmt.Println(strings.Repeat("-", 125))
 		for _, s := range sessions {
+			project := parser.GetDisplayName(s.ProjectPath)
+			if len(project) > 23 {
+				project = "..." + project[len(project)-20:]
+			}
 			model := s.Model
 			if len(model) > 25 {
 				model = model[:22] + "..."
 			}
 			tokens := s.InputTokens + s.OutputTokens
-			fmt.Printf("%-38s %16s %6d %10s %s\n",
+			fmt.Printf("%-38s %-25s %16s %6d %10s %s\n",
 				s.ID,
+				project,
 				s.StartedAt.Format("2006-01-02 15:04"),
 				s.TurnCount,
 				formatTokens(tokens),

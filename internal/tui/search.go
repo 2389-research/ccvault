@@ -5,6 +5,7 @@ package tui
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/2389-research/ccvault/internal/db"
@@ -155,13 +156,13 @@ func (m *SearchModel) Update(msg tea.Msg) tea.Cmd {
 				m.ensureVisible()
 			}
 
-		case "home", "g":
+		case "home":
 			if !m.focused && len(m.results) > 0 {
 				m.cursor = 0
 				m.offset = 0
 			}
 
-		case "end", "G":
+		case "end":
 			if !m.focused && len(m.results) > 0 {
 				m.cursor = len(m.results) - 1
 				m.ensureVisible()
@@ -172,6 +173,19 @@ func (m *SearchModel) Update(msg tea.Msg) tea.Cmd {
 				var cmd tea.Cmd
 				m.input, cmd = m.input.Update(msg)
 				return cmd
+			}
+			// vim-style navigation when not typing
+			switch msg.String() {
+			case "g":
+				if len(m.results) > 0 {
+					m.cursor = 0
+					m.offset = 0
+				}
+			case "G":
+				if len(m.results) > 0 {
+					m.cursor = len(m.results) - 1
+					m.ensureVisible()
+				}
 			}
 		}
 
@@ -307,12 +321,7 @@ func (m *SearchModel) View() string {
 					turnType = "asst"
 				}
 
-				project := r.ProjectPath
-				// Show just the last 2 path components
-				parts := strings.Split(project, "/")
-				if len(parts) > 2 {
-					project = strings.Join(parts[len(parts)-2:], "/")
-				}
+				project := filepath.Base(r.ProjectPath)
 				if len(project) > 25 {
 					project = "..." + project[len(project)-22:]
 				}

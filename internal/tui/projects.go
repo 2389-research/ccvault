@@ -5,6 +5,7 @@ package tui
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/2389-research/ccvault/internal/db"
@@ -139,9 +140,11 @@ func (m *ProjectsModel) View() string {
 		b.WriteString("\n")
 	} else {
 		// Header
-		header := fmt.Sprintf("%-50s %-12s %8s %10s %12s", "PROJECT", "SOURCE", "SESSIONS", "TOKENS", "LAST ACTIVE")
+		header := fmt.Sprintf("%-24s %-32s %-12s %8s %10s %12s", "PROJECT", "PATH", "SOURCE", "SESSIONS", "TOKENS", "LAST ACTIVE")
 		b.WriteString(headerStyle.Render(header))
 		b.WriteString("\n")
+
+		home, _ := os.UserHomeDir()
 
 		// List
 		visibleRows := m.visibleRows()
@@ -153,18 +156,24 @@ func (m *ProjectsModel) View() string {
 		for i := m.offset; i < end; i++ {
 			p := m.projects[i]
 			name := p.DisplayName
-			if len(name) > 48 {
-				name = "..." + name[len(name)-45:]
+			if len(name) > 22 {
+				name = "..." + name[len(name)-19:]
 			}
-			lastActive := p.LastActivityAt.Format("2006-01-02")
-
+			path := p.Path
+			if home != "" && strings.HasPrefix(path, home) {
+				path = "~" + path[len(home):]
+			}
+			if len(path) > 30 {
+				path = "..." + path[len(path)-27:]
+			}
 			source := p.Source
 			if len(source) > 10 {
 				source = source[:10] + ".."
 			}
+			lastActive := p.LastActivityAt.Format("2006-01-02")
 
-			line := fmt.Sprintf("%-50s %-12s %8d %10s %12s",
-				name, source, p.SessionCount, formatTokensPlain(p.TotalTokens), lastActive)
+			line := fmt.Sprintf("%-24s %-32s %-12s %8d %10s %12s",
+				name, path, source, p.SessionCount, formatTokensPlain(p.TotalTokens), lastActive)
 
 			if i == m.cursor {
 				b.WriteString(selectedStyle.Render(line))

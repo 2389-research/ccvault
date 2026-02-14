@@ -147,22 +147,9 @@ func isValidUUID(s string) bool {
 	return true
 }
 
-// GetDisplayName creates a short display name from a project path
+// GetDisplayName returns the last path component as the project name
 func GetDisplayName(projectPath string) string {
-	// Remove home directory prefix
-	home, _ := os.UserHomeDir()
-	if strings.HasPrefix(projectPath, home) {
-		projectPath = "~" + projectPath[len(home):]
-	}
-
-	// Take last 2-3 path components for display
-	parts := strings.Split(projectPath, "/")
-	if len(parts) <= 3 {
-		return projectPath
-	}
-
-	// Return last 3 components
-	return strings.Join(parts[len(parts)-3:], "/")
+	return filepath.Base(projectPath)
 }
 
 // ScanHistory reads the global history.jsonl file

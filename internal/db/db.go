@@ -71,6 +71,23 @@ func (db *DB) Close() error {
 	return db.DB.Close()
 }
 
+// ResetAll deletes all data from all tables for a clean full resync.
+// Schema (tables, triggers, FTS index) is left in place — migrations own
+// its lifecycle. Deleting turns cascades to turns_fts via the AFTER DELETE
+// trigger, so no FTS drop is needed here.
+func (db *DB) ResetAll() error {
+	// Delete data in child-to-parent order so foreign-key-like invariants hold
+	// (turns before sessions, sessions before projects, etc.)
+	tables := []string{"tool_uses", "turns", "sessions", "projects", "source_files"}
+	for _, table := range tables {
+		if _, err := db.Exec("DELETE FROM " + table); err != nil {
+			return fmt.Errorf("delete from %s: %w", table, err)
+		}
+	}
+
+	return nil
+}
+
 // BeginTx starts a new transaction
 func (db *DB) BeginTx() (*sql.Tx, error) {
 	return db.Begin()

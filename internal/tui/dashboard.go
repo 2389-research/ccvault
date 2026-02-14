@@ -5,6 +5,7 @@ package tui
 
 import (
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -204,14 +205,22 @@ func (m *DashboardModel) View() string {
 
 	// Top projects
 	if len(m.topProjects) > 0 {
+		home, _ := os.UserHomeDir()
 		b.WriteString(lipgloss.NewStyle().Bold(true).Render("Recent Projects"))
 		b.WriteString("\n")
 		for _, p := range m.topProjects {
 			name := p.DisplayName
-			if len(name) > 40 {
-				name = "..." + name[len(name)-37:]
+			if len(name) > 22 {
+				name = "..." + name[len(name)-19:]
 			}
-			b.WriteString(normalStyle.Render(fmt.Sprintf("  %-42s %3d sessions", name, p.SessionCount)))
+			path := p.Path
+			if home != "" && strings.HasPrefix(path, home) {
+				path = "~" + path[len(home):]
+			}
+			if len(path) > 35 {
+				path = "..." + path[len(path)-32:]
+			}
+			b.WriteString(normalStyle.Render(fmt.Sprintf("  %-24s %-37s %3d sessions", name, path, p.SessionCount)))
 			b.WriteString("\n")
 		}
 		b.WriteString("\n")
