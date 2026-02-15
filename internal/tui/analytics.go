@@ -390,19 +390,9 @@ func (m *AnalyticsModel) renderTopProjects() string {
 			name = "..." + name[len(name)-19:]
 		}
 		path := p.ProjectPath
-<<<<<<< Updated upstream
-		if home != "" && strings.HasPrefix(path, home) {
-			path = "~" + path[len(home):]
-		}
-||||||| Stash base
- 		if home != "" && (path == home || strings.HasPrefix(path, home+string(os.PathSeparator))) {
- 			path = "~" + path[len(home):]
- 		}
-=======
 		if home != "" && (path == home || strings.HasPrefix(path, home+string(os.PathSeparator))) {
 			path = "~" + path[len(home):]
 		}
->>>>>>> Stashed changes
 		if len(path) > 28 {
 			path = "..." + path[len(path)-25:]
 		}

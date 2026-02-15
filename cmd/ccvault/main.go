@@ -23,10 +23,10 @@ import (
 	"github.com/2389-research/ccvault/internal/db"
 	"github.com/2389-research/ccvault/internal/export"
 	"github.com/2389-research/ccvault/internal/mcp"
-	"github.com/2389-research/ccvault/pkg/parser"
 	"github.com/2389-research/ccvault/internal/search"
 	"github.com/2389-research/ccvault/internal/sync"
 	"github.com/2389-research/ccvault/internal/tui"
+	"github.com/2389-research/ccvault/pkg/parser"
 	"github.com/spf13/cobra"
 )
 
