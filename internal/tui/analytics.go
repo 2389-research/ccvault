@@ -1,11 +1,10 @@
 // ABOUTME: Analytics view for ccvault TUI
-// ABOUTME: Shows DuckDB-powered usage statistics and trends
+// ABOUTME: Shows usage statistics and trends
 
 package tui
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -21,7 +20,6 @@ import (
 // AnalyticsModel holds analytics view state
 type AnalyticsModel struct {
 	db          *db.DB
-	cacheDir    string
 	width       int
 	height      int
 	loading     bool
@@ -45,11 +43,10 @@ const (
 var tabNames = []string{"Summary", "Daily Usage", "Top Projects", "By Model"}
 
 // NewAnalyticsModel creates a new analytics model
-func NewAnalyticsModel(database *db.DB, cacheDir string) *AnalyticsModel {
+func NewAnalyticsModel(database *db.DB) *AnalyticsModel {
 	return &AnalyticsModel{
-		db:       database,
-		cacheDir: cacheDir,
-		loading:  true,
+		db:      database,
+		loading: true,
 	}
 }
 
@@ -67,20 +64,7 @@ type analyticsLoadedMsg struct {
 }
 
 func (m *AnalyticsModel) loadAnalytics() tea.Msg {
-	// Auto-build cache if parquet file is missing
-	sessionsPath := filepath.Join(m.cacheDir, "sessions.parquet")
-	if _, err := os.Stat(sessionsPath); os.IsNotExist(err) {
-		exporter := analytics.NewExporter(m.db, m.cacheDir)
-		if err := exporter.Export(); err != nil {
-			return analyticsLoadedMsg{err: fmt.Errorf("build analytics cache: %w", err)}
-		}
-	}
-
-	analyzer, err := analytics.NewAnalyzer(m.cacheDir)
-	if err != nil {
-		return analyticsLoadedMsg{err: err}
-	}
-	defer func() { _ = analyzer.Close() }()
+	analyzer := analytics.NewAnalyzer(m.db)
 
 	// Load all analytics data
 	summary, err := analyzer.GetSummary()

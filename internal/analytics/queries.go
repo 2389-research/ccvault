@@ -1,41 +1,28 @@
-// ABOUTME: DuckDB analytics queries for ccvault
-// ABOUTME: Provides fast aggregate queries over Parquet data
+// ABOUTME: Analytics queries for ccvault
+// ABOUTME: Provides aggregate queries over session data via SQLite
 
 package analytics
 
 import (
-	"database/sql"
 	"fmt"
-	"os"
-	"path/filepath"
 	"time"
 
-	_ "github.com/marcboeker/go-duckdb"
+	"github.com/2389-research/ccvault/internal/db"
 )
 
-// Analyzer runs analytics queries over Parquet data
+// Analyzer runs analytics queries over session data
 type Analyzer struct {
-	db       *sql.DB
-	cacheDir string
+	db *db.DB
 }
 
-// NewAnalyzer creates a new DuckDB analyzer
-func NewAnalyzer(cacheDir string) (*Analyzer, error) {
-	// Open DuckDB in-memory
-	db, err := sql.Open("duckdb", "")
-	if err != nil {
-		return nil, fmt.Errorf("open duckdb: %w", err)
-	}
-
-	return &Analyzer{
-		db:       db,
-		cacheDir: cacheDir,
-	}, nil
+// NewAnalyzer creates a new SQLite-backed analyzer
+func NewAnalyzer(database *db.DB) *Analyzer {
+	return &Analyzer{db: database}
 }
 
-// Close closes the DuckDB connection
+// Close is a no-op (DB lifecycle managed by caller)
 func (a *Analyzer) Close() error {
-	return a.db.Close()
+	return nil
 }
 
 // TokensByDay returns token usage grouped by day
@@ -49,30 +36,21 @@ type DailyTokens struct {
 
 // GetTokensByDay returns token usage grouped by day
 func (a *Analyzer) GetTokensByDay(days int) ([]DailyTokens, error) {
-	sessionsPath := filepath.Join(a.cacheDir, "sessions.parquet")
-
-	// Check if parquet file exists
-	if _, err := os.Stat(sessionsPath); os.IsNotExist(err) {
-		return nil, fmt.Errorf("analytics cache not found. Run 'ccvault build-cache' first")
-	}
-
-	// started_at is stored as TIMESTAMP_MILLIS in Parquet, DuckDB reads it as timestamp
 	cutoff := time.Now().AddDate(0, 0, -days)
-	query := fmt.Sprintf(`
+	query := `
 		SELECT
-			DATE_TRUNC('day', started_at) as date,
+			DATE(started_at) as date,
 			SUM(input_tokens) as input_tokens,
 			SUM(output_tokens) as output_tokens,
-			SUM(total_tokens) as total_tokens,
+			SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens) as total_tokens,
 			COUNT(*) as session_count
-		FROM read_parquet('%s')
-		WHERE started_at > TIMESTAMP '%s'
-		GROUP BY DATE_TRUNC('day', started_at)
+		FROM sessions
+		WHERE started_at > ?
+		GROUP BY DATE(started_at)
 		ORDER BY date DESC
-		LIMIT %d
-	`, sessionsPath, cutoff.Format("2006-01-02 15:04:05"), days)
+		LIMIT ?`
 
-	rows, err := a.db.Query(query)
+	rows, err := a.db.Query(query, cutoff, days)
 	if err != nil {
 		return nil, fmt.Errorf("query: %w", err)
 	}
@@ -81,9 +59,11 @@ func (a *Analyzer) GetTokensByDay(days int) ([]DailyTokens, error) {
 	var results []DailyTokens
 	for rows.Next() {
 		var d DailyTokens
-		if err := rows.Scan(&d.Date, &d.InputTokens, &d.OutputTokens, &d.TotalTokens, &d.SessionCount); err != nil {
+		var dateStr string
+		if err := rows.Scan(&dateStr, &d.InputTokens, &d.OutputTokens, &d.TotalTokens, &d.SessionCount); err != nil {
 			return nil, fmt.Errorf("scan: %w", err)
 		}
+		d.Date, _ = time.Parse("2006-01-02", dateStr)
 		results = append(results, d)
 	}
 
@@ -100,27 +80,19 @@ type ProjectStats struct {
 
 // GetTopProjects returns top projects by token usage
 func (a *Analyzer) GetTopProjects(limit int) ([]ProjectStats, error) {
-	sessionsPath := filepath.Join(a.cacheDir, "sessions.parquet")
-
-	// Check if parquet file exists
-	if _, err := os.Stat(sessionsPath); os.IsNotExist(err) {
-		return nil, fmt.Errorf("analytics cache not found. Run 'ccvault build-cache' first")
-	}
-
-	// started_at is already a timestamp from Parquet TIMESTAMP_MILLIS
-	query := fmt.Sprintf(`
+	query := `
 		SELECT
-			project_path,
+			p.path as project_path,
 			COUNT(*) as session_count,
-			SUM(total_tokens) as total_tokens,
-			MAX(started_at) as last_active
-		FROM read_parquet('%s')
-		GROUP BY project_path
+			SUM(s.input_tokens + s.output_tokens + s.cache_read_tokens + s.cache_write_tokens) as total_tokens,
+			MAX(s.started_at) as last_active
+		FROM sessions s
+		JOIN projects p ON s.project_id = p.id
+		GROUP BY p.path
 		ORDER BY total_tokens DESC
-		LIMIT %d
-	`, sessionsPath, limit)
+		LIMIT ?`
 
-	rows, err := a.db.Query(query)
+	rows, err := a.db.Query(query, limit)
 	if err != nil {
 		return nil, fmt.Errorf("query: %w", err)
 	}
@@ -147,23 +119,15 @@ type ModelStats struct {
 
 // GetTokensByModel returns token usage grouped by model
 func (a *Analyzer) GetTokensByModel() ([]ModelStats, error) {
-	sessionsPath := filepath.Join(a.cacheDir, "sessions.parquet")
-
-	// Check if parquet file exists
-	if _, err := os.Stat(sessionsPath); os.IsNotExist(err) {
-		return nil, fmt.Errorf("analytics cache not found. Run 'ccvault build-cache' first")
-	}
-
-	query := fmt.Sprintf(`
+	query := `
 		SELECT
 			model,
 			COUNT(*) as session_count,
-			SUM(total_tokens) as total_tokens
-		FROM read_parquet('%s')
+			SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens) as total_tokens
+		FROM sessions
 		WHERE model IS NOT NULL AND model != ''
 		GROUP BY model
-		ORDER BY total_tokens DESC
-	`, sessionsPath)
+		ORDER BY total_tokens DESC`
 
 	rows, err := a.db.Query(query)
 	if err != nil {
@@ -194,23 +158,14 @@ type Summary struct {
 
 // GetSummary returns overall statistics
 func (a *Analyzer) GetSummary() (*Summary, error) {
-	sessionsPath := filepath.Join(a.cacheDir, "sessions.parquet")
-
-	// Check if parquet file exists
-	if _, err := os.Stat(sessionsPath); os.IsNotExist(err) {
-		return nil, fmt.Errorf("analytics cache not found. Run 'ccvault build-cache' first")
-	}
-
-	// started_at is already a timestamp from Parquet TIMESTAMP_MILLIS
-	query := fmt.Sprintf(`
+	query := `
 		SELECT
 			COUNT(*) as total_sessions,
-			COALESCE(SUM(total_tokens), 0) as total_tokens,
+			COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens), 0) as total_tokens,
 			MIN(started_at) as first_session,
 			MAX(started_at) as last_session,
 			COUNT(DISTINCT model) as unique_models
-		FROM read_parquet('%s')
-	`, sessionsPath)
+		FROM sessions`
 
 	var s Summary
 	err := a.db.QueryRow(query).Scan(

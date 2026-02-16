@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -31,17 +30,10 @@ type Server struct {
 
 // NewServer creates a new MCP server
 func NewServer(database *db.DB, cfg *config.Config) (*Server, error) {
-	cacheDir := filepath.Join(cfg.DataDir, "analytics")
-	analyzer, err := analytics.NewAnalyzer(cacheDir)
-	if err != nil {
-		// Analytics not available, continue without it
-		analyzer = nil
-	}
-
 	return &Server{
 		db:       database,
 		cfg:      cfg,
-		analyzer: analyzer,
+		analyzer: analytics.NewAnalyzer(database),
 		debug:    os.Getenv("CCVAULT_MCP_DEBUG") == "1",
 	}, nil
 }

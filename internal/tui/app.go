@@ -130,7 +130,7 @@ func New(database *db.DB, cacheDir, claudeHome string) *Model {
 	m.sessions = NewSessionsModel(database)
 	m.conversation = NewConversationModel(database)
 	m.search = NewSearchModel(database)
-	m.analytics = NewAnalyticsModel(database, cacheDir)
+	m.analytics = NewAnalyticsModel(database)
 	m.syncing = NewSyncingModel(database, claudeHome)
 
 	return m
