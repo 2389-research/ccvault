@@ -33,8 +33,8 @@ func TestMigrator_FreshDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("query max version: %v", err)
 	}
-	if maxVersion != 2 {
-		t.Errorf("max version = %d, want 2", maxVersion)
+	if maxVersion != 3 {
+		t.Errorf("max version = %d, want 3", maxVersion)
 	}
 
 	// Count migration records
@@ -43,8 +43,8 @@ func TestMigrator_FreshDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("count schema_version: %v", err)
 	}
-	if count != 2 {
-		t.Errorf("schema_version count = %d, want 2", count)
+	if count != 3 {
+		t.Errorf("schema_version count = %d, want 3", count)
 	}
 
 	// Verify all core tables exist
@@ -114,14 +114,14 @@ func TestMigrator_ExistingDatabase(t *testing.T) {
 		t.Fatalf("second RunMigrations: %v", err)
 	}
 
-	// Verify exactly 2 migration records, not 4
+	// Verify exactly 3 migration records, not 6
 	var count int
 	err := db.QueryRow("SELECT COUNT(*) FROM schema_version").Scan(&count)
 	if err != nil {
 		t.Fatalf("count schema_version: %v", err)
 	}
-	if count != 2 {
-		t.Errorf("schema_version count = %d, want 2 (idempotent)", count)
+	if count != 3 {
+		t.Errorf("schema_version count = %d, want 3 (idempotent)", count)
 	}
 }
 
@@ -191,24 +191,24 @@ func TestMigrator_BootstrapExisting(t *testing.T) {
 		t.Fatalf("RunMigrations on pre-existing db: %v", err)
 	}
 
-	// Verify it bootstrapped to version 2 (both migrations detected as applied)
+	// Verify it bootstrapped to version 2 then applied migration 003
 	var maxVersion int
 	err := db.QueryRow("SELECT MAX(version) FROM schema_version").Scan(&maxVersion)
 	if err != nil {
 		t.Fatalf("query max version: %v", err)
 	}
-	if maxVersion != 2 {
-		t.Errorf("max version = %d, want 2", maxVersion)
+	if maxVersion != 3 {
+		t.Errorf("max version = %d, want 3", maxVersion)
 	}
 
-	// Verify exactly 2 records (bootstrapped, not re-applied)
+	// Verify exactly 3 records (2 bootstrapped + 1 applied)
 	var count int
 	err = db.QueryRow("SELECT COUNT(*) FROM schema_version").Scan(&count)
 	if err != nil {
 		t.Fatalf("count schema_version: %v", err)
 	}
-	if count != 2 {
-		t.Errorf("schema_version count = %d, want 2", count)
+	if count != 3 {
+		t.Errorf("schema_version count = %d, want 3", count)
 	}
 }
 
@@ -248,14 +248,14 @@ func TestMigrator_BootstrapPartial(t *testing.T) {
 		t.Fatalf("RunMigrations: %v", err)
 	}
 
-	// Verify version is now 2
+	// Verify version is now 3 (bootstrapped to 1, applied 002 and 003)
 	var maxVersion int
 	err := db.QueryRow("SELECT MAX(version) FROM schema_version").Scan(&maxVersion)
 	if err != nil {
 		t.Fatalf("query max version: %v", err)
 	}
-	if maxVersion != 2 {
-		t.Errorf("max version = %d, want 2", maxVersion)
+	if maxVersion != 3 {
+		t.Errorf("max version = %d, want 3", maxVersion)
 	}
 
 	// Verify has_error column was added by migration 002
@@ -281,6 +281,71 @@ func TestMigrator_BootstrapPartial(t *testing.T) {
 	}
 	if !found {
 		t.Error("has_error column not added by migration 002")
+	}
+}
+
+func TestMigrator_SourceColumns(t *testing.T) {
+	db := openMemoryDB(t)
+	defer func() { _ = db.Close() }()
+
+	if err := RunMigrations(db); err != nil {
+		t.Fatalf("RunMigrations: %v", err)
+	}
+
+	// Verify version is 3
+	var maxVersion int
+	err := db.QueryRow("SELECT MAX(version) FROM schema_version").Scan(&maxVersion)
+	if err != nil {
+		t.Fatalf("query max version: %v", err)
+	}
+	if maxVersion != 3 {
+		t.Errorf("max version = %d, want 3", maxVersion)
+	}
+
+	// Insert a project row and verify the source column defaults to "claude-code"
+	_, err = db.Exec(`INSERT INTO projects (path, display_name, first_seen_at, last_activity_at)
+		VALUES ('/tmp/test', 'test-project', datetime('now'), datetime('now'))`)
+	if err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+
+	var source string
+	err = db.QueryRow("SELECT source FROM projects WHERE path = '/tmp/test'").Scan(&source)
+	if err != nil {
+		t.Fatalf("query project source: %v", err)
+	}
+	if source != "claude-code" {
+		t.Errorf("project source = %q, want %q", source, "claude-code")
+	}
+
+	// Insert a session and verify source defaults to "claude-code"
+	_, err = db.Exec(`INSERT INTO sessions (id, project_id, started_at, source_file)
+		VALUES ('test-session-1', 1, datetime('now'), '/tmp/test.jsonl')`)
+	if err != nil {
+		t.Fatalf("insert session: %v", err)
+	}
+
+	err = db.QueryRow("SELECT source FROM sessions WHERE id = 'test-session-1'").Scan(&source)
+	if err != nil {
+		t.Fatalf("query session source: %v", err)
+	}
+	if source != "claude-code" {
+		t.Errorf("session source = %q, want %q", source, "claude-code")
+	}
+
+	// Verify source_files table also has the source column
+	_, err = db.Exec(`INSERT INTO source_files (path, mtime, synced_at)
+		VALUES ('/tmp/test.jsonl', datetime('now'), datetime('now'))`)
+	if err != nil {
+		t.Fatalf("insert source_file: %v", err)
+	}
+
+	err = db.QueryRow("SELECT source FROM source_files WHERE path = '/tmp/test.jsonl'").Scan(&source)
+	if err != nil {
+		t.Fatalf("query source_files source: %v", err)
+	}
+	if source != "claude-code" {
+		t.Errorf("source_files source = %q, want %q", source, "claude-code")
 	}
 }
 
