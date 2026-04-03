@@ -1,17 +1,21 @@
-// ABOUTME: Sync logic for indexing Claude Code conversations
-// ABOUTME: Scans ~/.claude/projects/ and populates the ccvault database
+// ABOUTME: Sync logic for indexing conversations from configured sources
+// ABOUTME: Iterates over source adapters to discover, parse, and populate the ccvault database
 
 package sync
 
 import (
-	"bytes"
 	"database/sql"
 	"fmt"
 	"time"
 
+	"github.com/2389-research/ccvault/internal/config"
 	"github.com/2389-research/ccvault/internal/db"
+	"github.com/2389-research/ccvault/pkg/adapter"
 	"github.com/2389-research/ccvault/pkg/models"
 	"github.com/2389-research/ccvault/pkg/parser"
+
+	// Register the claude-code adapter so it is available via adapter.Get
+	_ "github.com/2389-research/ccvault/pkg/adapter/claudecode"
 )
 
 // Stats tracks sync statistics
@@ -26,10 +30,10 @@ type Stats struct {
 	Duration        time.Duration
 }
 
-// Syncer handles syncing Claude Code data to ccvault
+// Syncer handles syncing conversation data to ccvault
 type Syncer struct {
 	db              *db.DB
-	claudeHome      string
+	sources         []config.SourceConfig
 	full            bool
 	verbose         bool
 	onProgress      func(msg string)
@@ -68,10 +72,10 @@ func WithCountProgressCallback(fn func(current, total int)) Option {
 }
 
 // New creates a new Syncer
-func New(database *db.DB, claudeHome string, opts ...Option) *Syncer {
+func New(database *db.DB, sources []config.SourceConfig, opts ...Option) *Syncer {
 	s := &Syncer{
 		db:              database,
-		claudeHome:      claudeHome,
+		sources:         sources,
 		onProgress:      func(string) {},   // no-op default
 		onCountProgress: func(int, int) {}, // no-op default
 	}
@@ -86,19 +90,9 @@ func (s *Syncer) Run() (*Stats, error) {
 	start := time.Now()
 	stats := &Stats{}
 
-	s.progress("Scanning %s for sessions...", s.claudeHome)
-
-	// Discover session files
-	sessionFiles, err := parser.ScanClaudeHome(s.claudeHome)
-	if err != nil {
-		return nil, fmt.Errorf("scan claude home: %w", err)
-	}
-
-	stats.SessionsScanned = len(sessionFiles)
-	s.progress("Found %d session files", len(sessionFiles))
-
 	// Batch-load all stored mtimes in one query for fast incremental checks
 	var storedMtimes map[string]time.Time
+	var err error
 	if !s.full {
 		storedMtimes, err = s.db.GetAllSourceMtimes()
 		if err != nil {
@@ -112,19 +106,60 @@ func (s *Syncer) Run() (*Stats, error) {
 	// Track unique projects
 	projectsSeen := make(map[string]bool)
 
+	// Collect all session files across all sources
+	type sourceSession struct {
+		file       adapter.SessionFile
+		sourceName string
+		sourceType string
+		adapter    adapter.SourceAdapter
+	}
+	var allSessions []sourceSession
+
+	for _, src := range s.sources {
+		s.progress("Scanning source %q (%s) at %s...", src.Name, src.Type, src.Path)
+
+		adpt, err := adapter.Get(src.Type)
+		if err != nil {
+			stats.Errors = append(stats.Errors, fmt.Errorf("source %q: %w", src.Name, err))
+			s.progress("Error: unknown adapter type %q for source %q", src.Type, src.Name)
+			continue
+		}
+
+		files, err := adpt.Discover(src.Path)
+		if err != nil {
+			stats.Errors = append(stats.Errors, fmt.Errorf("source %q discover: %w", src.Name, err))
+			s.progress("Error scanning source %q: %v", src.Name, err)
+			continue
+		}
+
+		s.progress("Found %d session files in source %q", len(files), src.Name)
+
+		for _, f := range files {
+			allSessions = append(allSessions, sourceSession{
+				file:       f,
+				sourceName: src.Name,
+				sourceType: src.Type,
+				adapter:    adpt,
+			})
+		}
+	}
+
+	stats.SessionsScanned = len(allSessions)
+	s.progress("Total: %d session files across %d sources", len(allSessions), len(s.sources))
+
 	// Process each session
-	total := len(sessionFiles)
-	for i, sf := range sessionFiles {
-		if err := s.processSession(sf, stats, storedMtimes, projectsSeen); err != nil {
-			stats.Errors = append(stats.Errors, fmt.Errorf("session %s: %w", sf.SessionID, err))
+	total := len(allSessions)
+	for i, ss := range allSessions {
+		if err := s.processSession(ss.file, ss.adapter, ss.sourceName, stats, storedMtimes, projectsSeen); err != nil {
+			stats.Errors = append(stats.Errors, fmt.Errorf("session %s: %w", ss.file.Path, err))
 			if s.verbose {
-				s.progress("Error processing %s: %v", sf.SessionID, err)
+				s.progress("Error processing %s: %v", ss.file.Path, err)
 			}
 		}
 
 		s.onCountProgress(i+1, total)
 
-		if (i+1)%100 == 0 || i == len(sessionFiles)-1 {
+		if (i+1)%100 == 0 || i == len(allSessions)-1 {
 			s.progress("Processed %d/%d sessions", i+1, total)
 		}
 	}
@@ -138,8 +173,8 @@ func (s *Syncer) Run() (*Stats, error) {
 	return stats, nil
 }
 
-// processSession handles a single session file
-func (s *Syncer) processSession(sf parser.SessionFile, stats *Stats, storedMtimes map[string]time.Time, projectsSeen map[string]bool) error {
+// processSession handles a single session file using the given adapter
+func (s *Syncer) processSession(sf adapter.SessionFile, adpt adapter.SourceAdapter, sourceName string, stats *Stats, storedMtimes map[string]time.Time, projectsSeen map[string]bool) error {
 	// Check if we need to process this file
 	if !s.full {
 		if !s.needsSync(sf, storedMtimes) {
@@ -150,32 +185,83 @@ func (s *Syncer) processSession(sf parser.SessionFile, stats *Stats, storedMtime
 		}
 	}
 
-	// Parse the session
-	turns, session, err := parser.ParseSession(sf.Path)
+	// Parse the session using the adapter
+	parsed, err := adpt.Parse(sf.Path)
 	if err != nil {
 		return fmt.Errorf("parse session: %w", err)
 	}
 
-	if session.ID == "" {
+	if parsed.ID == "" {
 		// Record mtime so we skip this empty file next time
-		_ = s.db.UpsertSourceFileMtime(sf.Path, sf.ModTime)
+		_ = s.db.UpsertSourceFileMtime(sf.Path, sf.ModTime, sourceName)
 		stats.SessionsSkipped++
 		return nil // Empty or invalid session
 	}
 
 	// Prefer CWD extracted from JSONL (ground truth) over scanner's lossy decode
-	if session.ProjectPath == "" {
-		session.ProjectPath = sf.ProjectPath
+	if parsed.ProjectPath == "" {
+		parsed.ProjectPath = sf.ProjectPath
 	}
 
-	projectsSeen[session.ProjectPath] = true
+	projectsSeen[parsed.ProjectPath] = true
 
-	// Extract tool uses
-	toolUses := parser.ExtractToolUses(turns)
+	// Build models from parsed data
+	session := &models.Session{
+		ID:          parsed.ID,
+		ProjectPath: parsed.ProjectPath,
+		Model:       parsed.Model,
+		GitBranch:   parsed.GitBranch,
+		StartedAt:   parsed.StartedAt,
+		EndedAt:     parsed.EndedAt,
+		SourceFile:  sf.Path,
+		Source:      sourceName,
+	}
 
-	// Detect session flags for search filtering
-	session.HasError = detectErrors(turns)
-	session.HasSubagent = detectSubagents(toolUses)
+	// Detect session flags from adapter metadata
+	if v, ok := parsed.Metadata["has_error"]; ok {
+		if b, ok := v.(bool); ok {
+			session.HasError = b
+		}
+	}
+	if v, ok := parsed.Metadata["has_subagent"]; ok {
+		if b, ok := v.(bool); ok {
+			session.HasSubagent = b
+		}
+	}
+
+	// Convert parsed turns to model turns and collect tool uses
+	turns := make([]models.Turn, len(parsed.Turns))
+	var toolUses []models.ToolUse
+	for i, pt := range parsed.Turns {
+		turns[i] = models.Turn{
+			ID:           pt.ID,
+			SessionID:    parsed.ID,
+			ParentID:     pt.ParentID,
+			Type:         pt.Type,
+			Timestamp:    pt.Timestamp,
+			Content:      pt.Content,
+			RawJSON:      pt.RawJSON,
+			InputTokens:  int(pt.InputTokens),
+			OutputTokens: int(pt.OutputTokens),
+		}
+
+		// Accumulate session token totals
+		session.InputTokens += pt.InputTokens
+		session.OutputTokens += pt.OutputTokens
+
+		// Convert tool uses
+		for _, ptu := range pt.ToolUses {
+			toolUses = append(toolUses, models.ToolUse{
+				TurnID:    pt.ID,
+				SessionID: parsed.ID,
+				ToolName:  ptu.ToolName,
+				FilePath:  ptu.FilePath,
+				Timestamp: pt.Timestamp,
+			})
+		}
+	}
+
+	session.TurnCount = len(turns)
 
 	// Store everything in a transaction
 	err = s.db.WithTx(func(tx *sql.Tx) error {
@@ -187,6 +273,7 @@ func (s *Syncer) processSession(sf parser.SessionFile, stats *Stats, storedMtime
 			LastActivityAt: session.EndedAt,
 			SessionCount:   1,
 			TotalTokens:    session.TotalTokens(),
+			Source:         sourceName,
 		}
 		if err := s.db.UpsertProjectTx(tx, project); err != nil {
 			return fmt.Errorf("upsert project: %w", err)
@@ -223,7 +310,7 @@ func (s *Syncer) processSession(sf parser.SessionFile, stats *Stats, storedMtime
 		}
 
 		// Record source file mtime so incremental sync skips this file next time
-		if err := s.db.UpsertSourceFileMtimeTx(tx, sf.Path, sf.ModTime); err != nil {
+		if err := s.db.UpsertSourceFileMtimeTx(tx, sf.Path, sf.ModTime, sourceName); err != nil {
 			return fmt.Errorf("upsert source mtime: %w", err)
 		}
 
@@ -242,7 +329,7 @@ func (s *Syncer) processSession(sf parser.SessionFile, stats *Stats, storedMtime
 }
 
 // needsSync checks if a session file needs to be synced using the pre-loaded mtime map
-func (s *Syncer) needsSync(sf parser.SessionFile, storedMtimes map[string]time.Time) bool {
+func (s *Syncer) needsSync(sf adapter.SessionFile, storedMtimes map[string]time.Time) bool {
 	storedMtime, exists := storedMtimes[sf.Path]
 	if !exists || storedMtime.IsZero() {
 		return true // No stored time, needs sync
@@ -254,30 +341,6 @@ func (s *Syncer) needsSync(sf parser.SessionFile, storedMtimes map[string]time.T
 	}
 
 	return sf.ModTime.After(storedMtime)
-}
-
-// detectErrors checks if any turn in the session contains a tool error
-func detectErrors(turns []models.Turn) bool {
-	isErrorMarker := []byte(`"is_error":true`)
-	isErrorMarkerSpaced := []byte(`"is_error": true`)
-	for _, t := range turns {
-		if len(t.RawJSON) > 0 {
-			if bytes.Contains(t.RawJSON, isErrorMarker) || bytes.Contains(t.RawJSON, isErrorMarkerSpaced) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// detectSubagents checks if any tool use is a Task (subagent spawn)
-func detectSubagents(toolUses []models.ToolUse) bool {
-	for _, tu := range toolUses {
-		if tu.ToolName == "Task" {
-			return true
-		}
-	}
-	return false
 }
 
 // progress logs a progress message

@@ -82,7 +82,7 @@ var quickstartCmd = &cobra.Command{
 			fmt.Println("No conversations indexed yet. Let's sync your Claude Code history...")
 			fmt.Println()
 
-			syncer := sync.New(database, cfg.ClaudeHome,
+			syncer := sync.New(database, cfg.Sources,
 				sync.WithProgressCallback(func(msg string) {
 					fmt.Println("  " + msg)
 				}),
@@ -290,7 +290,7 @@ var syncCmd = &cobra.Command{
 		defer func() { _ = database.Close() }()
 
 		// Create syncer
-		syncer := sync.New(database, cfg.ClaudeHome,
+		syncer := sync.New(database, cfg.Sources,
 			sync.WithFullSync(full),
 			sync.WithVerbose(verbose),
 			sync.WithProgressCallback(func(msg string) {
@@ -342,7 +342,7 @@ var tuiCmd = &cobra.Command{
 		defer func() { _ = database.Close() }()
 
 		cacheDir := filepath.Join(cfg.DataDir, "analytics")
-		return tui.Run(database, cacheDir, cfg.ClaudeHome)
+		return tui.Run(database, cacheDir, cfg.Sources)
 	},
 }
 

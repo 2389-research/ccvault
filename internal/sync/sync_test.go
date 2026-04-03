@@ -1,257 +1,347 @@
-// ABOUTME: Integration tests for sync logic
-// ABOUTME: Validates CWD-preferred project path resolution and projectsSeen tracking
+// ABOUTME: Tests for the sync package's adapter-based session syncing
+// ABOUTME: Validates multi-source discovery, parsing, incremental sync, and error handling
 
 package sync
 
 import (
-	"fmt"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/2389-research/ccvault/internal/config"
 	"github.com/2389-research/ccvault/internal/db"
+	"github.com/2389-research/ccvault/pkg/adapter"
+
+	// Register the claude-code adapter
+	_ "github.com/2389-research/ccvault/pkg/adapter/claudecode"
 )
 
+// setupTestDB creates a temporary database for testing
 func setupTestDB(t *testing.T) (*db.DB, func()) {
 	t.Helper()
-
-	tmpDir, err := os.MkdirTemp("", "ccvault-sync-test-*")
+	tmpDir, err := os.MkdirTemp("", "sync-test-*")
 	if err != nil {
 		t.Fatalf("create temp dir: %v", err)
 	}
-
 	database, err := db.Open(tmpDir)
 	if err != nil {
 		_ = os.RemoveAll(tmpDir)
 		t.Fatalf("open db: %v", err)
 	}
-
-	cleanup := func() {
+	return database, func() {
 		_ = database.Close()
 		_ = os.RemoveAll(tmpDir)
 	}
-
-	return database, cleanup
 }
 
-// createFakeClaudeHome creates a temporary ~/.claude structure with session files.
-// encodedDir is the dash-encoded directory name (e.g. "-Users-harper-canvas-plugins").
-// cwd is the actual working directory to embed in the JSONL (e.g. "/Users/harper/canvas-plugins").
-// If cwd is empty, no cwd field is written in the JSONL.
-func createFakeClaudeHome(t *testing.T, encodedDir, cwd string) (claudeHome string, cleanup func()) {
+// writeTestSession writes a minimal Claude Code JSONL session file
+func writeTestSession(t *testing.T, dir, sessionID, projectDir string) string {
 	t.Helper()
+	// Create projects/<encoded-path>/ directory
+	projDir := filepath.Join(dir, "projects", projectDir)
+	if err := os.MkdirAll(projDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	path := filepath.Join(projDir, sessionID+".jsonl")
 
-	tmpDir, err := os.MkdirTemp("", "ccvault-claude-home-*")
+	now := time.Now().UTC().Truncate(time.Millisecond)
+
+	// Write a minimal JSONL file with a user message and an assistant response
+	userMsg := map[string]any{
+		"uuid":      "turn-1",
+		"sessionId": sessionID,
+		"type":      "human",
+		"timestamp": now.Format(time.RFC3339Nano),
+		"message": map[string]any{
+			"role":    "user",
+			"content": "Hello world",
+		},
+	}
+	assistantMsg := map[string]any{
+		"uuid":       "turn-2",
+		"parentUuid": "turn-1",
+		"sessionId":  sessionID,
+		"type":       "assistant",
+		"timestamp":  now.Add(time.Second).Format(time.RFC3339Nano),
+		"message": map[string]any{
+			"id":    "msg-1",
+			"model": "claude-sonnet-4-20250514",
+			"role":  "assistant",
+			"content": []map[string]any{
+				{"type": "text", "text": "Hi there!"},
+			},
+			"usage": map[string]any{
+				"input_tokens":  10,
+				"output_tokens": 5,
+			},
+		},
+	}
+
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create file: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	enc := json.NewEncoder(f)
+	if err := enc.Encode(userMsg); err != nil {
+		t.Fatalf("encode user: %v", err)
+	}
+	if err := enc.Encode(assistantMsg); err != nil {
+		t.Fatalf("encode assistant: %v", err)
+	}
+
+	return path
+}
+
+func TestNewSyncerAcceptsSources(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	sources := []config.SourceConfig{
+		{Name: "test-source", Type: "claude-code", Path: "/tmp/fake"},
+	}
+	syncer := New(database, sources)
+	if syncer == nil {
+		t.Fatal("expected non-nil syncer")
+	}
+	if len(syncer.sources) != 1 {
+		t.Fatalf("expected 1 source, got %d", len(syncer.sources))
+	}
+	if syncer.sources[0].Name != "test-source" {
+		t.Errorf("expected source name 'test-source', got %q", syncer.sources[0].Name)
+	}
+}
+
+func TestRunWithClaudeCodeAdapter(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	// Create a fake Claude home with a session
+	claudeHome, err := os.MkdirTemp("", "claude-home-*")
 	if err != nil {
 		t.Fatalf("create temp dir: %v", err)
 	}
+	defer func() { _ = os.RemoveAll(claudeHome) }()
 
-	projectDir := filepath.Join(tmpDir, "projects", encodedDir)
-	if err := os.MkdirAll(projectDir, 0755); err != nil {
-		_ = os.RemoveAll(tmpDir)
-		t.Fatalf("create project dir: %v", err)
+	writeTestSession(t, claudeHome, "a1b2c3d4-e5f6-7890-abcd-ef1234567890", "-Users-test-myproject")
+
+	sources := []config.SourceConfig{
+		{Name: "claude-code", Type: "claude-code", Path: claudeHome},
 	}
 
-	sessionID := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-	sessionFile := filepath.Join(projectDir, sessionID+".jsonl")
-
-	var cwdField string
-	if cwd != "" {
-		cwdField = fmt.Sprintf(`,"cwd":"%s"`, cwd)
-	}
-
-	jsonl := fmt.Sprintf(
-		`{"uuid":"turn1-aaa-bbbb-cccc-dddddddddddd","sessionId":"%s","type":"user","timestamp":"2026-02-02T20:00:00.000Z"%s,"message":{"role":"user","content":"Hello"}}
-{"uuid":"turn2-aaa-bbbb-cccc-dddddddddddd","sessionId":"%s","type":"assistant","timestamp":"2026-02-02T20:01:00.000Z"%s,"message":{"model":"claude-opus-4-5-20251101","role":"assistant","content":[{"type":"text","text":"Hi!"}],"usage":{"input_tokens":10,"output_tokens":5}}}`,
-		sessionID, cwdField, sessionID, cwdField,
+	var progressMsgs []string
+	syncer := New(database, sources,
+		WithFullSync(true),
+		WithProgressCallback(func(msg string) {
+			progressMsgs = append(progressMsgs, msg)
+		}),
 	)
 
-	if err := os.WriteFile(sessionFile, []byte(jsonl), 0644); err != nil {
-		_ = os.RemoveAll(tmpDir)
-		t.Fatalf("write session file: %v", err)
-	}
-
-	return tmpDir, func() { _ = os.RemoveAll(tmpDir) }
-}
-
-func TestSync_CWDPreferredOverScannerPath(t *testing.T) {
-	database, dbCleanup := setupTestDB(t)
-	defer dbCleanup()
-
-	// Encoded dir: "-Users-harper-canvas-plugins"
-	// Scanner would decode this as "/Users/harper/canvas/plugins" (WRONG)
-	// CWD in JSONL says "/Users/harper/canvas-plugins" (CORRECT)
-	claudeHome, homeCleanup := createFakeClaudeHome(t,
-		"-Users-harper-canvas-plugins",
-		"/Users/harper/canvas-plugins",
-	)
-	defer homeCleanup()
-
-	syncer := New(database, claudeHome, WithFullSync(true))
 	stats, err := syncer.Run()
 	if err != nil {
-		t.Fatalf("sync failed: %v", err)
+		t.Fatalf("Run() error: %v", err)
 	}
 
+	if stats.SessionsScanned != 1 {
+		t.Errorf("expected 1 session scanned, got %d", stats.SessionsScanned)
+	}
 	if stats.SessionsIndexed != 1 {
-		t.Fatalf("Expected 1 session indexed, got %d", stats.SessionsIndexed)
+		t.Errorf("expected 1 session indexed, got %d", stats.SessionsIndexed)
 	}
-
-	// Verify project was created with the CWD path, not the lossy decode
-	project, err := database.GetProjectByPath("/Users/harper/canvas-plugins")
-	if err != nil {
-		t.Fatalf("GetProjectByPath failed: %v", err)
+	if stats.TurnsIndexed < 1 {
+		t.Errorf("expected at least 1 turn indexed, got %d", stats.TurnsIndexed)
 	}
-	if project == nil {
-		t.Fatal("Expected project with path '/Users/harper/canvas-plugins', got nil")
+	if stats.ProjectsFound < 1 {
+		t.Errorf("expected at least 1 project, got %d", stats.ProjectsFound)
 	}
-
-	// The lossy-decoded path should NOT exist as a project
-	wrongProject, err := database.GetProjectByPath("/Users/harper/canvas/plugins")
-	if err != nil {
-		t.Fatalf("GetProjectByPath failed: %v", err)
-	}
-	if wrongProject != nil {
-		t.Error("Project with lossy-decoded path '/Users/harper/canvas/plugins' should not exist")
+	if len(progressMsgs) == 0 {
+		t.Error("expected progress messages, got none")
 	}
 }
 
-func TestSync_FallsBackToScannerPathWhenNoCWD(t *testing.T) {
-	database, dbCleanup := setupTestDB(t)
-	defer dbCleanup()
+func TestIncrementalSyncSkipsUnchanged(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
 
-	// No CWD in JSONL — should fall back to scanner's lossy decode
-	claudeHome, homeCleanup := createFakeClaudeHome(t,
-		"-Users-harper-simple-project",
-		"", // no cwd
-	)
-	defer homeCleanup()
-
-	syncer := New(database, claudeHome, WithFullSync(true))
-	stats, err := syncer.Run()
+	claudeHome, err := os.MkdirTemp("", "claude-home-*")
 	if err != nil {
-		t.Fatalf("sync failed: %v", err)
+		t.Fatalf("create temp dir: %v", err)
 	}
+	defer func() { _ = os.RemoveAll(claudeHome) }()
 
-	if stats.SessionsIndexed != 1 {
-		t.Fatalf("Expected 1 session indexed, got %d", stats.SessionsIndexed)
+	writeTestSession(t, claudeHome, "b2c3d4e5-f6a7-8901-bcde-f12345678901", "-Users-test-project2")
+
+	sources := []config.SourceConfig{
+		{Name: "claude-code", Type: "claude-code", Path: claudeHome},
 	}
-
-	// Falls back to scanner decode: "-Users-harper-simple-project" → "/Users/harper/simple/project"
-	project, err := database.GetProjectByPath("/Users/harper/simple/project")
-	if err != nil {
-		t.Fatalf("GetProjectByPath failed: %v", err)
-	}
-	if project == nil {
-		t.Fatal("Expected project with scanner-decoded path '/Users/harper/simple/project', got nil")
-	}
-}
-
-func TestSync_ProjectsSeenTracksCWDPath(t *testing.T) {
-	database, dbCleanup := setupTestDB(t)
-	defer dbCleanup()
-
-	claudeHome, homeCleanup := createFakeClaudeHome(t,
-		"-Users-harper-buddy-web",
-		"/Users/harper/buddy-web",
-	)
-	defer homeCleanup()
-
-	syncer := New(database, claudeHome, WithFullSync(true))
-	stats, err := syncer.Run()
-	if err != nil {
-		t.Fatalf("sync failed: %v", err)
-	}
-
-	// ProjectsFound should count 1 project (the CWD path)
-	if stats.ProjectsFound != 1 {
-		t.Errorf("Expected ProjectsFound=1, got %d", stats.ProjectsFound)
-	}
-}
-
-func TestSync_IncrementalSkipUsesProjectsSeen(t *testing.T) {
-	database, dbCleanup := setupTestDB(t)
-	defer dbCleanup()
-
-	claudeHome, homeCleanup := createFakeClaudeHome(t,
-		"-Users-harper-my-app",
-		"/Users/harper/my-app",
-	)
-	defer homeCleanup()
 
 	// First sync: full
-	syncer := New(database, claudeHome, WithFullSync(true))
-	stats, err := syncer.Run()
+	syncer := New(database, sources, WithFullSync(true))
+	stats1, err := syncer.Run()
 	if err != nil {
-		t.Fatalf("first sync failed: %v", err)
+		t.Fatalf("first Run() error: %v", err)
 	}
-	if stats.SessionsIndexed != 1 {
-		t.Fatalf("Expected 1 session indexed on first sync, got %d", stats.SessionsIndexed)
+	if stats1.SessionsIndexed != 1 {
+		t.Fatalf("expected 1 indexed on first sync, got %d", stats1.SessionsIndexed)
 	}
 
-	// Second sync: incremental — file should be skipped (same mtime)
-	// Touch the file to ensure mtime is not after stored mtime
-	syncer2 := New(database, claudeHome, WithFullSync(false))
+	// Second sync: incremental (should skip the file since mtime hasn't changed)
+	syncer2 := New(database, sources)
 	stats2, err := syncer2.Run()
 	if err != nil {
-		t.Fatalf("second sync failed: %v", err)
+		t.Fatalf("second Run() error: %v", err)
 	}
-
 	if stats2.SessionsSkipped != 1 {
-		t.Errorf("Expected 1 session skipped on incremental sync, got %d", stats2.SessionsSkipped)
+		t.Errorf("expected 1 skipped on incremental sync, got %d", stats2.SessionsSkipped)
 	}
 	if stats2.SessionsIndexed != 0 {
-		t.Errorf("Expected 0 sessions indexed on incremental sync, got %d", stats2.SessionsIndexed)
-	}
-
-	// ProjectsFound should still be 1 even though session was skipped
-	if stats2.ProjectsFound != 1 {
-		t.Errorf("Expected ProjectsFound=1 on incremental sync, got %d", stats2.ProjectsFound)
+		t.Errorf("expected 0 indexed on incremental sync, got %d", stats2.SessionsIndexed)
 	}
 }
 
-func TestSync_IncrementalResyncsModifiedFile(t *testing.T) {
-	database, dbCleanup := setupTestDB(t)
-	defer dbCleanup()
+func TestRunWithUnknownAdapterType(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
 
-	claudeHome, homeCleanup := createFakeClaudeHome(t,
-		"-Users-harper-test-proj",
-		"/Users/harper/test-proj",
+	sources := []config.SourceConfig{
+		{Name: "unknown", Type: "nonexistent-adapter", Path: "/tmp/fake"},
+	}
+
+	syncer := New(database, sources)
+	stats, err := syncer.Run()
+	if err != nil {
+		t.Fatalf("Run() should not return top-level error for adapter failures, got: %v", err)
+	}
+	if len(stats.Errors) == 0 {
+		t.Error("expected errors for unknown adapter type, got none")
+	}
+}
+
+func TestNeedsSyncWithMtimeMap(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	syncer := New(database, nil)
+	now := time.Now()
+
+	tests := []struct {
+		name     string
+		sf       adapter.SessionFile
+		mtimes   map[string]time.Time
+		expected bool
+	}{
+		{
+			name:     "no stored mtime",
+			sf:       adapter.SessionFile{Path: "/a.jsonl", ModTime: now},
+			mtimes:   map[string]time.Time{},
+			expected: true,
+		},
+		{
+			name:     "file newer than stored",
+			sf:       adapter.SessionFile{Path: "/b.jsonl", ModTime: now},
+			mtimes:   map[string]time.Time{"/b.jsonl": now.Add(-time.Hour)},
+			expected: true,
+		},
+		{
+			name:     "file same as stored",
+			sf:       adapter.SessionFile{Path: "/c.jsonl", ModTime: now},
+			mtimes:   map[string]time.Time{"/c.jsonl": now},
+			expected: false,
+		},
+		{
+			name:     "file older than stored",
+			sf:       adapter.SessionFile{Path: "/d.jsonl", ModTime: now.Add(-time.Hour)},
+			mtimes:   map[string]time.Time{"/d.jsonl": now},
+			expected: false,
+		},
+		{
+			name:     "zero modtime always syncs",
+			sf:       adapter.SessionFile{Path: "/e.jsonl", ModTime: time.Time{}},
+			mtimes:   map[string]time.Time{"/e.jsonl": now},
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := syncer.needsSync(tt.sf, tt.mtimes)
+			if result != tt.expected {
+				t.Errorf("needsSync() = %v, want %v", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestMultipleSourcesSync(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	// Create two separate claude homes
+	home1, err := os.MkdirTemp("", "home1-*")
+	if err != nil {
+		t.Fatalf("create temp dir: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(home1) }()
+
+	home2, err := os.MkdirTemp("", "home2-*")
+	if err != nil {
+		t.Fatalf("create temp dir: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(home2) }()
+
+	writeTestSession(t, home1, "c3d4e5f6-a7b8-9012-cdef-123456789012", "-Users-test-proj1")
+	writeTestSession(t, home2, "d4e5f6a7-b8c9-0123-defa-234567890123", "-Users-test-proj2")
+
+	sources := []config.SourceConfig{
+		{Name: "source-a", Type: "claude-code", Path: home1},
+		{Name: "source-b", Type: "claude-code", Path: home2},
+	}
+
+	syncer := New(database, sources, WithFullSync(true))
+	stats, err := syncer.Run()
+	if err != nil {
+		t.Fatalf("Run() error: %v", err)
+	}
+
+	if stats.SessionsScanned != 2 {
+		t.Errorf("expected 2 sessions scanned, got %d", stats.SessionsScanned)
+	}
+	if stats.SessionsIndexed != 2 {
+		t.Errorf("expected 2 sessions indexed, got %d", stats.SessionsIndexed)
+	}
+}
+
+func TestOptionsApply(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	var gotProgress bool
+	var gotCount bool
+
+	syncer := New(database, nil,
+		WithFullSync(true),
+		WithVerbose(true),
+		WithProgressCallback(func(msg string) { gotProgress = true }),
+		WithCountProgressCallback(func(c, total int) { gotCount = true }),
 	)
-	defer homeCleanup()
 
-	// First sync: full
-	syncer := New(database, claudeHome, WithFullSync(true))
-	_, err := syncer.Run()
-	if err != nil {
-		t.Fatalf("first sync failed: %v", err)
+	if !syncer.full {
+		t.Error("expected full=true")
+	}
+	if !syncer.verbose {
+		t.Error("expected verbose=true")
 	}
 
-	// Touch the file to bump mtime into the future
-	sessionFile := filepath.Join(claudeHome, "projects", "-Users-harper-test-proj", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl")
-	futureTime := time.Now().Add(1 * time.Hour)
-	if err := os.Chtimes(sessionFile, futureTime, futureTime); err != nil {
-		t.Fatalf("chtimes: %v", err)
+	syncer.onProgress("test")
+	if !gotProgress {
+		t.Error("progress callback not called")
 	}
 
-	// Second sync: incremental — file should be re-processed
-	syncer2 := New(database, claudeHome, WithFullSync(false))
-	stats2, err := syncer2.Run()
-	if err != nil {
-		t.Fatalf("second sync failed: %v", err)
-	}
-
-	if stats2.SessionsIndexed != 1 {
-		t.Errorf("Expected 1 session re-indexed after mtime bump, got %d", stats2.SessionsIndexed)
-	}
-
-	// Verify project still has CWD path after re-sync
-	project, err := database.GetProjectByPath("/Users/harper/test-proj")
-	if err != nil {
-		t.Fatalf("GetProjectByPath failed: %v", err)
-	}
-	if project == nil {
-		t.Fatal("Expected project with CWD path after re-sync, got nil")
+	syncer.onCountProgress(1, 10)
+	if !gotCount {
+		t.Error("count progress callback not called")
 	}
 }

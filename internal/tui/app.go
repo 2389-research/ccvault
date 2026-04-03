@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/2389-research/ccvault/internal/config"
 	"github.com/2389-research/ccvault/internal/db"
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
@@ -94,13 +95,13 @@ var keys = KeyMap{
 
 // Model is the main TUI model
 type Model struct {
-	db         *db.DB
-	cacheDir   string
-	claudeHome string
-	view       View
-	width      int
-	height     int
-	err        error
+	db       *db.DB
+	cacheDir string
+	sources  []config.SourceConfig
+	view     View
+	width    int
+	height   int
+	err      error
 
 	// View-specific state
 	dashboard    *DashboardModel
@@ -116,13 +117,13 @@ type Model struct {
 }
 
 // New creates a new TUI model
-func New(database *db.DB, cacheDir, claudeHome string) *Model {
+func New(database *db.DB, cacheDir string, sources []config.SourceConfig) *Model {
 	m := &Model{
-		db:         database,
-		cacheDir:   cacheDir,
-		claudeHome: claudeHome,
-		view:       DashboardView,
-		viewStack:  []View{DashboardView},
+		db:        database,
+		cacheDir:  cacheDir,
+		sources:   sources,
+		view:      DashboardView,
+		viewStack: []View{DashboardView},
 	}
 
 	m.dashboard = NewDashboardModel(database)
@@ -131,7 +132,7 @@ func New(database *db.DB, cacheDir, claudeHome string) *Model {
 	m.conversation = NewConversationModel(database)
 	m.search = NewSearchModel(database)
 	m.analytics = NewAnalyticsModel(database, cacheDir)
-	m.syncing = NewSyncingModel(database, claudeHome)
+	m.syncing = NewSyncingModel(database, sources)
 
 	return m
 }
@@ -183,7 +184,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Start syncing
 			m.view = SyncingView
 			m.viewStack = []View{SyncingView}
-			m.syncing = NewSyncingModel(m.db, m.claudeHome)
+			m.syncing = NewSyncingModel(m.db, m.sources)
 			return m, m.syncing.Init()
 		}
 		// No sync needed, proceed to dashboard
@@ -332,7 +333,7 @@ func (m *Model) pushView(view View, data interface{}) (*Model, tea.Cmd) {
 	case AnalyticsView:
 		cmd = m.analytics.Init()
 	case SyncingView:
-		m.syncing = NewSyncingModel(m.db, m.claudeHome)
+		m.syncing = NewSyncingModel(m.db, m.sources)
 		cmd = m.syncing.Init()
 	}
 
@@ -363,9 +364,9 @@ type ErrorMsg struct {
 type syncDoneTransitionMsg struct{}
 
 // Run starts the TUI
-func Run(database *db.DB, cacheDir, claudeHome string) error {
+func Run(database *db.DB, cacheDir string, sources []config.SourceConfig) error {
 	p := tea.NewProgram(
-		New(database, cacheDir, claudeHome),
+		New(database, cacheDir, sources),
 		tea.WithAltScreen(),
 		tea.WithMouseCellMotion(),
 	)
