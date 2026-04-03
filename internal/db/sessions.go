@@ -310,8 +310,8 @@ func (db *DB) UpsertSourceFileMtime(path string, mtime time.Time, source ...stri
 		src = source[0]
 	}
 	_, err := db.Exec(
-		"INSERT INTO source_files (path, mtime, synced_at, source) VALUES (?, ?, ?, ?) ON CONFLICT(path) DO UPDATE SET mtime = excluded.mtime, synced_at = excluded.synced_at, source = excluded.source",
-		path, mtime, time.Now(), src,
+		"INSERT INTO source_files (path, source, mtime, synced_at) VALUES (?, ?, ?, ?) ON CONFLICT(path, source) DO UPDATE SET mtime = excluded.mtime, synced_at = excluded.synced_at",
+		path, src, mtime, time.Now(),
 	)
 	return err
 }
@@ -324,8 +324,8 @@ func (db *DB) UpsertSourceFileMtimeTx(tx *sql.Tx, path string, mtime time.Time, 
 		src = source[0]
 	}
 	_, err := tx.Exec(
-		"INSERT INTO source_files (path, mtime, synced_at, source) VALUES (?, ?, ?, ?) ON CONFLICT(path) DO UPDATE SET mtime = excluded.mtime, synced_at = excluded.synced_at, source = excluded.source",
-		path, mtime, time.Now(), src,
+		"INSERT INTO source_files (path, source, mtime, synced_at) VALUES (?, ?, ?, ?) ON CONFLICT(path, source) DO UPDATE SET mtime = excluded.mtime, synced_at = excluded.synced_at",
+		path, src, mtime, time.Now(),
 	)
 	return err
 }

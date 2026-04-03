@@ -12,10 +12,6 @@ import (
 	"github.com/2389-research/ccvault/internal/db"
 	"github.com/2389-research/ccvault/pkg/adapter"
 	"github.com/2389-research/ccvault/pkg/models"
-	"github.com/2389-research/ccvault/pkg/parser"
-
-	// Register the claude-code adapter so it is available via adapter.Get
-	_ "github.com/2389-research/ccvault/pkg/adapter/claudecode"
 )
 
 // Stats tracks sync statistics
@@ -265,10 +261,14 @@ func (s *Syncer) processSession(sf adapter.SessionFile, adpt adapter.SourceAdapt
 
 	// Store everything in a transaction
 	err = s.db.WithTx(func(tx *sql.Tx) error {
-		// Upsert project
+		// Upsert project — use display name from adapter (source-specific logic)
+		displayName := parsed.DisplayName
+		if displayName == "" {
+			displayName = session.ProjectPath
+		}
 		project := &models.Project{
 			Path:           session.ProjectPath,
-			DisplayName:    parser.GetDisplayName(session.ProjectPath),
+			DisplayName:    displayName,
 			FirstSeenAt:    session.StartedAt,
 			LastActivityAt: session.EndedAt,
 			SessionCount:   1,

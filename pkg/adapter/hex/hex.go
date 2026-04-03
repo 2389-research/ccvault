@@ -132,6 +132,7 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 	parsed := &adapter.ParsedSession{
 		ID:          session.ID,
 		ProjectPath: "hex",
+		DisplayName: "Hex",
 		Turns:       turns,
 		StartedAt:   session.CreatedAt,
 		EndedAt:     session.UpdatedAt,

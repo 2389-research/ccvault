@@ -165,7 +165,7 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 				Type:      "user",
 				Timestamp: ts,
 				Content:   md.Content,
-				RawJSON:   json.RawMessage(makeCopy(raw)),
+				RawJSON:   json.RawMessage(adapter.MakeCopy(raw)),
 			}
 			turns = append(turns, turn)
 
@@ -181,7 +181,7 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 				Type:      "assistant",
 				Timestamp: ts,
 				Content:   md.Content,
-				RawJSON:   json.RawMessage(makeCopy(raw)),
+				RawJSON:   json.RawMessage(adapter.MakeCopy(raw)),
 			}
 			turns = append(turns, turn)
 			lastAssistantIdx = len(turns) - 1
@@ -217,6 +217,7 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 	return &adapter.ParsedSession{
 		ID:          sessionID,
 		ProjectPath: "jeff",
+		DisplayName: "Jeff",
 		Turns:       turns,
 		Model:       model,
 		StartedAt:   startedAt,
@@ -224,11 +225,4 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 		SourceName:  "jeff",
 		Metadata:    metadata,
 	}, nil
-}
-
-// makeCopy returns a copy of the byte slice to avoid referencing the scanner buffer.
-func makeCopy(b []byte) []byte {
-	c := make([]byte, len(b))
-	copy(c, b)
-	return c
 }

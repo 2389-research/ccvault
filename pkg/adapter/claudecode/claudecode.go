@@ -117,6 +117,7 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 	parsed := &adapter.ParsedSession{
 		ID:          session.ID,
 		ProjectPath: session.ProjectPath,
+		DisplayName: parser.GetDisplayName(session.ProjectPath),
 		Turns:       parsedTurns,
 		Model:       session.Model,
 		GitBranch:   session.GitBranch,

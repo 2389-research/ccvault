@@ -259,7 +259,7 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 					Type:      msg.Role,
 					Timestamp: ts,
 					Content:   strings.Join(textParts, "\n\n"),
-					RawJSON:   json.RawMessage(makeCopy(raw)),
+					RawJSON:   json.RawMessage(adapter.MakeCopy(raw)),
 				}
 
 				turns = append(turns, turn)
@@ -316,6 +316,7 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 	return &adapter.ParsedSession{
 		ID:          sessionID,
 		ProjectPath: projectPath,
+		DisplayName: displayNameFromPath(projectPath),
 		Turns:       turns,
 		Model:       model,
 		GitBranch:   gitBranch,
@@ -326,9 +327,18 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 	}, nil
 }
 
-// makeCopy returns a copy of the byte slice to avoid referencing the scanner buffer.
-func makeCopy(b []byte) []byte {
-	c := make([]byte, len(b))
-	copy(c, b)
-	return c
+// displayNameFromPath returns a shortened display name from a project path.
+func displayNameFromPath(projectPath string) string {
+	if projectPath == "" {
+		return ""
+	}
+	home, _ := os.UserHomeDir()
+	if strings.HasPrefix(projectPath, home) {
+		projectPath = "~" + projectPath[len(home):]
+	}
+	parts := strings.Split(projectPath, "/")
+	if len(parts) <= 3 {
+		return projectPath
+	}
+	return strings.Join(parts[len(parts)-3:], "/")
 }

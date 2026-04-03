@@ -12,7 +12,10 @@ import (
 	"github.com/2389-research/ccvault/pkg/models"
 )
 
-// UpsertProject creates or updates a project record
+// UpsertProject creates or updates a project record.
+// Projects are keyed by path alone (not path+source), so multiple sources working on
+// the same project directory aggregate into a single project row. The source field
+// reflects the last source that synced a session for this project.
 func (db *DB) UpsertProject(p *models.Project) error {
 	source := p.Source
 	if source == "" {

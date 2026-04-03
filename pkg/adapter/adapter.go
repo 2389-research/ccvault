@@ -19,6 +19,7 @@ type SessionFile struct {
 type ParsedSession struct {
 	ID          string
 	ProjectPath string
+	DisplayName string // Human-readable project name for display in the UI
 	Turns       []ParsedTurn
 	Model       string
 	GitBranch   string

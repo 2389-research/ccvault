@@ -5,6 +5,7 @@ package db
 
 import (
 	"database/sql"
+	"strings"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -33,8 +34,8 @@ func TestMigrator_FreshDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("query max version: %v", err)
 	}
-	if maxVersion != 3 {
-		t.Errorf("max version = %d, want 3", maxVersion)
+	if maxVersion != 4 {
+		t.Errorf("max version = %d, want 4", maxVersion)
 	}
 
 	// Count migration records
@@ -43,8 +44,8 @@ func TestMigrator_FreshDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("count schema_version: %v", err)
 	}
-	if count != 3 {
-		t.Errorf("schema_version count = %d, want 3", count)
+	if count != 4 {
+		t.Errorf("schema_version count = %d, want 4", count)
 	}
 
 	// Verify all core tables exist
@@ -114,14 +115,14 @@ func TestMigrator_ExistingDatabase(t *testing.T) {
 		t.Fatalf("second RunMigrations: %v", err)
 	}
 
-	// Verify exactly 3 migration records, not 6
+	// Verify exactly 4 migration records, not 8
 	var count int
 	err := db.QueryRow("SELECT COUNT(*) FROM schema_version").Scan(&count)
 	if err != nil {
 		t.Fatalf("count schema_version: %v", err)
 	}
-	if count != 3 {
-		t.Errorf("schema_version count = %d, want 3 (idempotent)", count)
+	if count != 4 {
+		t.Errorf("schema_version count = %d, want 4 (idempotent)", count)
 	}
 }
 
@@ -191,24 +192,24 @@ func TestMigrator_BootstrapExisting(t *testing.T) {
 		t.Fatalf("RunMigrations on pre-existing db: %v", err)
 	}
 
-	// Verify it bootstrapped to version 2 then applied migration 003
+	// Verify it bootstrapped to version 2 then applied migrations 003 and 004
 	var maxVersion int
 	err := db.QueryRow("SELECT MAX(version) FROM schema_version").Scan(&maxVersion)
 	if err != nil {
 		t.Fatalf("query max version: %v", err)
 	}
-	if maxVersion != 3 {
-		t.Errorf("max version = %d, want 3", maxVersion)
+	if maxVersion != 4 {
+		t.Errorf("max version = %d, want 4", maxVersion)
 	}
 
-	// Verify exactly 3 records (2 bootstrapped + 1 applied)
+	// Verify exactly 4 records (2 bootstrapped + 2 applied)
 	var count int
 	err = db.QueryRow("SELECT COUNT(*) FROM schema_version").Scan(&count)
 	if err != nil {
 		t.Fatalf("count schema_version: %v", err)
 	}
-	if count != 3 {
-		t.Errorf("schema_version count = %d, want 3", count)
+	if count != 4 {
+		t.Errorf("schema_version count = %d, want 4", count)
 	}
 }
 
@@ -243,19 +244,19 @@ func TestMigrator_BootstrapPartial(t *testing.T) {
 		}
 	}
 
-	// Run migrator — should bootstrap to version 1 and apply migration 002
+	// Run migrator — should bootstrap to version 1 and apply migrations 002-004
 	if err := RunMigrations(db); err != nil {
 		t.Fatalf("RunMigrations: %v", err)
 	}
 
-	// Verify version is now 3 (bootstrapped to 1, applied 002 and 003)
+	// Verify version is now 4 (bootstrapped to 1, applied 002, 003, and 004)
 	var maxVersion int
 	err := db.QueryRow("SELECT MAX(version) FROM schema_version").Scan(&maxVersion)
 	if err != nil {
 		t.Fatalf("query max version: %v", err)
 	}
-	if maxVersion != 3 {
-		t.Errorf("max version = %d, want 3", maxVersion)
+	if maxVersion != 4 {
+		t.Errorf("max version = %d, want 4", maxVersion)
 	}
 
 	// Verify has_error column was added by migration 002
@@ -298,8 +299,8 @@ func TestMigrator_SourceColumns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("query max version: %v", err)
 	}
-	if maxVersion != 3 {
-		t.Errorf("max version = %d, want 3", maxVersion)
+	if maxVersion != 4 {
+		t.Errorf("max version = %d, want 4", maxVersion)
 	}
 
 	// Insert a project row and verify the source column defaults to "claude-code"
@@ -361,7 +362,7 @@ CREATE INDEX idx_foo ON foo(id);`
 
 	stmts := splitStatements(input)
 	if len(stmts) != 3 {
-		t.Fatalf("got %d statements, want 3", len(stmts))
+		t.Fatalf("got %d statements, want 4", len(stmts))
 	}
 
 	if stmts[0] != "CREATE TABLE foo (id INTEGER);" {
@@ -380,22 +381,9 @@ CREATE INDEX idx_foo ON foo(id);`
 
 func containsAll(s string, subs ...string) bool {
 	for _, sub := range subs {
-		if !contains(s, sub) {
+		if !strings.Contains(s, sub) {
 			return false
 		}
 	}
 	return true
-}
-
-func contains(s, sub string) bool {
-	return len(s) >= len(sub) && searchString(s, sub)
-}
-
-func searchString(s, sub string) bool {
-	for i := 0; i <= len(s)-len(sub); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
 }

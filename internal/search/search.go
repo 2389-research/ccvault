@@ -158,6 +158,7 @@ func (s *Searcher) buildQuery(q *Query, limit int) (string, []interface{}) {
 	if q.Source != "" {
 		conditions = append(conditions, fmt.Sprintf("s.source = $%d", argNum))
 		args = append(args, q.Source)
+		argNum++ //nolint:ineffassign // keep argNum consistent for future filters
 	}
 
 	// Build final query
