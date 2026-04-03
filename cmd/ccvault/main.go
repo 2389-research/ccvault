@@ -11,6 +11,9 @@ import (
 	"strings"
 	"time"
 
+	// Register the Claude Code adapter so its init() runs
+	_ "github.com/2389-research/ccvault/pkg/adapter/claudecode"
+
 	"github.com/2389-research/ccvault/internal/analytics"
 	"github.com/2389-research/ccvault/internal/config"
 	"github.com/2389-research/ccvault/internal/db"
