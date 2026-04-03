@@ -14,9 +14,14 @@ import (
 
 // UpsertProject creates or updates a project record
 func (db *DB) UpsertProject(p *models.Project) error {
+	source := p.Source
+	if source == "" {
+		source = "claude-code"
+	}
+
 	query := `
-		INSERT INTO projects (path, display_name, first_seen_at, last_activity_at, session_count, total_tokens)
-		VALUES (?, ?, ?, ?, ?, ?)
+		INSERT INTO projects (path, display_name, first_seen_at, last_activity_at, session_count, total_tokens, source)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(path) DO UPDATE SET
 			display_name = excluded.display_name,
 			last_activity_at = CASE
@@ -25,7 +30,8 @@ func (db *DB) UpsertProject(p *models.Project) error {
 				ELSE projects.last_activity_at
 			END,
 			session_count = projects.session_count + excluded.session_count,
-			total_tokens = projects.total_tokens + excluded.total_tokens
+			total_tokens = projects.total_tokens + excluded.total_tokens,
+			source = excluded.source
 		RETURNING id`
 
 	err := db.QueryRow(query,
@@ -35,6 +41,7 @@ func (db *DB) UpsertProject(p *models.Project) error {
 		p.LastActivityAt,
 		p.SessionCount,
 		p.TotalTokens,
+		source,
 	).Scan(&p.ID)
 
 	if err != nil {
@@ -45,9 +52,14 @@ func (db *DB) UpsertProject(p *models.Project) error {
 
 // UpsertProjectTx creates or updates a project record within a transaction
 func (db *DB) UpsertProjectTx(tx *sql.Tx, p *models.Project) error {
+	source := p.Source
+	if source == "" {
+		source = "claude-code"
+	}
+
 	query := `
-		INSERT INTO projects (path, display_name, first_seen_at, last_activity_at, session_count, total_tokens)
-		VALUES (?, ?, ?, ?, ?, ?)
+		INSERT INTO projects (path, display_name, first_seen_at, last_activity_at, session_count, total_tokens, source)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(path) DO UPDATE SET
 			display_name = excluded.display_name,
 			last_activity_at = CASE
@@ -56,7 +68,8 @@ func (db *DB) UpsertProjectTx(tx *sql.Tx, p *models.Project) error {
 				ELSE projects.last_activity_at
 			END,
 			session_count = projects.session_count + excluded.session_count,
-			total_tokens = projects.total_tokens + excluded.total_tokens
+			total_tokens = projects.total_tokens + excluded.total_tokens,
+			source = excluded.source
 		RETURNING id`
 
 	err := tx.QueryRow(query,
@@ -66,6 +79,7 @@ func (db *DB) UpsertProjectTx(tx *sql.Tx, p *models.Project) error {
 		p.LastActivityAt,
 		p.SessionCount,
 		p.TotalTokens,
+		source,
 	).Scan(&p.ID)
 
 	if err != nil {
@@ -77,7 +91,7 @@ func (db *DB) UpsertProjectTx(tx *sql.Tx, p *models.Project) error {
 // GetProject retrieves a project by ID
 func (db *DB) GetProject(id int64) (*models.Project, error) {
 	query := `
-		SELECT id, path, display_name, first_seen_at, last_activity_at, session_count, total_tokens
+		SELECT id, path, display_name, first_seen_at, last_activity_at, session_count, total_tokens, source
 		FROM projects WHERE id = ?`
 
 	p := &models.Project{}
@@ -89,6 +103,7 @@ func (db *DB) GetProject(id int64) (*models.Project, error) {
 		&p.LastActivityAt,
 		&p.SessionCount,
 		&p.TotalTokens,
+		&p.Source,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -102,7 +117,7 @@ func (db *DB) GetProject(id int64) (*models.Project, error) {
 // GetProjectByPath retrieves a project by path
 func (db *DB) GetProjectByPath(path string) (*models.Project, error) {
 	query := `
-		SELECT id, path, display_name, first_seen_at, last_activity_at, session_count, total_tokens
+		SELECT id, path, display_name, first_seen_at, last_activity_at, session_count, total_tokens, source
 		FROM projects WHERE path = ?`
 
 	p := &models.Project{}
@@ -114,6 +129,7 @@ func (db *DB) GetProjectByPath(path string) (*models.Project, error) {
 		&p.LastActivityAt,
 		&p.SessionCount,
 		&p.TotalTokens,
+		&p.Source,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -139,7 +155,7 @@ func (db *DB) GetProjects(orderBy string, limit int) ([]models.Project, error) {
 	}
 
 	query := fmt.Sprintf(`
-		SELECT id, path, display_name, first_seen_at, last_activity_at, session_count, total_tokens
+		SELECT id, path, display_name, first_seen_at, last_activity_at, session_count, total_tokens, source
 		FROM projects ORDER BY %s`, order)
 
 	if limit > 0 {
@@ -163,6 +179,7 @@ func (db *DB) GetProjects(orderBy string, limit int) ([]models.Project, error) {
 			&p.LastActivityAt,
 			&p.SessionCount,
 			&p.TotalTokens,
+			&p.Source,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scan project: %w", err)
