@@ -141,6 +141,7 @@ func (s *Searcher) buildQuery(q *Query, limit int) (string, []interface{}) {
 	if !q.After.IsZero() {
 		conditions = append(conditions, fmt.Sprintf("t.timestamp > $%d", argNum))
 		args = append(args, q.After)
+		argNum++
 	}
 
 	// has:error — sessions flagged during sync as containing tool errors
@@ -151,6 +152,12 @@ func (s *Searcher) buildQuery(q *Query, limit int) (string, []interface{}) {
 	// has:subagent — sessions flagged during sync as using Task tool
 	if q.HasAgent {
 		conditions = append(conditions, "s.has_subagent = 1")
+	}
+
+	// Source filter
+	if q.Source != "" {
+		conditions = append(conditions, fmt.Sprintf("s.source = $%d", argNum))
+		args = append(args, q.Source)
 	}
 
 	// Build final query

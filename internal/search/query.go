@@ -11,15 +11,16 @@ import (
 
 // Query represents a parsed search query
 type Query struct {
-	Text      string    // Free-text search terms
-	Project   string    // project: filter
-	Model     string    // model: filter
-	Tool      string    // tool: filter
-	File      string    // file: filter
-	Before    time.Time // before: filter
-	After     time.Time // after: filter
-	HasError  bool      // has:error filter
-	HasAgent  bool      // has:subagent filter
+	Text     string    // Free-text search terms
+	Project  string    // project: filter
+	Model    string    // model: filter
+	Tool     string    // tool: filter
+	File     string    // file: filter
+	Before   time.Time // before: filter
+	After    time.Time // after: filter
+	HasError bool      // has:error filter
+	HasAgent bool      // has:subagent filter
+	Source   string    // source: filter
 }
 
 // Parse parses a search query string into a Query struct
@@ -47,6 +48,8 @@ func Parse(input string) *Query {
 			q.Before = parseDate(value)
 		case "after":
 			q.After = parseDate(value)
+		case "source":
+			q.Source = value
 		case "has":
 			switch strings.ToLower(value) {
 			case "error":
@@ -105,7 +108,8 @@ func (q *Query) IsEmpty() bool {
 		q.Before.IsZero() &&
 		q.After.IsZero() &&
 		!q.HasError &&
-		!q.HasAgent
+		!q.HasAgent &&
+		q.Source == ""
 }
 
 // HasFilters returns true if the query has any non-text filters
@@ -117,5 +121,6 @@ func (q *Query) HasFilters() bool {
 		!q.Before.IsZero() ||
 		!q.After.IsZero() ||
 		q.HasError ||
-		q.HasAgent
+		q.HasAgent ||
+		q.Source != ""
 }

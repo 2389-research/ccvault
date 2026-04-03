@@ -135,6 +135,7 @@ func TestQuery_IsEmpty(t *testing.T) {
 		{&Query{Model: "opus"}, false},
 		{&Query{Tool: "Bash"}, false},
 		{&Query{HasError: true}, false},
+		{&Query{Source: "codex"}, false},
 	}
 
 	for _, tt := range tests {
@@ -157,6 +158,7 @@ func TestQuery_HasFilters(t *testing.T) {
 		{&Query{Tool: "Bash"}, true},
 		{&Query{HasError: true}, true},
 		{&Query{Text: "hello", Project: "myproject"}, true},
+		{&Query{Source: "codex"}, true},
 	}
 
 	for _, tt := range tests {
@@ -236,6 +238,28 @@ func TestParseDate_Invalid(t *testing.T) {
 	result := parseDate("not-a-date")
 	if !result.IsZero() {
 		t.Errorf("Expected zero time for invalid date, got %v", result)
+	}
+}
+
+func TestParse_SourceFilter(t *testing.T) {
+	q := Parse("source:codex auth middleware")
+
+	if q.Source != "codex" {
+		t.Errorf("Expected source 'codex', got '%s'", q.Source)
+	}
+	if q.Text != "auth middleware" {
+		t.Errorf("Expected text 'auth middleware', got '%s'", q.Text)
+	}
+}
+
+func TestParse_SourceFilterQuoted(t *testing.T) {
+	q := Parse(`source:"claude-code" auth`)
+
+	if q.Source != "claude-code" {
+		t.Errorf("Expected source 'claude-code', got '%s'", q.Source)
+	}
+	if q.Text != "auth" {
+		t.Errorf("Expected text 'auth', got '%s'", q.Text)
 	}
 }
 
