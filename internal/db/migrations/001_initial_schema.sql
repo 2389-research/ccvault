@@ -1,5 +1,5 @@
--- ABOUTME: Reference copy of the SQLite schema for ccvault database
--- ABOUTME: Migrations in internal/db/migrations/ are the source of truth for schema changes
+-- ABOUTME: Initial database schema for ccvault
+-- ABOUTME: Creates core tables for projects, sessions, turns, tool_uses, FTS5, and sync state
 
 -- Projects table
 CREATE TABLE IF NOT EXISTS projects (

@@ -213,7 +213,7 @@ func (m *SyncingModel) View() string {
 		pct := float64(m.current) / float64(m.total)
 		b.WriteString("  ")
 		b.WriteString(m.bar.ViewAs(pct))
-		b.WriteString(fmt.Sprintf("  %d/%d", m.current, m.total))
+		fmt.Fprintf(&b, "  %d/%d", m.current, m.total)
 		b.WriteString("\n\n")
 	}
 

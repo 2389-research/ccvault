@@ -1076,7 +1076,7 @@ func (s *Server) promptSummarizeRecent(args map[string]interface{}) (promptGetRe
 
 	// Build context
 	var context strings.Builder
-	context.WriteString(fmt.Sprintf("## Claude Code Activity Summary (Last %d Days)\n\n", days))
+	fmt.Fprintf(&context, "## Claude Code Activity Summary (Last %d Days)\n\n", days)
 	context.WriteString("### Archive Statistics\n")
 	statsJSON, _ := json.MarshalIndent(stats, "", "  ")
 	context.WriteString("```json\n")
@@ -1085,11 +1085,11 @@ func (s *Server) promptSummarizeRecent(args map[string]interface{}) (promptGetRe
 
 	context.WriteString("### Recent Sessions\n")
 	for _, sess := range sessions {
-		context.WriteString(fmt.Sprintf("- **%s** (%s): %d turns, %s model\n",
+		fmt.Fprintf(&context, "- **%s** (%s): %d turns, %s model\n",
 			sess.ID[:8],
 			sess.StartedAt.Format("Jan 2 15:04"),
 			sess.TurnCount,
-			shortenModel(sess.Model)))
+			shortenModel(sess.Model))
 	}
 
 	return promptGetResult{
@@ -1137,19 +1137,19 @@ func (s *Server) promptAnalyzeProject(args map[string]interface{}) (promptGetRes
 	}
 
 	var context strings.Builder
-	context.WriteString(fmt.Sprintf("## Project Analysis: %s\n\n", project.DisplayName))
-	context.WriteString(fmt.Sprintf("- **Path**: %s\n", project.Path))
-	context.WriteString(fmt.Sprintf("- **Sessions**: %d\n", project.SessionCount))
-	context.WriteString(fmt.Sprintf("- **Total Tokens**: %d\n", project.TotalTokens))
-	context.WriteString(fmt.Sprintf("- **First Seen**: %s\n", project.FirstSeenAt.Format("Jan 2, 2006")))
-	context.WriteString(fmt.Sprintf("- **Last Activity**: %s\n\n", project.LastActivityAt.Format("Jan 2, 2006")))
+	fmt.Fprintf(&context, "## Project Analysis: %s\n\n", project.DisplayName)
+	fmt.Fprintf(&context, "- **Path**: %s\n", project.Path)
+	fmt.Fprintf(&context, "- **Sessions**: %d\n", project.SessionCount)
+	fmt.Fprintf(&context, "- **Total Tokens**: %d\n", project.TotalTokens)
+	fmt.Fprintf(&context, "- **First Seen**: %s\n", project.FirstSeenAt.Format("Jan 2, 2006"))
+	fmt.Fprintf(&context, "- **Last Activity**: %s\n\n", project.LastActivityAt.Format("Jan 2, 2006"))
 
 	context.WriteString("### Session History\n")
 	for _, sess := range sessions {
-		context.WriteString(fmt.Sprintf("- %s: %d turns, %s\n",
+		fmt.Fprintf(&context, "- %s: %d turns, %s\n",
 			sess.StartedAt.Format("Jan 2 15:04"),
 			sess.TurnCount,
-			shortenModel(sess.Model)))
+			shortenModel(sess.Model))
 	}
 
 	return promptGetResult{
@@ -1181,15 +1181,15 @@ func (s *Server) promptFindSolutions(args map[string]interface{}) (promptGetResu
 	}
 
 	var context strings.Builder
-	context.WriteString(fmt.Sprintf("## Search Results for: %s\n\n", topic))
-	context.WriteString(fmt.Sprintf("Found %d relevant conversations:\n\n", len(results)))
+	fmt.Fprintf(&context, "## Search Results for: %s\n\n", topic)
+	fmt.Fprintf(&context, "Found %d relevant conversations:\n\n", len(results))
 
 	for i, r := range results {
-		context.WriteString(fmt.Sprintf("### Result %d\n", i+1))
-		context.WriteString(fmt.Sprintf("- **Session**: %s\n", r.SessionID[:8]))
-		context.WriteString(fmt.Sprintf("- **Date**: %s\n", r.Turn.Timestamp.Format("Jan 2, 2006 15:04")))
-		context.WriteString(fmt.Sprintf("- **Type**: %s\n", r.Turn.Type))
-		context.WriteString(fmt.Sprintf("- **Snippet**: %s\n\n", r.Snippet))
+		fmt.Fprintf(&context, "### Result %d\n", i+1)
+		fmt.Fprintf(&context, "- **Session**: %s\n", r.SessionID[:8])
+		fmt.Fprintf(&context, "- **Date**: %s\n", r.Turn.Timestamp.Format("Jan 2, 2006 15:04"))
+		fmt.Fprintf(&context, "- **Type**: %s\n", r.Turn.Type)
+		fmt.Fprintf(&context, "- **Snippet**: %s\n\n", r.Snippet)
 	}
 
 	return promptGetResult{
@@ -1273,8 +1273,8 @@ func (s *Server) promptCompareApproaches(args map[string]interface{}) (promptGet
 	}
 
 	var context strings.Builder
-	context.WriteString(fmt.Sprintf("## Comparing Approaches for: %s\n\n", topic))
-	context.WriteString(fmt.Sprintf("Found %d sessions with relevant content:\n\n", len(sessionSnippets)))
+	fmt.Fprintf(&context, "## Comparing Approaches for: %s\n\n", topic)
+	fmt.Fprintf(&context, "Found %d sessions with relevant content:\n\n", len(sessionSnippets))
 
 	i := 0
 	for sessionID, snippets := range sessionSnippets {
@@ -1282,12 +1282,12 @@ func (s *Server) promptCompareApproaches(args map[string]interface{}) (promptGet
 			break
 		}
 		session, _ := s.db.GetSession(sessionID)
-		context.WriteString(fmt.Sprintf("### Session %d (%s)\n", i+1, sessionID[:8]))
+		fmt.Fprintf(&context, "### Session %d (%s)\n", i+1, sessionID[:8])
 		if session != nil {
-			context.WriteString(fmt.Sprintf("Date: %s, Model: %s\n", session.StartedAt.Format("Jan 2"), shortenModel(session.Model)))
+			fmt.Fprintf(&context, "Date: %s, Model: %s\n", session.StartedAt.Format("Jan 2"), shortenModel(session.Model))
 		}
 		for _, snippet := range snippets {
-			context.WriteString(fmt.Sprintf("- %s\n", snippet))
+			fmt.Fprintf(&context, "- %s\n", snippet)
 		}
 		context.WriteString("\n")
 		i++
@@ -1319,11 +1319,11 @@ func (s *Server) promptToolUsageReport(args map[string]interface{}) (promptGetRe
 	context.WriteString("## Tool Usage Report\n\n")
 	context.WriteString("### Tool Frequency\n")
 	for tool, count := range toolStats {
-		context.WriteString(fmt.Sprintf("- **%s**: %d uses\n", tool, count))
+		fmt.Fprintf(&context, "- **%s**: %d uses\n", tool, count)
 	}
 
 	if specificTool != "" {
-		context.WriteString(fmt.Sprintf("\n### Focus: %s\n", specificTool))
+		fmt.Fprintf(&context, "\n### Focus: %s\n", specificTool)
 		// Could add more detailed analysis for specific tool
 	}
 
