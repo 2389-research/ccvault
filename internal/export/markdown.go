@@ -87,6 +87,9 @@ func (e *MarkdownExporter) Export(w io.Writer, session *models.Session, turns []
 	if session.GitBranch != "" {
 		_, _ = fmt.Fprintf(w, "| **Git Branch** | `%s` |\n", session.GitBranch)
 	}
+	if session.Source != "" {
+		_, _ = fmt.Fprintf(w, "| **Source** | %s |\n", session.Source)
+	}
 	_, _ = fmt.Fprintf(w, "\n")
 
 	// Conversation section

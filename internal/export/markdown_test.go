@@ -191,6 +191,54 @@ func TestExtractUserContent_InvalidJSON(t *testing.T) {
 	}
 }
 
+func TestExport_WithSource(t *testing.T) {
+	e := NewMarkdownExporter()
+
+	session := &models.Session{
+		ID:        "test-session-456",
+		Model:     "claude-opus-4",
+		StartedAt: time.Date(2024, 1, 15, 10, 30, 0, 0, time.UTC),
+		Source:    "codex",
+	}
+
+	var buf bytes.Buffer
+	err := e.Export(&buf, session, nil, "")
+
+	if err != nil {
+		t.Fatalf("Export failed: %v", err)
+	}
+
+	output := buf.String()
+
+	if !strings.Contains(output, "| **Source** | codex |") {
+		t.Error("Missing source row in metadata")
+	}
+}
+
+func TestExport_WithoutSource(t *testing.T) {
+	e := NewMarkdownExporter()
+
+	session := &models.Session{
+		ID:        "test-session-789",
+		Model:     "claude-opus-4",
+		StartedAt: time.Date(2024, 1, 15, 10, 30, 0, 0, time.UTC),
+	}
+
+	var buf bytes.Buffer
+	err := e.Export(&buf, session, nil, "")
+
+	if err != nil {
+		t.Fatalf("Export failed: %v", err)
+	}
+
+	output := buf.String()
+
+	// Should not have source row if source is empty
+	if strings.Contains(output, "| **Source**") {
+		t.Error("Should not have source row without source value")
+	}
+}
+
 func TestExport_WithDuration(t *testing.T) {
 	e := NewMarkdownExporter()
 
