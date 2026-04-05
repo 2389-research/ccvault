@@ -263,6 +263,10 @@ func (s *Server) handleToolsList(req *jsonRPCRequest) {
 						Type:        "number",
 						Description: "Skip first N results for pagination. Use next_offset from response.",
 					},
+					"source": {
+						Type:        "string",
+						Description: "Filter by source (e.g. \"claude-code\", \"codex\", \"jeff\", \"hex\")",
+					},
 				},
 				Required: []string{"query"},
 			},
@@ -549,6 +553,12 @@ func (s *Server) searchConversations(args map[string]interface{}) (interface{}, 
 
 	// Fetch one extra to determine if there are more results
 	parsed := search.Parse(query)
+
+	// Apply source filter from explicit parameter (overrides any source: in query text)
+	if source, ok := args["source"].(string); ok && source != "" {
+		parsed.Source = source
+	}
+
 	searcher := search.New(s.db.DB)
 	results, err := searcher.Search(parsed, limit+offset+1)
 	if err != nil {
@@ -584,6 +594,7 @@ func (s *Server) searchConversations(args map[string]interface{}) (interface{}, 
 			"timestamp":    r.Turn.Timestamp.Format(time.RFC3339),
 			"project_path": r.ProjectPath,
 			"model":        r.Model,
+			"source":       r.Source,
 			"snippet":      snippet,
 		})
 	}
@@ -722,6 +733,7 @@ func (s *Server) getSessionSummary(args map[string]interface{}) (interface{}, er
 	return map[string]interface{}{
 		"session_id":     session.ID,
 		"project_path":   projectPath,
+		"source":         session.Source,
 		"model":          session.Model,
 		"started_at":     session.StartedAt.Format(time.RFC3339),
 		"ended_at":       session.EndedAt.Format(time.RFC3339),
