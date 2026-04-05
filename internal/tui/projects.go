@@ -139,7 +139,7 @@ func (m *ProjectsModel) View() string {
 		b.WriteString("\n")
 	} else {
 		// Header
-		header := fmt.Sprintf("%-50s %8s %10s %12s", "PROJECT", "SESSIONS", "TOKENS", "LAST ACTIVE")
+		header := fmt.Sprintf("%-50s %-12s %8s %10s %12s", "PROJECT", "SOURCE", "SESSIONS", "TOKENS", "LAST ACTIVE")
 		b.WriteString(headerStyle.Render(header))
 		b.WriteString("\n")
 
@@ -158,8 +158,13 @@ func (m *ProjectsModel) View() string {
 			}
 			lastActive := p.LastActivityAt.Format("2006-01-02")
 
-			line := fmt.Sprintf("%-50s %8d %10s %12s",
-				name, p.SessionCount, formatTokensPlain(p.TotalTokens), lastActive)
+			source := p.Source
+			if len(source) > 10 {
+				source = source[:10] + ".."
+			}
+
+			line := fmt.Sprintf("%-50s %-12s %8d %10s %12s",
+				name, source, p.SessionCount, formatTokensPlain(p.TotalTokens), lastActive)
 
 			if i == m.cursor {
 				b.WriteString(selectedStyle.Render(line))

@@ -386,6 +386,8 @@ func (m *SearchModel) View() string {
 		b.WriteString("\n")
 		b.WriteString(dimStyle.Render("  after:2024-01    After date"))
 		b.WriteString("\n")
+		b.WriteString(dimStyle.Render("  source:name      Filter by source (e.g. claude-code, codex)"))
+		b.WriteString("\n")
 		b.WriteString(dimStyle.Render("  \"exact phrase\"   Exact phrase match"))
 		b.WriteString("\n\n")
 		b.WriteString(dimStyle.Render("  Example: project:myapp model:opus tool:Bash"))
