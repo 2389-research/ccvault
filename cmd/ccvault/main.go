@@ -190,6 +190,7 @@ Use --json for machine-readable output.`,
 				"project:<name>":   "Filter by project",
 				"model:<name>":     "Filter by model",
 				"tool:<name>":      "Filter by tool used",
+				"source:<name>":    "Filter by source",
 				"after:<date>":     "Sessions after date",
 				"before:<date>":    "Sessions before date",
 				"\"exact phrase\"": "Exact phrase match",
@@ -276,11 +277,31 @@ var syncCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		full, _ := cmd.Flags().GetBool("full")
 		verbose, _ := cmd.Flags().GetBool("verbose")
+		sourceFilter, _ := cmd.Flags().GetString("source")
 
 		// Load config
 		cfg, err := config.Load()
 		if err != nil {
 			return fmt.Errorf("load config: %w", err)
+		}
+
+		// Filter sources if --source flag is provided
+		sources := cfg.Sources
+		if sourceFilter != "" {
+			var filtered []config.SourceConfig
+			for _, s := range cfg.Sources {
+				if s.Name == sourceFilter {
+					filtered = append(filtered, s)
+				}
+			}
+			if len(filtered) == 0 {
+				names := make([]string, len(cfg.Sources))
+				for i, s := range cfg.Sources {
+					names[i] = s.Name
+				}
+				return fmt.Errorf("source %q not found; available sources: %s", sourceFilter, strings.Join(names, ", "))
+			}
+			sources = filtered
 		}
 
 		// Ensure data directory exists
@@ -296,7 +317,7 @@ var syncCmd = &cobra.Command{
 		defer func() { _ = database.Close() }()
 
 		// Create syncer
-		syncer := sync.New(database, cfg.Sources,
+		syncer := sync.New(database, sources,
 			sync.WithFullSync(full),
 			sync.WithVerbose(verbose),
 			sync.WithProgressCallback(func(msg string) {
@@ -885,6 +906,7 @@ func init() {
 	// Sync flags
 	syncCmd.Flags().Bool("full", false, "Force full rescan instead of incremental")
 	syncCmd.Flags().BoolP("verbose", "v", false, "Show verbose output")
+	syncCmd.Flags().String("source", "", "Sync only a specific source (e.g., codex, claude-code)")
 
 	// Search flags
 	searchCmd.Flags().Bool("json", false, "Output results as JSON")
