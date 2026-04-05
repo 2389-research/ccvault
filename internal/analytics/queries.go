@@ -183,6 +183,90 @@ func (a *Analyzer) GetTokensByModel() ([]ModelStats, error) {
 	return results, rows.Err()
 }
 
+// SourceTokenStats represents token usage grouped by source
+type SourceTokenStats struct {
+	Source      string `json:"source"`
+	TotalTokens int64  `json:"total_tokens"`
+}
+
+// GetTokensBySource returns total tokens grouped by source
+func (a *Analyzer) GetTokensBySource() ([]SourceTokenStats, error) {
+	sessionsPath := filepath.Join(a.cacheDir, "sessions.parquet")
+
+	// Check if parquet file exists
+	if _, err := os.Stat(sessionsPath); os.IsNotExist(err) {
+		return nil, fmt.Errorf("analytics cache not found. Run 'ccvault build-cache' first")
+	}
+
+	query := fmt.Sprintf(`
+		SELECT
+			COALESCE(source, 'unknown') as source,
+			SUM(total_tokens) as total_tokens
+		FROM read_parquet('%s')
+		GROUP BY COALESCE(source, 'unknown')
+		ORDER BY total_tokens DESC
+	`, sessionsPath)
+
+	rows, err := a.db.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("query: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var results []SourceTokenStats
+	for rows.Next() {
+		var s SourceTokenStats
+		if err := rows.Scan(&s.Source, &s.TotalTokens); err != nil {
+			return nil, fmt.Errorf("scan: %w", err)
+		}
+		results = append(results, s)
+	}
+
+	return results, rows.Err()
+}
+
+// SourceSessionStats represents session count grouped by source
+type SourceSessionStats struct {
+	Source       string `json:"source"`
+	SessionCount int    `json:"session_count"`
+}
+
+// GetSessionsBySource returns session count grouped by source
+func (a *Analyzer) GetSessionsBySource() ([]SourceSessionStats, error) {
+	sessionsPath := filepath.Join(a.cacheDir, "sessions.parquet")
+
+	// Check if parquet file exists
+	if _, err := os.Stat(sessionsPath); os.IsNotExist(err) {
+		return nil, fmt.Errorf("analytics cache not found. Run 'ccvault build-cache' first")
+	}
+
+	query := fmt.Sprintf(`
+		SELECT
+			COALESCE(source, 'unknown') as source,
+			COUNT(*) as session_count
+		FROM read_parquet('%s')
+		GROUP BY COALESCE(source, 'unknown')
+		ORDER BY session_count DESC
+	`, sessionsPath)
+
+	rows, err := a.db.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("query: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var results []SourceSessionStats
+	for rows.Next() {
+		var s SourceSessionStats
+		if err := rows.Scan(&s.Source, &s.SessionCount); err != nil {
+			return nil, fmt.Errorf("scan: %w", err)
+		}
+		results = append(results, s)
+	}
+
+	return results, rows.Err()
+}
+
 // Summary returns overall analytics summary
 type Summary struct {
 	TotalSessions int       `json:"total_sessions"`
