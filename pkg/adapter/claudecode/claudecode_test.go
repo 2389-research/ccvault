@@ -111,9 +111,11 @@ func TestClaudeCodeAdapter_Parse_ErrorDetection(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "error-session.jsonl")
 
+	// Real Claude Code tool errors land in a user message containing a tool_result
+	// block with is_error: true.
 	lines := []string{
 		`{"uuid":"turn-1","sessionId":"sess-err","type":"user","timestamp":"2025-01-01T00:00:00Z","message":{"role":"user","content":"hello"}}`,
-		`{"uuid":"turn-2","sessionId":"sess-err","type":"assistant","timestamp":"2025-01-01T00:01:00Z","message":{"id":"msg-1","model":"claude-3","role":"assistant","content":[{"type":"text","text":"oops"}]}, "is_error":true}`,
+		`{"uuid":"turn-2","sessionId":"sess-err","parentUuid":"turn-1","type":"user","timestamp":"2025-01-01T00:01:00Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu-1","content":"bash: command not found","is_error":true}]}}`,
 	}
 	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -133,6 +135,36 @@ func TestClaudeCodeAdapter_Parse_ErrorDetection(t *testing.T) {
 	// Session metadata should reflect the error
 	if v, ok := parsed.Metadata["has_error"]; !ok || v != true {
 		t.Errorf("Metadata[has_error] = %v, want true", v)
+	}
+}
+
+func TestClaudeCodeAdapter_Parse_ErrorDetection_FalsePositive(t *testing.T) {
+	// User text mentioning "is_error":true should NOT be flagged: the previous
+	// substring-match implementation produced false positives here.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "talky-session.jsonl")
+
+	lines := []string{
+		`{"uuid":"turn-1","sessionId":"sess-talk","type":"user","timestamp":"2025-01-01T00:00:00Z","message":{"role":"user","content":"can you set \"is_error\":true on that response?"}}`,
+		`{"uuid":"turn-2","sessionId":"sess-talk","parentUuid":"turn-1","type":"assistant","timestamp":"2025-01-01T00:01:00Z","message":{"id":"msg-1","model":"claude-3","role":"assistant","content":[{"type":"text","text":"sure"}],"usage":{"input_tokens":10,"output_tokens":5}}}`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	a := New()
+	parsed, err := a.Parse(path)
+	if err != nil {
+		t.Fatalf("Parse() error: %v", err)
+	}
+
+	for i, tr := range parsed.Turns {
+		if tr.HasError {
+			t.Errorf("Turns[%d].HasError = true, want false (false positive from substring match)", i)
+		}
+	}
+	if v, ok := parsed.Metadata["has_error"]; ok && v == true {
+		t.Error("Metadata[has_error] should not be set when no real tool error exists")
 	}
 }
 

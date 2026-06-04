@@ -6,7 +6,9 @@ package jeff
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +16,10 @@ import (
 
 	"github.com/2389-research/ccvault/pkg/adapter"
 )
+
+// sessionIDPrefix namespaces Jeff session IDs to prevent collisions with other
+// sources' IDs on the global sessions primary key.
+const sessionIDPrefix = "jeff:"
 
 func init() {
 	adapter.Register("jeff", func() adapter.SourceAdapter {
@@ -68,6 +74,11 @@ func (a *Adapter) Discover(root string) ([]adapter.SessionFile, error) {
 		return nil, nil
 	}
 
+	// Jeff sessions have no per-session CWD, so we key the project on the
+	// install root. Multiple Jeff installs in different roots stay distinct;
+	// a single install collapses to one project (the intended behaviour).
+	projectPath := projectPathForRoot(root)
+
 	var files []adapter.SessionFile
 
 	err := filepath.Walk(sessionsDir, func(path string, info os.FileInfo, err error) error {
@@ -83,7 +94,7 @@ func (a *Adapter) Discover(root string) ([]adapter.SessionFile, error) {
 
 		files = append(files, adapter.SessionFile{
 			Path:        path,
-			ProjectPath: "jeff",
+			ProjectPath: projectPath,
 			ModTime:     info.ModTime(),
 		})
 		return nil
@@ -95,6 +106,17 @@ func (a *Adapter) Discover(root string) ([]adapter.SessionFile, error) {
 	return files, nil
 }
 
+// projectPathForRoot returns a stable per-install project key for a Jeff root.
+func projectPathForRoot(root string) string {
+	if root == "" {
+		return "jeff"
+	}
+	if abs, err := filepath.Abs(root); err == nil {
+		return "jeff:" + abs
+	}
+	return "jeff:" + root
+}
+
 // Parse reads a Jeff JSONL session file and converts it to adapter.ParsedSession.
 func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 	f, err := os.Open(path)
@@ -103,11 +125,10 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 	}
 	defer func() { _ = f.Close() }()
 
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	reader := bufio.NewReader(f)
 
 	var (
-		sessionID string
+		convID    string
 		model     string
 		startedAt time.Time
 		endedAt   time.Time
@@ -121,12 +142,31 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 
 	turnCounter := 0
 
-	for scanner.Scan() {
-		raw := scanner.Bytes()
+	for {
+		raw, readErr := adapter.ReadLine(reader)
+		if len(raw) == 0 {
+			if readErr != nil {
+				if errors.Is(readErr, io.EOF) {
+					break
+				}
+				return nil, fmt.Errorf("reading jeff session: %w", readErr)
+			}
+			continue
+		}
 
 		var line jsonlLine
 		if err := json.Unmarshal(raw, &line); err != nil {
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
 			continue
+		}
+
+		// Recover the conversation ID from any line that carries it, not just
+		// session_start — a corrupt or missing session_start record would
+		// otherwise leave the session unidentifiable and break dedupe.
+		if convID == "" && line.ConvID != "" {
+			convID = line.ConvID
 		}
 
 		ts, _ := time.Parse(time.RFC3339Nano, line.Timestamp)
@@ -143,9 +183,6 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 
 		switch line.EntryType {
 		case "session_start":
-			if line.ConvID != "" {
-				sessionID = line.ConvID
-			}
 			var sd sessionStartData
 			if err := json.Unmarshal(line.Data, &sd); err == nil {
 				if sd.Model != "" {
@@ -161,7 +198,7 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 
 			turnCounter++
 			turn := adapter.ParsedTurn{
-				ID:        fmt.Sprintf("%s-turn-%d", sessionID, turnCounter),
+				ID:        fmt.Sprintf("%s%s-turn-%d", sessionIDPrefix, convID, turnCounter),
 				Type:      "user",
 				Timestamp: ts,
 				Content:   md.Content,
@@ -177,7 +214,7 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 
 			turnCounter++
 			turn := adapter.ParsedTurn{
-				ID:        fmt.Sprintf("%s-turn-%d", sessionID, turnCounter),
+				ID:        fmt.Sprintf("%s%s-turn-%d", sessionIDPrefix, convID, turnCounter),
 				Type:      "assistant",
 				Timestamp: ts,
 				Content:   md.Content,
@@ -203,10 +240,10 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 		case "error":
 			hasError = true
 		}
-	}
 
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("scanning jeff session: %w", err)
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
 	}
 
 	metadata := make(map[string]any)
@@ -214,9 +251,15 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 		metadata["has_error"] = true
 	}
 
+	sessionID := ""
+	if convID != "" {
+		sessionID = sessionIDPrefix + convID
+	}
+
 	return &adapter.ParsedSession{
-		ID:          sessionID,
-		ProjectPath: "jeff",
+		ID: sessionID,
+		// ProjectPath left empty so the sync layer falls back to the per-root
+		// value set in Discover(); this keeps the source of truth in one place.
 		DisplayName: "Jeff",
 		Turns:       turns,
 		Model:       model,

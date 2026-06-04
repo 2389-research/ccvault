@@ -38,6 +38,30 @@ func (a *Analyzer) Close() error {
 	return a.db.Close()
 }
 
+// SessionsParquetHasSource returns true when the on-disk sessions.parquet has a
+// `source` column. Older parquet files written before multi-source support
+// don't, and source-aware queries against them would fail; callers should
+// rebuild the cache when this returns false. A missing file also returns false.
+func (a *Analyzer) SessionsParquetHasSource() (bool, error) {
+	sessionsPath := filepath.Join(a.cacheDir, "sessions.parquet")
+	if _, err := os.Stat(sessionsPath); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("stat sessions parquet: %w", err)
+	}
+
+	query := fmt.Sprintf(
+		`SELECT COUNT(*) FROM parquet_schema('%s') WHERE name = 'source'`,
+		sessionsPath,
+	)
+	var count int
+	if err := a.db.QueryRow(query).Scan(&count); err != nil {
+		return false, fmt.Errorf("inspect parquet schema: %w", err)
+	}
+	return count > 0, nil
+}
+
 // TokensByDay returns token usage grouped by day
 type DailyTokens struct {
 	Date         time.Time `json:"date"`
@@ -200,10 +224,10 @@ func (a *Analyzer) GetTokensBySource() ([]SourceTokenStats, error) {
 
 	query := fmt.Sprintf(`
 		SELECT
-			COALESCE(source, 'unknown') as source,
+			COALESCE(source, 'claude-code') as source,
 			SUM(total_tokens) as total_tokens
 		FROM read_parquet('%s')
-		GROUP BY COALESCE(source, 'unknown')
+		GROUP BY COALESCE(source, 'claude-code')
 		ORDER BY total_tokens DESC
 	`, sessionsPath)
 
@@ -242,10 +266,10 @@ func (a *Analyzer) GetSessionsBySource() ([]SourceSessionStats, error) {
 
 	query := fmt.Sprintf(`
 		SELECT
-			COALESCE(source, 'unknown') as source,
+			COALESCE(source, 'claude-code') as source,
 			COUNT(*) as session_count
 		FROM read_parquet('%s')
-		GROUP BY COALESCE(source, 'unknown')
+		GROUP BY COALESCE(source, 'claude-code')
 		ORDER BY session_count DESC
 	`, sessionsPath)
 

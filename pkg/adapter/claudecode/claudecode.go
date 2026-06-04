@@ -4,7 +4,7 @@
 package claudecode
 
 import (
-	"strings"
+	"encoding/json"
 
 	"github.com/2389-research/ccvault/pkg/adapter"
 	"github.com/2389-research/ccvault/pkg/models"
@@ -83,9 +83,7 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 			OutputTokens: int64(t.OutputTokens),
 		}
 
-		// Error detection: check RawJSON for is_error field
-		rawStr := string(t.RawJSON)
-		if strings.Contains(rawStr, `"is_error":true`) || strings.Contains(rawStr, `"is_error": true`) {
+		if turnHasError(t.RawJSON) {
 			pt.HasError = true
 			hasError = true
 		}
@@ -128,4 +126,31 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 	}
 
 	return parsed, nil
+}
+
+// turnHasError reports whether the raw turn carries a tool_result content block
+// with is_error: true. Claude Code stores tool error flags inside the user
+// message's content array, so we walk that structure rather than substring-match.
+func turnHasError(rawJSON json.RawMessage) bool {
+	if len(rawJSON) == 0 {
+		return false
+	}
+	var raw models.RawTurn
+	if err := json.Unmarshal(rawJSON, &raw); err != nil || raw.Message == nil {
+		return false
+	}
+	var msg models.RawUserMessage
+	if err := json.Unmarshal(raw.Message, &msg); err != nil {
+		return false
+	}
+	var blocks []models.UserContentBlock
+	if err := json.Unmarshal(msg.Content, &blocks); err != nil {
+		return false
+	}
+	for _, block := range blocks {
+		if block.Type == "tool_result" && block.IsError {
+			return true
+		}
+	}
+	return false
 }

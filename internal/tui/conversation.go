@@ -292,12 +292,17 @@ func (m *ConversationModel) View() string {
 	if m.session != nil {
 		b.WriteString(titleStyle.Render("Conversation"))
 		b.WriteString("\n")
-		meta := fmt.Sprintf("%s • %d turns • %s • %s",
+		parts := []string{
 			m.session.StartedAt.Format("2006-01-02 15:04"),
-			len(m.turns),
-			m.session.Model,
-			m.session.Source)
-		b.WriteString(subtitleStyle.Render(meta))
+			fmt.Sprintf("%d turns", len(m.turns)),
+		}
+		if m.session.Model != "" {
+			parts = append(parts, m.session.Model)
+		}
+		if m.session.Source != "" {
+			parts = append(parts, m.session.Source)
+		}
+		b.WriteString(subtitleStyle.Render(strings.Join(parts, " • ")))
 		b.WriteString("\n\n")
 	}
 

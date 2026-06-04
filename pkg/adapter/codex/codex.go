@@ -6,7 +6,9 @@ package codex
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -134,20 +136,24 @@ func extractCWDFromFile(path string) (string, error) {
 	}
 	defer func() { _ = f.Close() }()
 
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
-
-	for scanner.Scan() {
-		var line jsonlLine
-		if err := json.Unmarshal(scanner.Bytes(), &line); err != nil {
-			continue
-		}
-		if line.Type == "session_meta" {
-			var meta sessionMetaPayload
-			if err := json.Unmarshal(line.Payload, &meta); err != nil {
-				return "", fmt.Errorf("parsing session_meta payload: %w", err)
+	reader := bufio.NewReader(f)
+	for {
+		raw, err := adapter.ReadLine(reader)
+		if len(raw) > 0 {
+			var line jsonlLine
+			if jerr := json.Unmarshal(raw, &line); jerr == nil && line.Type == "session_meta" {
+				var meta sessionMetaPayload
+				if perr := json.Unmarshal(line.Payload, &meta); perr != nil {
+					return "", fmt.Errorf("parsing session_meta payload: %w", perr)
+				}
+				return meta.CWD, nil
 			}
-			return meta.CWD, nil
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return "", fmt.Errorf("reading %s: %w", path, err)
 		}
 	}
 
@@ -162,8 +168,7 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 	}
 	defer func() { _ = f.Close() }()
 
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	reader := bufio.NewReader(f)
 
 	var (
 		sessionID   string
@@ -185,11 +190,26 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 
 	turnCounter := 0
 
-	for scanner.Scan() {
-		raw := scanner.Bytes()
+	for {
+		raw, readErr := adapter.ReadLine(reader)
+		if len(raw) == 0 {
+			if readErr != nil {
+				if errors.Is(readErr, io.EOF) {
+					break
+				}
+				return nil, fmt.Errorf("reading codex session: %w", readErr)
+			}
+			continue
+		}
 
 		var line jsonlLine
 		if err := json.Unmarshal(raw, &line); err != nil {
+			if readErr != nil && !errors.Is(readErr, io.EOF) {
+				return nil, fmt.Errorf("reading codex session: %w", readErr)
+			}
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
 			continue
 		}
 
@@ -307,10 +327,10 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 				}
 			}
 		}
-	}
 
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("scanning codex session: %w", err)
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
 	}
 
 	return &adapter.ParsedSession{

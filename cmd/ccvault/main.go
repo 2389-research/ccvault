@@ -906,7 +906,7 @@ func init() {
 	// Sync flags
 	syncCmd.Flags().Bool("full", false, "Force full rescan instead of incremental")
 	syncCmd.Flags().BoolP("verbose", "v", false, "Show verbose output")
-	syncCmd.Flags().String("source", "", "Sync only a specific source (e.g., codex, claude-code)")
+	syncCmd.Flags().String("source", "", "Sync only the configured source with this name (matches sources[].name from config)")
 
 	// Search flags
 	searchCmd.Flags().Bool("json", false, "Output results as JSON")

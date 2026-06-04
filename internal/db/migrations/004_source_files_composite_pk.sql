@@ -10,7 +10,11 @@ CREATE TABLE source_files_new (
 );
 
 INSERT INTO source_files_new (path, source, mtime, synced_at)
-    SELECT path, source, mtime, synced_at FROM source_files;
+    SELECT path,
+           COALESCE(NULLIF(source, ''), 'claude-code') AS source,
+           mtime,
+           synced_at
+    FROM source_files;
 
 DROP TABLE source_files;
 

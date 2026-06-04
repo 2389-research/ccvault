@@ -4,8 +4,10 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/spf13/viper"
 )
@@ -99,7 +101,27 @@ func unmarshalAndApplyDefaults(v *viper.Viper) (*Config, error) {
 		}}
 	}
 
+	if err := validateSources(cfg.Sources); err != nil {
+		return nil, err
+	}
+
 	return &cfg, nil
+}
+
+// validateSources rejects configurations with duplicate or empty source names,
+// since the --source filter and other lookups key off Name.
+func validateSources(sources []SourceConfig) error {
+	seen := make(map[string]int, len(sources))
+	for i, s := range sources {
+		if strings.TrimSpace(s.Name) == "" {
+			return fmt.Errorf("sources[%d]: name is required", i)
+		}
+		if prev, ok := seen[s.Name]; ok {
+			return fmt.Errorf("duplicate source name %q at sources[%d] and sources[%d]; names must be unique", s.Name, prev, i)
+		}
+		seen[s.Name] = i
+	}
+	return nil
 }
 
 // EnsureDataDir creates the data directory if it doesn't exist

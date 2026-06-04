@@ -13,6 +13,10 @@ import (
 	"github.com/2389-research/ccvault/pkg/adapter"
 )
 
+// sessionIDPrefix namespaces Hex session IDs so they can't collide with other
+// sources' IDs on the global sessions primary key.
+const sessionIDPrefix = "hex:"
+
 func init() {
 	adapter.Register("hex", func() adapter.SourceAdapter {
 		return New()
@@ -70,6 +74,11 @@ func (a *Adapter) Discover(root string) ([]adapter.SessionFile, error) {
 		return nil, fmt.Errorf("read sessions dir: %w", err)
 	}
 
+	// Hex sessions carry no filesystem CWD, so we key the project by install
+	// root. Distinct Hex roots stay distinct; a single install collapses to
+	// one project.
+	projectPath := projectPathForRoot(root)
+
 	var files []adapter.SessionFile
 	for _, entry := range entries {
 		if entry.IsDir() {
@@ -86,12 +95,23 @@ func (a *Adapter) Discover(root string) ([]adapter.SessionFile, error) {
 
 		files = append(files, adapter.SessionFile{
 			Path:        filepath.Join(sessionsDir, entry.Name()),
-			ProjectPath: "hex",
+			ProjectPath: projectPath,
 			ModTime:     fi.ModTime(),
 		})
 	}
 
 	return files, nil
+}
+
+// projectPathForRoot returns a stable per-install project key for a Hex root.
+func projectPathForRoot(root string) string {
+	if root == "" {
+		return "hex"
+	}
+	if abs, err := filepath.Abs(root); err == nil {
+		return "hex:" + abs
+	}
+	return "hex:" + root
 }
 
 // Parse reads a Hex JSON session file and converts it to adapter.ParsedSession.
@@ -106,11 +126,16 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 		return nil, fmt.Errorf("unmarshal session: %w", err)
 	}
 
+	namespacedID := ""
+	if session.ID != "" {
+		namespacedID = sessionIDPrefix + session.ID
+	}
+
 	turns := make([]adapter.ParsedTurn, len(session.Messages))
 	var prevTurnID string
 
 	for i, msg := range session.Messages {
-		turnID := fmt.Sprintf("%s-%d", session.ID, i)
+		turnID := fmt.Sprintf("%s-%d", namespacedID, i)
 
 		rawJSON, err := json.Marshal(msg)
 		if err != nil {
@@ -130,8 +155,9 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 	}
 
 	parsed := &adapter.ParsedSession{
-		ID:          session.ID,
-		ProjectPath: "hex",
+		ID: namespacedID,
+		// ProjectPath left empty so sync falls back to the per-root value set
+		// in Discover().
 		DisplayName: "Hex",
 		Turns:       turns,
 		StartedAt:   session.CreatedAt,

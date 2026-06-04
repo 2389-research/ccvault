@@ -88,7 +88,7 @@ func (e *MarkdownExporter) Export(w io.Writer, session *models.Session, turns []
 		_, _ = fmt.Fprintf(w, "| **Git Branch** | `%s` |\n", session.GitBranch)
 	}
 	if session.Source != "" {
-		_, _ = fmt.Fprintf(w, "| **Source** | %s |\n", session.Source)
+		_, _ = fmt.Fprintf(w, "| **Source** | `%s` |\n", escapeTableCell(session.Source))
 	}
 	_, _ = fmt.Fprintf(w, "\n")
 
@@ -393,6 +393,16 @@ func extractUserContent(rawJSON json.RawMessage) string {
 	}
 
 	return ""
+}
+
+// escapeTableCell sanitizes a value for inclusion in a markdown table cell:
+// pipes are escaped and any embedded newlines collapsed to spaces.
+func escapeTableCell(s string) string {
+	s = strings.ReplaceAll(s, "|", `\|`)
+	s = strings.ReplaceAll(s, "\r\n", " ")
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ReplaceAll(s, "\r", " ")
+	return s
 }
 
 // formatTokens formats a token count for display

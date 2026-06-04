@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/2389-research/ccvault/pkg/adapter"
@@ -61,9 +62,10 @@ func TestJeffAdapter_Discover(t *testing.T) {
 		t.Fatalf("expected 2 files, got %d", len(files))
 	}
 
+	wantProjectPath := projectPathForRoot(root)
 	for _, f := range files {
-		if f.ProjectPath != "jeff" {
-			t.Errorf("expected project path %q, got %q", "jeff", f.ProjectPath)
+		if f.ProjectPath != wantProjectPath {
+			t.Errorf("expected project path %q, got %q", wantProjectPath, f.ProjectPath)
 		}
 	}
 }
@@ -162,12 +164,15 @@ func TestJeffAdapter_Parse(t *testing.T) {
 		t.Fatalf("Parse error: %v", err)
 	}
 
-	// Check session metadata
-	if session.ID != "d41f67af-1234-5678-9abc-def012345678" {
+	// Check session metadata. IDs are namespaced with the source prefix so they
+	// can't collide with UUIDs from other adapters on the global sessions PK.
+	if session.ID != "jeff:d41f67af-1234-5678-9abc-def012345678" {
 		t.Errorf("unexpected session ID: %s", session.ID)
 	}
-	if session.ProjectPath != "jeff" {
-		t.Errorf("unexpected project path: %s", session.ProjectPath)
+	// ProjectPath is intentionally left empty on the parsed session; the sync
+	// layer fills it from the discovered SessionFile.ProjectPath.
+	if session.ProjectPath != "" {
+		t.Errorf("expected empty project path on parsed session, got: %s", session.ProjectPath)
 	}
 	if session.Model != "claude-sonnet-4-5" {
 		t.Errorf("unexpected model: %s", session.Model)
@@ -227,6 +232,53 @@ func TestJeffAdapter_Parse(t *testing.T) {
 	// HasError metadata should be set due to error entry
 	if v, ok := session.Metadata["has_error"]; !ok || v != true {
 		t.Errorf("expected has_error=true in metadata, got %v", session.Metadata)
+	}
+}
+
+func TestJeffAdapter_Parse_RecoversSessionIDWithoutSessionStart(t *testing.T) {
+	// Jeff sessions whose session_start line is missing or corrupt should
+	// still produce a session whose ID is recovered from conversation_id on
+	// other lines, otherwise dedupe/upsert breaks on partial files.
+	dir := t.TempDir()
+	fpath := filepath.Join(dir, "no-session-start.jsonl")
+
+	convID := "deadbeef-1234-5678-9abc-def012345678"
+	lines := []map[string]any{
+		// session_start is intentionally absent.
+		{
+			"timestamp":       "2026-02-24T19:56:10.000000Z",
+			"entry_type":      "user_message",
+			"conversation_id": convID,
+			"data":            map[string]any{"content": "hello"},
+		},
+		{
+			"timestamp":       "2026-02-24T19:56:15.000000Z",
+			"entry_type":      "assistant_message",
+			"conversation_id": convID,
+			"data":            map[string]any{"content": "world"},
+		},
+	}
+	writeJSONLFile(t, fpath, lines)
+
+	a := New()
+	session, err := a.Parse(fpath)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	wantID := "jeff:" + convID
+	if session.ID != wantID {
+		t.Errorf("session.ID = %q, want %q", session.ID, wantID)
+	}
+	if len(session.Turns) != 2 {
+		t.Fatalf("len(Turns) = %d, want 2", len(session.Turns))
+	}
+	// Each turn ID must also carry the recovered conversation ID so dedupe
+	// across re-syncs is stable.
+	for i, tr := range session.Turns {
+		if !strings.HasPrefix(tr.ID, wantID+"-turn-") {
+			t.Errorf("Turns[%d].ID = %q, want prefix %q", i, tr.ID, wantID+"-turn-")
+		}
 	}
 }
 

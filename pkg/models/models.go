@@ -96,6 +96,7 @@ type UserContentBlock struct {
 	Text      string `json:"text,omitempty"`
 	Content   string `json:"content,omitempty"` // For tool_result
 	ToolUseID string `json:"tool_use_id,omitempty"`
+	IsError   bool   `json:"is_error,omitempty"` // For tool_result
 }
 
 // RawAssistantMessage represents an assistant message in Claude Code format

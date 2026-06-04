@@ -210,8 +210,35 @@ func TestExport_WithSource(t *testing.T) {
 
 	output := buf.String()
 
-	if !strings.Contains(output, "| **Source** | codex |") {
-		t.Error("Missing source row in metadata")
+	if !strings.Contains(output, "| **Source** | `codex` |") {
+		t.Errorf("Missing source row in metadata; got:\n%s", output)
+	}
+}
+
+func TestExport_SourceEscaping(t *testing.T) {
+	e := NewMarkdownExporter()
+
+	session := &models.Session{
+		ID:        "test-session-pipe",
+		Model:     "claude-opus-4",
+		StartedAt: time.Date(2024, 1, 15, 10, 30, 0, 0, time.UTC),
+		Source:    "weird|name\nwith newline",
+	}
+
+	var buf bytes.Buffer
+	if err := e.Export(&buf, session, nil, ""); err != nil {
+		t.Fatalf("Export failed: %v", err)
+	}
+
+	output := buf.String()
+	if strings.Contains(output, "weird|name") {
+		t.Errorf("unescaped pipe leaked into table cell:\n%s", output)
+	}
+	if strings.Contains(output, "weird|name\nwith newline") {
+		t.Errorf("newline in source not collapsed:\n%s", output)
+	}
+	if !strings.Contains(output, `weird\|name with newline`) {
+		t.Errorf("expected escaped/collapsed source, got:\n%s", output)
 	}
 }
 

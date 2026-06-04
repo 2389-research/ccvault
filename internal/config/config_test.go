@@ -159,6 +159,47 @@ func TestLoad_BackwardCompat(t *testing.T) {
 	}
 }
 
+func TestLoad_DuplicateSourceNames(t *testing.T) {
+	tmpDir := t.TempDir()
+	configFile := filepath.Join(tmpDir, "config.yaml")
+
+	content := `
+sources:
+  - name: "primary"
+    type: "claude-code"
+    path: "/home/user/.claude"
+  - name: "primary"
+    type: "codex"
+    path: "/home/user/.codex"
+`
+	if err := os.WriteFile(configFile, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write config: %v", err)
+	}
+
+	if _, err := LoadFrom(configFile); err == nil {
+		t.Fatal("expected error for duplicate source names, got nil")
+	}
+}
+
+func TestLoad_EmptySourceName(t *testing.T) {
+	tmpDir := t.TempDir()
+	configFile := filepath.Join(tmpDir, "config.yaml")
+
+	content := `
+sources:
+  - name: ""
+    type: "claude-code"
+    path: "/home/user/.claude"
+`
+	if err := os.WriteFile(configFile, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write config: %v", err)
+	}
+
+	if _, err := LoadFrom(configFile); err == nil {
+		t.Fatal("expected error for empty source name, got nil")
+	}
+}
+
 func TestEnsureDataDir(t *testing.T) {
 	// Create a temp directory for testing
 	tmpDir := t.TempDir()

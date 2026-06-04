@@ -55,9 +55,10 @@ func TestHexAdapter_Discover(t *testing.T) {
 		t.Fatalf("Discover() returned %d files, want 2", len(files))
 	}
 
+	wantProjectPath := projectPathForRoot(root)
 	for _, sf := range files {
-		if sf.ProjectPath != "hex" {
-			t.Errorf("ProjectPath = %q, want %q", sf.ProjectPath, "hex")
+		if sf.ProjectPath != wantProjectPath {
+			t.Errorf("ProjectPath = %q, want %q", sf.ProjectPath, wantProjectPath)
 		}
 		if sf.ModTime.IsZero() {
 			t.Error("ModTime is zero")
@@ -116,11 +117,13 @@ func TestHexAdapter_Parse(t *testing.T) {
 		t.Fatalf("Parse() error: %v", err)
 	}
 
-	if parsed.ID != "abc-123" {
-		t.Errorf("ID = %q, want %q", parsed.ID, "abc-123")
+	if parsed.ID != "hex:abc-123" {
+		t.Errorf("ID = %q, want %q", parsed.ID, "hex:abc-123")
 	}
-	if parsed.ProjectPath != "hex" {
-		t.Errorf("ProjectPath = %q, want %q", parsed.ProjectPath, "hex")
+	// ProjectPath is intentionally empty on the parsed session; sync layer
+	// fills it from the SessionFile produced by Discover().
+	if parsed.ProjectPath != "" {
+		t.Errorf("ProjectPath = %q, want empty", parsed.ProjectPath)
 	}
 	if parsed.SourceName != "hex" {
 		t.Errorf("SourceName = %q, want %q", parsed.SourceName, "hex")
@@ -130,8 +133,14 @@ func TestHexAdapter_Parse(t *testing.T) {
 	}
 
 	// Check timestamps
-	expectedStart, _ := time.Parse(time.RFC3339Nano, "2026-01-12T11:48:34.247188-06:00")
-	expectedEnd, _ := time.Parse(time.RFC3339Nano, "2026-01-12T11:48:50.530819-06:00")
+	expectedStart, err := time.Parse(time.RFC3339Nano, "2026-01-12T11:48:34.247188-06:00")
+	if err != nil {
+		t.Fatalf("parse expectedStart: %v", err)
+	}
+	expectedEnd, err := time.Parse(time.RFC3339Nano, "2026-01-12T11:48:50.530819-06:00")
+	if err != nil {
+		t.Fatalf("parse expectedEnd: %v", err)
+	}
 	if !parsed.StartedAt.Equal(expectedStart) {
 		t.Errorf("StartedAt = %v, want %v", parsed.StartedAt, expectedStart)
 	}
@@ -146,8 +155,8 @@ func TestHexAdapter_Parse(t *testing.T) {
 
 	// First turn
 	turn0 := parsed.Turns[0]
-	if turn0.ID != "abc-123-0" {
-		t.Errorf("Turns[0].ID = %q, want %q", turn0.ID, "abc-123-0")
+	if turn0.ID != "hex:abc-123-0" {
+		t.Errorf("Turns[0].ID = %q, want %q", turn0.ID, "hex:abc-123-0")
 	}
 	if turn0.ParentID != "" {
 		t.Errorf("Turns[0].ParentID = %q, want empty", turn0.ParentID)
@@ -164,11 +173,11 @@ func TestHexAdapter_Parse(t *testing.T) {
 
 	// Second turn
 	turn1 := parsed.Turns[1]
-	if turn1.ID != "abc-123-1" {
-		t.Errorf("Turns[1].ID = %q, want %q", turn1.ID, "abc-123-1")
+	if turn1.ID != "hex:abc-123-1" {
+		t.Errorf("Turns[1].ID = %q, want %q", turn1.ID, "hex:abc-123-1")
 	}
-	if turn1.ParentID != "abc-123-0" {
-		t.Errorf("Turns[1].ParentID = %q, want %q", turn1.ParentID, "abc-123-0")
+	if turn1.ParentID != "hex:abc-123-0" {
+		t.Errorf("Turns[1].ParentID = %q, want %q", turn1.ParentID, "hex:abc-123-0")
 	}
 	if turn1.Type != "assistant" {
 		t.Errorf("Turns[1].Type = %q, want %q", turn1.Type, "assistant")
@@ -225,8 +234,8 @@ func TestHexAdapter_Parse_EmptyMessages(t *testing.T) {
 		t.Fatalf("Parse() error: %v", err)
 	}
 
-	if parsed.ID != "empty-123" {
-		t.Errorf("ID = %q, want %q", parsed.ID, "empty-123")
+	if parsed.ID != "hex:empty-123" {
+		t.Errorf("ID = %q, want %q", parsed.ID, "hex:empty-123")
 	}
 	if len(parsed.Turns) != 0 {
 		t.Errorf("len(Turns) = %d, want 0", len(parsed.Turns))

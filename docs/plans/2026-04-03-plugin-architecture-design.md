@@ -116,7 +116,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 
 Numbered migration files (embedded via `//go:embed`):
 
-```
+```text
 internal/db/migrations/
   001_initial_schema.sql       -- current schema.sql content
   002_add_error_subagent.sql   -- has_error, has_subagent columns + indexes
