@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/2389-research/ccvault/internal/config"
 	"github.com/2389-research/ccvault/internal/db"
 	"github.com/2389-research/ccvault/internal/sync"
 	"github.com/charmbracelet/bubbles/progress"
@@ -22,16 +23,16 @@ type syncCountProgress struct {
 
 // SyncingModel holds syncing view state
 type SyncingModel struct {
-	db         *db.DB
-	claudeHome string
-	progress   []string
-	done       bool
-	err        error
-	stats      *sync.Stats
-	startTime  time.Time
-	bar        progress.Model
-	current    int
-	total      int
+	db        *db.DB
+	sources   []config.SourceConfig
+	progress  []string
+	done      bool
+	err       error
+	stats     *sync.Stats
+	startTime time.Time
+	bar       progress.Model
+	current   int
+	total     int
 
 	// Channels for communicating with the sync goroutine
 	progressCh chan string
@@ -40,7 +41,7 @@ type SyncingModel struct {
 }
 
 // NewSyncingModel creates a new syncing model
-func NewSyncingModel(database *db.DB, claudeHome string) *SyncingModel {
+func NewSyncingModel(database *db.DB, sources []config.SourceConfig) *SyncingModel {
 	bar := progress.New(
 		progress.WithDefaultGradient(),
 		progress.WithWidth(40),
@@ -48,7 +49,7 @@ func NewSyncingModel(database *db.DB, claudeHome string) *SyncingModel {
 	)
 	return &SyncingModel{
 		db:         database,
-		claudeHome: claudeHome,
+		sources:    sources,
 		progress:   []string{},
 		startTime:  time.Now(),
 		bar:        bar,
@@ -79,7 +80,7 @@ func (m *SyncingModel) Init() tea.Cmd {
 
 	// Launch sync in a goroutine so the TUI stays responsive
 	go func() {
-		syncer := sync.New(m.db, m.claudeHome,
+		syncer := sync.New(m.db, m.sources,
 			sync.WithProgressCallback(func(msg string) {
 				m.progressCh <- msg
 			}),
@@ -213,7 +214,7 @@ func (m *SyncingModel) View() string {
 		pct := float64(m.current) / float64(m.total)
 		b.WriteString("  ")
 		b.WriteString(m.bar.ViewAs(pct))
-		b.WriteString(fmt.Sprintf("  %d/%d", m.current, m.total))
+		fmt.Fprintf(&b, "  %d/%d", m.current, m.total)
 		b.WriteString("\n\n")
 	}
 

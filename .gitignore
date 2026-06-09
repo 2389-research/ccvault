@@ -35,3 +35,6 @@ Thumbs.db
 # Worktrees
 .worktrees/
 worktrees/
+
+# Scratch scenario tests
+.scratch/

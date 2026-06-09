@@ -13,11 +13,16 @@ import (
 
 // UpsertSession creates or updates a session record
 func (db *DB) UpsertSession(s *models.Session) error {
+	source := s.Source
+	if source == "" {
+		source = "claude-code"
+	}
+
 	query := `
 		INSERT INTO sessions (id, project_id, started_at, ended_at, model, git_branch,
 			turn_count, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-			source_file, source_mtime, has_error, has_subagent)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			source_file, source_mtime, has_error, has_subagent, source)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			ended_at = excluded.ended_at,
 			model = COALESCE(excluded.model, sessions.model),
@@ -28,7 +33,8 @@ func (db *DB) UpsertSession(s *models.Session) error {
 			cache_write_tokens = excluded.cache_write_tokens,
 			source_mtime = excluded.source_mtime,
 			has_error = excluded.has_error,
-			has_subagent = excluded.has_subagent`
+			has_subagent = excluded.has_subagent,
+			source = excluded.source`
 
 	_, err := db.Exec(query,
 		s.ID,
@@ -46,6 +52,7 @@ func (db *DB) UpsertSession(s *models.Session) error {
 		time.Now(),
 		s.HasError,
 		s.HasSubagent,
+		source,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert session: %w", err)
@@ -55,11 +62,16 @@ func (db *DB) UpsertSession(s *models.Session) error {
 
 // UpsertSessionTx creates or updates a session record within a transaction
 func (db *DB) UpsertSessionTx(tx *sql.Tx, s *models.Session) error {
+	source := s.Source
+	if source == "" {
+		source = "claude-code"
+	}
+
 	query := `
 		INSERT INTO sessions (id, project_id, started_at, ended_at, model, git_branch,
 			turn_count, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-			source_file, source_mtime, has_error, has_subagent)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			source_file, source_mtime, has_error, has_subagent, source)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			ended_at = excluded.ended_at,
 			model = COALESCE(excluded.model, sessions.model),
@@ -70,7 +82,8 @@ func (db *DB) UpsertSessionTx(tx *sql.Tx, s *models.Session) error {
 			cache_write_tokens = excluded.cache_write_tokens,
 			source_mtime = excluded.source_mtime,
 			has_error = excluded.has_error,
-			has_subagent = excluded.has_subagent`
+			has_subagent = excluded.has_subagent,
+			source = excluded.source`
 
 	_, err := tx.Exec(query,
 		s.ID,
@@ -88,6 +101,7 @@ func (db *DB) UpsertSessionTx(tx *sql.Tx, s *models.Session) error {
 		time.Now(),
 		s.HasError,
 		s.HasSubagent,
+		source,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert session: %w", err)
@@ -100,7 +114,7 @@ func (db *DB) GetSession(id string) (*models.Session, error) {
 	query := `
 		SELECT id, project_id, started_at, ended_at, model, git_branch,
 			turn_count, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-			source_file
+			source_file, source
 		FROM sessions WHERE id = ?`
 
 	s := &models.Session{}
@@ -118,6 +132,7 @@ func (db *DB) GetSession(id string) (*models.Session, error) {
 		&s.CacheReadTokens,
 		&s.CacheWriteTokens,
 		&s.SourceFile,
+		&s.Source,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -136,7 +151,7 @@ func (db *DB) GetSessions(projectID int64, limit int) ([]models.Session, error) 
 	query := `
 		SELECT s.id, s.project_id, s.started_at, s.ended_at, s.model, s.git_branch,
 			s.turn_count, s.input_tokens, s.output_tokens, s.cache_read_tokens, s.cache_write_tokens,
-			s.source_file, COALESCE(p.path, '') as project_path
+			s.source_file, COALESCE(p.path, '') as project_path, s.source
 		FROM sessions s
 		LEFT JOIN projects p ON s.project_id = p.id`
 
@@ -176,6 +191,7 @@ func (db *DB) GetSessions(projectID int64, limit int) ([]models.Session, error) 
 			&s.CacheWriteTokens,
 			&s.SourceFile,
 			&s.ProjectPath,
+			&s.Source,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scan session: %w", err)
@@ -258,9 +274,17 @@ func (db *DB) GetSourceMtime(path string) (time.Time, error) {
 	return time.Time{}, nil
 }
 
-// GetAllSourceMtimes loads all source file modification times from the source_files tracking table
-func (db *DB) GetAllSourceMtimes() (map[string]time.Time, error) {
-	rows, err := db.Query("SELECT path, mtime FROM source_files")
+// GetAllSourceMtimes loads all source file modification times from the source_files tracking table.
+// If source is non-empty, only returns entries matching that source.
+func (db *DB) GetAllSourceMtimes(source ...string) (map[string]time.Time, error) {
+	query := "SELECT path, mtime FROM source_files"
+	var args []interface{}
+	if len(source) > 0 && source[0] != "" {
+		query += " WHERE source = ?"
+		args = append(args, source[0])
+	}
+
+	rows, err := db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -278,20 +302,30 @@ func (db *DB) GetAllSourceMtimes() (map[string]time.Time, error) {
 	return result, rows.Err()
 }
 
-// UpsertSourceFileMtime records a source file's mtime after processing
-func (db *DB) UpsertSourceFileMtime(path string, mtime time.Time) error {
+// UpsertSourceFileMtime records a source file's mtime after processing.
+// Source defaults to "claude-code" if empty.
+func (db *DB) UpsertSourceFileMtime(path string, mtime time.Time, source ...string) error {
+	src := "claude-code"
+	if len(source) > 0 && source[0] != "" {
+		src = source[0]
+	}
 	_, err := db.Exec(
-		"INSERT INTO source_files (path, mtime, synced_at) VALUES (?, ?, ?) ON CONFLICT(path) DO UPDATE SET mtime = excluded.mtime, synced_at = excluded.synced_at",
-		path, mtime, time.Now(),
+		"INSERT INTO source_files (path, source, mtime, synced_at) VALUES (?, ?, ?, ?) ON CONFLICT(path, source) DO UPDATE SET mtime = excluded.mtime, synced_at = excluded.synced_at",
+		path, src, mtime, time.Now(),
 	)
 	return err
 }
 
-// UpsertSourceFileMtimeTx records a source file's mtime within a transaction
-func (db *DB) UpsertSourceFileMtimeTx(tx *sql.Tx, path string, mtime time.Time) error {
+// UpsertSourceFileMtimeTx records a source file's mtime within a transaction.
+// Source defaults to "claude-code" if empty.
+func (db *DB) UpsertSourceFileMtimeTx(tx *sql.Tx, path string, mtime time.Time, source ...string) error {
+	src := "claude-code"
+	if len(source) > 0 && source[0] != "" {
+		src = source[0]
+	}
 	_, err := tx.Exec(
-		"INSERT INTO source_files (path, mtime, synced_at) VALUES (?, ?, ?) ON CONFLICT(path) DO UPDATE SET mtime = excluded.mtime, synced_at = excluded.synced_at",
-		path, mtime, time.Now(),
+		"INSERT INTO source_files (path, source, mtime, synced_at) VALUES (?, ?, ?, ?) ON CONFLICT(path, source) DO UPDATE SET mtime = excluded.mtime, synced_at = excluded.synced_at",
+		path, src, mtime, time.Now(),
 	)
 	return err
 }

@@ -1,5 +1,5 @@
--- ABOUTME: Reference copy of the SQLite schema for ccvault database
--- ABOUTME: Migrations in internal/db/migrations/ are the source of truth for schema changes
+-- ABOUTME: Initial database schema for ccvault
+-- ABOUTME: Creates core tables for projects, sessions, turns, tool_uses, FTS5, and sync state
 
 -- Projects table
 CREATE TABLE IF NOT EXISTS projects (
@@ -9,13 +9,11 @@ CREATE TABLE IF NOT EXISTS projects (
     first_seen_at DATETIME,
     last_activity_at DATETIME,
     session_count INTEGER DEFAULT 0,
-    total_tokens INTEGER DEFAULT 0,
-    source TEXT NOT NULL DEFAULT 'claude-code'
+    total_tokens INTEGER DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_projects_path ON projects(path);
 CREATE INDEX IF NOT EXISTS idx_projects_last_activity ON projects(last_activity_at DESC);
-CREATE INDEX IF NOT EXISTS idx_projects_source ON projects(source);
 
 -- Sessions table
 CREATE TABLE IF NOT EXISTS sessions (
@@ -31,16 +29,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     cache_read_tokens INTEGER DEFAULT 0,
     cache_write_tokens INTEGER DEFAULT 0,
     source_file TEXT NOT NULL,
-    source_mtime DATETIME,
-    has_error INTEGER DEFAULT 0,
-    has_subagent INTEGER DEFAULT 0,
-    source TEXT NOT NULL DEFAULT 'claude-code'
+    source_mtime DATETIME
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_file ON sessions(source_file);
-CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 
 -- Turns table
 CREATE TABLE IF NOT EXISTS turns (
@@ -100,17 +94,9 @@ CREATE TABLE IF NOT EXISTS sync_state (
     value TEXT
 );
 
--- Source file tracking for incremental sync (composite PK prevents cross-source collisions)
+-- Source file tracking for incremental sync
 CREATE TABLE IF NOT EXISTS source_files (
-    path TEXT NOT NULL,
-    source TEXT NOT NULL DEFAULT 'claude-code',
+    path TEXT PRIMARY KEY,
     mtime DATETIME NOT NULL,
-    synced_at DATETIME NOT NULL,
-    PRIMARY KEY (path, source)
-);
-
--- Schema version tracking for migrations
-CREATE TABLE IF NOT EXISTS schema_version (
-    version INTEGER NOT NULL,
-    applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    synced_at DATETIME NOT NULL
 );

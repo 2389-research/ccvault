@@ -159,7 +159,7 @@ func (m *SessionsModel) View() string {
 		b.WriteString("\n")
 	} else {
 		// Header
-		header := fmt.Sprintf("%-20s %6s %10s %-30s", "STARTED", "TURNS", "TOKENS", "MODEL")
+		header := fmt.Sprintf("%-20s %-12s %6s %10s %-30s", "STARTED", "SOURCE", "TURNS", "TOKENS", "MODEL")
 		b.WriteString(headerStyle.Render(header))
 		b.WriteString("\n")
 
@@ -178,8 +178,14 @@ func (m *SessionsModel) View() string {
 			}
 			tokens := s.InputTokens + s.OutputTokens
 
-			line := fmt.Sprintf("%-20s %6d %10s %-30s",
+			source := s.Source
+			if len(source) > 10 {
+				source = source[:10] + ".."
+			}
+
+			line := fmt.Sprintf("%-20s %-12s %6d %10s %-30s",
 				s.StartedAt.Format("2006-01-02 15:04"),
+				source,
 				s.TurnCount,
 				formatTokensPlain(tokens),
 				model)

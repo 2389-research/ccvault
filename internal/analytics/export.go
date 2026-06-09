@@ -27,6 +27,7 @@ type SessionRecord struct {
 	OutputTokens    int64  `parquet:"name=output_tokens, type=INT64"`
 	CacheReadTokens int64  `parquet:"name=cache_read_tokens, type=INT64"`
 	TotalTokens     int64  `parquet:"name=total_tokens, type=INT64"`
+	Source          string `parquet:"name=source, type=BYTE_ARRAY, convertedtype=UTF8"`
 }
 
 // TurnRecord is a Parquet-compatible turn record
@@ -129,6 +130,7 @@ func (e *Exporter) exportSessions() error {
 			OutputTokens:    s.OutputTokens,
 			CacheReadTokens: s.CacheReadTokens,
 			TotalTokens:     s.InputTokens + s.OutputTokens + s.CacheReadTokens + s.CacheWriteTokens,
+			Source:          s.Source,
 		}
 		if err := pw.Write(record); err != nil {
 			return fmt.Errorf("write record: %w", err)

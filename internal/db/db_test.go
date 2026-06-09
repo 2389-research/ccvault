@@ -373,3 +373,239 @@ func TestGetFirstAndLastActivity(t *testing.T) {
 		t.Errorf("last activity should be around %v, got %v", now, last)
 	}
 }
+
+func TestProjectSourceField(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	// Insert project with explicit source
+	p := &models.Project{
+		Path:           "/Users/test/codex-project",
+		DisplayName:    "codex-project",
+		FirstSeenAt:    time.Now(),
+		LastActivityAt: time.Now(),
+		SessionCount:   1,
+		TotalTokens:    500,
+		Source:         "codex",
+	}
+
+	err := db.UpsertProject(p)
+	if err != nil {
+		t.Fatalf("upsert project with source: %v", err)
+	}
+
+	// Verify source is stored via GetProject
+	got, err := db.GetProject(p.ID)
+	if err != nil {
+		t.Fatalf("get project: %v", err)
+	}
+	if got.Source != "codex" {
+		t.Errorf("source = %q, want %q", got.Source, "codex")
+	}
+
+	// Verify source via GetProjectByPath
+	got, err = db.GetProjectByPath(p.Path)
+	if err != nil {
+		t.Fatalf("get project by path: %v", err)
+	}
+	if got.Source != "codex" {
+		t.Errorf("source = %q, want %q", got.Source, "codex")
+	}
+
+	// Verify source via GetProjects
+	projects, err := db.GetProjects("activity", 10)
+	if err != nil {
+		t.Fatalf("get projects: %v", err)
+	}
+	if len(projects) != 1 {
+		t.Fatalf("len(projects) = %d, want 1", len(projects))
+	}
+	if projects[0].Source != "codex" {
+		t.Errorf("source = %q, want %q", projects[0].Source, "codex")
+	}
+}
+
+func TestProjectSourceDefaultsToClaudeCode(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	// Insert project without setting Source (empty string)
+	p := &models.Project{
+		Path:           "/Users/test/default-project",
+		DisplayName:    "default-project",
+		FirstSeenAt:    time.Now(),
+		LastActivityAt: time.Now(),
+		SessionCount:   1,
+		TotalTokens:    100,
+	}
+
+	err := db.UpsertProject(p)
+	if err != nil {
+		t.Fatalf("upsert project: %v", err)
+	}
+
+	got, err := db.GetProject(p.ID)
+	if err != nil {
+		t.Fatalf("get project: %v", err)
+	}
+	if got.Source != "claude-code" {
+		t.Errorf("source = %q, want %q", got.Source, "claude-code")
+	}
+}
+
+func TestSessionSourceField(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	// Create project
+	p := &models.Project{
+		Path:        "/Users/test/project",
+		DisplayName: "test/project",
+		Source:      "codex",
+	}
+	_ = db.UpsertProject(p)
+
+	// Create session with explicit source
+	s := &models.Session{
+		ID:           "codex-session-123",
+		ProjectID:    p.ID,
+		StartedAt:    time.Now(),
+		EndedAt:      time.Now().Add(time.Hour),
+		Model:        "o3",
+		TurnCount:    5,
+		InputTokens:  200,
+		OutputTokens: 100,
+		SourceFile:   "/test/codex-session.jsonl",
+		Source:       "codex",
+	}
+
+	err := db.UpsertSession(s)
+	if err != nil {
+		t.Fatalf("upsert session with source: %v", err)
+	}
+
+	// Verify via GetSession
+	got, err := db.GetSession(s.ID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if got.Source != "codex" {
+		t.Errorf("source = %q, want %q", got.Source, "codex")
+	}
+
+	// Verify via GetSessions
+	sessions, err := db.GetSessions(p.ID, 10)
+	if err != nil {
+		t.Fatalf("get sessions: %v", err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("len(sessions) = %d, want 1", len(sessions))
+	}
+	if sessions[0].Source != "codex" {
+		t.Errorf("source = %q, want %q", sessions[0].Source, "codex")
+	}
+}
+
+func TestSessionSourceDefaultsToClaudeCode(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	p := &models.Project{Path: "/test", DisplayName: "test"}
+	_ = db.UpsertProject(p)
+
+	s := &models.Session{
+		ID:         "default-session-1",
+		ProjectID:  p.ID,
+		StartedAt:  time.Now(),
+		SourceFile: "/test/default.jsonl",
+	}
+	err := db.UpsertSession(s)
+	if err != nil {
+		t.Fatalf("upsert session: %v", err)
+	}
+
+	got, err := db.GetSession(s.ID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if got.Source != "claude-code" {
+		t.Errorf("source = %q, want %q", got.Source, "claude-code")
+	}
+}
+
+func TestGetAllSourceMtimesWithFilter(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	now := time.Now()
+
+	// Insert source files with different sources
+	err := db.UpsertSourceFileMtime("/path/claude1.jsonl", now, "claude-code")
+	if err != nil {
+		t.Fatalf("upsert mtime: %v", err)
+	}
+	err = db.UpsertSourceFileMtime("/path/claude2.jsonl", now, "claude-code")
+	if err != nil {
+		t.Fatalf("upsert mtime: %v", err)
+	}
+	err = db.UpsertSourceFileMtime("/path/codex1.jsonl", now, "codex")
+	if err != nil {
+		t.Fatalf("upsert mtime: %v", err)
+	}
+
+	// Get all (no filter)
+	all, err := db.GetAllSourceMtimes()
+	if err != nil {
+		t.Fatalf("get all mtimes: %v", err)
+	}
+	if len(all) != 3 {
+		t.Errorf("len(all) = %d, want 3", len(all))
+	}
+
+	// Filter by claude-code
+	claude, err := db.GetAllSourceMtimes("claude-code")
+	if err != nil {
+		t.Fatalf("get claude mtimes: %v", err)
+	}
+	if len(claude) != 2 {
+		t.Errorf("len(claude) = %d, want 2", len(claude))
+	}
+
+	// Filter by codex
+	codex, err := db.GetAllSourceMtimes("codex")
+	if err != nil {
+		t.Fatalf("get codex mtimes: %v", err)
+	}
+	if len(codex) != 1 {
+		t.Errorf("len(codex) = %d, want 1", len(codex))
+	}
+	if _, ok := codex["/path/codex1.jsonl"]; !ok {
+		t.Error("expected /path/codex1.jsonl in codex results")
+	}
+}
+
+func TestUpsertProjectTxWithSource(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	p := &models.Project{
+		Path:        "/test/tx-project",
+		DisplayName: "tx-project",
+		Source:      "codex",
+	}
+
+	err := db.WithTx(func(tx *sql.Tx) error {
+		return db.UpsertProjectTx(tx, p)
+	})
+	if err != nil {
+		t.Fatalf("transaction: %v", err)
+	}
+
+	got, _ := db.GetProject(p.ID)
+	if got == nil {
+		t.Fatal("project not created in transaction")
+	}
+	if got.Source != "codex" {
+		t.Errorf("source = %q, want %q", got.Source, "codex")
+	}
+}

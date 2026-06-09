@@ -28,6 +28,7 @@ type Result struct {
 	SessionID   string      `json:"session_id"`
 	ProjectPath string      `json:"project_path"`
 	Model       string      `json:"model,omitempty"`
+	Source      string      `json:"source,omitempty"`
 	Snippet     string      `json:"snippet"`
 }
 
@@ -58,6 +59,7 @@ func (s *Searcher) Search(q *Query, limit int) ([]Result, error) {
 			&content,
 			&r.ProjectPath,
 			&r.Model,
+			&r.Source,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scan result: %w", err)
@@ -82,7 +84,7 @@ func (s *Searcher) buildQuery(q *Query, limit int) (string, []interface{}) {
 	// Base query with joins
 	baseQuery := `
 		SELECT DISTINCT t.id, t.session_id, t.type, t.timestamp, t.content,
-			p.path as project_path, s.model
+			p.path as project_path, s.model, s.source
 		FROM turns t
 		JOIN sessions s ON t.session_id = s.id
 		JOIN projects p ON s.project_id = p.id`
@@ -141,6 +143,7 @@ func (s *Searcher) buildQuery(q *Query, limit int) (string, []interface{}) {
 	if !q.After.IsZero() {
 		conditions = append(conditions, fmt.Sprintf("t.timestamp > $%d", argNum))
 		args = append(args, q.After)
+		argNum++
 	}
 
 	// has:error — sessions flagged during sync as containing tool errors
@@ -151,6 +154,13 @@ func (s *Searcher) buildQuery(q *Query, limit int) (string, []interface{}) {
 	// has:subagent — sessions flagged during sync as using Task tool
 	if q.HasAgent {
 		conditions = append(conditions, "s.has_subagent = 1")
+	}
+
+	// Source filter
+	if q.Source != "" {
+		conditions = append(conditions, fmt.Sprintf("s.source = $%d", argNum))
+		args = append(args, q.Source)
+		argNum++ //nolint:ineffassign // keep argNum consistent for future filters
 	}
 
 	// Build final query

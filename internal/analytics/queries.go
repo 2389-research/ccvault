@@ -38,6 +38,30 @@ func (a *Analyzer) Close() error {
 	return a.db.Close()
 }
 
+// SessionsParquetHasSource returns true when the on-disk sessions.parquet has a
+// `source` column. Older parquet files written before multi-source support
+// don't, and source-aware queries against them would fail; callers should
+// rebuild the cache when this returns false. A missing file also returns false.
+func (a *Analyzer) SessionsParquetHasSource() (bool, error) {
+	sessionsPath := filepath.Join(a.cacheDir, "sessions.parquet")
+	if _, err := os.Stat(sessionsPath); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("stat sessions parquet: %w", err)
+	}
+
+	query := fmt.Sprintf(
+		`SELECT COUNT(*) FROM parquet_schema('%s') WHERE name = 'source'`,
+		sessionsPath,
+	)
+	var count int
+	if err := a.db.QueryRow(query).Scan(&count); err != nil {
+		return false, fmt.Errorf("inspect parquet schema: %w", err)
+	}
+	return count > 0, nil
+}
+
 // TokensByDay returns token usage grouped by day
 type DailyTokens struct {
 	Date         time.Time `json:"date"`
@@ -178,6 +202,90 @@ func (a *Analyzer) GetTokensByModel() ([]ModelStats, error) {
 			return nil, fmt.Errorf("scan: %w", err)
 		}
 		results = append(results, m)
+	}
+
+	return results, rows.Err()
+}
+
+// SourceTokenStats represents token usage grouped by source
+type SourceTokenStats struct {
+	Source      string `json:"source"`
+	TotalTokens int64  `json:"total_tokens"`
+}
+
+// GetTokensBySource returns total tokens grouped by source
+func (a *Analyzer) GetTokensBySource() ([]SourceTokenStats, error) {
+	sessionsPath := filepath.Join(a.cacheDir, "sessions.parquet")
+
+	// Check if parquet file exists
+	if _, err := os.Stat(sessionsPath); os.IsNotExist(err) {
+		return nil, fmt.Errorf("analytics cache not found. Run 'ccvault build-cache' first")
+	}
+
+	query := fmt.Sprintf(`
+		SELECT
+			COALESCE(source, 'claude-code') as source,
+			SUM(total_tokens) as total_tokens
+		FROM read_parquet('%s')
+		GROUP BY COALESCE(source, 'claude-code')
+		ORDER BY total_tokens DESC
+	`, sessionsPath)
+
+	rows, err := a.db.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("query: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var results []SourceTokenStats
+	for rows.Next() {
+		var s SourceTokenStats
+		if err := rows.Scan(&s.Source, &s.TotalTokens); err != nil {
+			return nil, fmt.Errorf("scan: %w", err)
+		}
+		results = append(results, s)
+	}
+
+	return results, rows.Err()
+}
+
+// SourceSessionStats represents session count grouped by source
+type SourceSessionStats struct {
+	Source       string `json:"source"`
+	SessionCount int    `json:"session_count"`
+}
+
+// GetSessionsBySource returns session count grouped by source
+func (a *Analyzer) GetSessionsBySource() ([]SourceSessionStats, error) {
+	sessionsPath := filepath.Join(a.cacheDir, "sessions.parquet")
+
+	// Check if parquet file exists
+	if _, err := os.Stat(sessionsPath); os.IsNotExist(err) {
+		return nil, fmt.Errorf("analytics cache not found. Run 'ccvault build-cache' first")
+	}
+
+	query := fmt.Sprintf(`
+		SELECT
+			COALESCE(source, 'claude-code') as source,
+			COUNT(*) as session_count
+		FROM read_parquet('%s')
+		GROUP BY COALESCE(source, 'claude-code')
+		ORDER BY session_count DESC
+	`, sessionsPath)
+
+	rows, err := a.db.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("query: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var results []SourceSessionStats
+	for rows.Next() {
+		var s SourceSessionStats
+		if err := rows.Scan(&s.Source, &s.SessionCount); err != nil {
+			return nil, fmt.Errorf("scan: %w", err)
+		}
+		results = append(results, s)
 	}
 
 	return results, rows.Err()

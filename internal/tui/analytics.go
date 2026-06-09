@@ -67,13 +67,11 @@ type analyticsLoadedMsg struct {
 }
 
 func (m *AnalyticsModel) loadAnalytics() tea.Msg {
-	// Auto-build cache if parquet file is missing
+	// Auto-build cache if parquet file is missing or predates multi-source support
 	sessionsPath := filepath.Join(m.cacheDir, "sessions.parquet")
+	needsRebuild := false
 	if _, err := os.Stat(sessionsPath); os.IsNotExist(err) {
-		exporter := analytics.NewExporter(m.db, m.cacheDir)
-		if err := exporter.Export(); err != nil {
-			return analyticsLoadedMsg{err: fmt.Errorf("build analytics cache: %w", err)}
-		}
+		needsRebuild = true
 	}
 
 	analyzer, err := analytics.NewAnalyzer(m.cacheDir)
@@ -81,6 +79,23 @@ func (m *AnalyticsModel) loadAnalytics() tea.Msg {
 		return analyticsLoadedMsg{err: err}
 	}
 	defer func() { _ = analyzer.Close() }()
+
+	if !needsRebuild {
+		hasSource, err := analyzer.SessionsParquetHasSource()
+		if err != nil {
+			return analyticsLoadedMsg{err: fmt.Errorf("check analytics cache schema: %w", err)}
+		}
+		if !hasSource {
+			needsRebuild = true
+		}
+	}
+
+	if needsRebuild {
+		exporter := analytics.NewExporter(m.db, m.cacheDir)
+		if err := exporter.Export(); err != nil {
+			return analyticsLoadedMsg{err: fmt.Errorf("build analytics cache: %w", err)}
+		}
+	}
 
 	// Load all analytics data
 	summary, err := analyzer.GetSummary()

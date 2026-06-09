@@ -17,6 +17,7 @@ type Project struct {
 	LastActivityAt time.Time `json:"last_activity_at"`
 	SessionCount   int       `json:"session_count"`
 	TotalTokens    int64     `json:"total_tokens"`
+	Source         string    `json:"source"` // Which AI tool produced this data (e.g. "claude-code", "codex")
 }
 
 // Session represents a single Claude Code conversation session
@@ -36,6 +37,7 @@ type Session struct {
 	SourceFile       string    `json:"source_file"` // Path to .jsonl file
 	HasError         bool      `json:"has_error"`
 	HasSubagent      bool      `json:"has_subagent"`
+	Source           string    `json:"source"` // Which AI tool produced this data (e.g. "claude-code", "codex")
 }
 
 // TotalTokens returns the sum of all token usage
@@ -94,6 +96,7 @@ type UserContentBlock struct {
 	Text      string `json:"text,omitempty"`
 	Content   string `json:"content,omitempty"` // For tool_result
 	ToolUseID string `json:"tool_use_id,omitempty"`
+	IsError   bool   `json:"is_error,omitempty"` // For tool_result
 }
 
 // RawAssistantMessage represents an assistant message in Claude Code format
