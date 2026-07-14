@@ -10,7 +10,7 @@
 | `get_session` | `session_id` (string) | — | Full session as markdown | WARNING: returns warning object (no markdown) for 100+ turn sessions; truncates at 50K chars. Prefer summary + turns for large sessions |
 | `list_sessions` | — | `project` (string, partial match), `limit` (number, default 20, max 100) | Recent sessions sorted by date desc | Partial match on path or display name; returns error (not empty) if no project matches; sets has_more when truncated |
 | `list_projects` | — | `sort` (name/activity/tokens/sessions, default: activity), `limit` (number, default 50, max 100) | Projects with session counts and token usage | Use to discover project names before searching; sets has_more when truncated |
-| `get_stats` | — | — | Archive-wide counts: projects, sessions, turns, total tokens, model breakdown, top tools, date range | Fast overview of the entire archive |
+| `get_stats` | — | — | Archive-wide counts: projects, sessions, turns, total tokens, model breakdown, top tools, date range | Fast overview of the entire archive. `first_activity`, `last_activity`, `days_span`, and `top_tools` are enrichment fields: if their queries fail the fields are omitted and a `warnings` entry is added instead |
 | `get_analytics` | — | `days` (number, default 30) | Daily token breakdown, top projects, model breakdown | Requires DuckDB analytics cache; when the cache is missing, returns `analytics.available: false` with a build-cache hint. Degraded stats appear as `summary.warnings`; degraded analytics queries as top-level `warnings` |
 
 ## 2. Search Query Syntax
