@@ -262,6 +262,35 @@ func TestGetAnalytics_ReportsUnavailableAnalytics(t *testing.T) {
 	}
 }
 
+func TestGetAnalytics_PropagatesSummaryWarnings(t *testing.T) {
+	s, database := newTestServer(t)
+
+	// Break only an enrichment query so getStats degrades (warns) instead of
+	// hard-failing. Dropping tool_uses makes GetToolUsageStats fail while
+	// the core session/project/token queries still succeed on empty tables.
+	if _, err := database.Exec("DROP TABLE tool_uses"); err != nil {
+		t.Fatalf("drop tool_uses: %v", err)
+	}
+
+	result, err := s.getAnalytics(map[string]interface{}{})
+	if err != nil {
+		t.Fatalf("getAnalytics: %v", err)
+	}
+
+	m := result.(map[string]interface{})
+	summary, ok := m["summary"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("result[summary] is not a map, got %#v", m["summary"])
+	}
+	warnings, ok := summary["warnings"].([]string)
+	if !ok || len(warnings) == 0 {
+		t.Fatalf("summary[warnings] should be a non-empty []string, got %#v", summary["warnings"])
+	}
+	if !strings.Contains(warnings[0], "tool") {
+		t.Errorf("warning should mention tool stats, got %q", warnings[0])
+	}
+}
+
 func TestGetStats_HealthyDBHasNoWarnings(t *testing.T) {
 	s, database := newTestServer(t)
 	p := seedProject(t, database, "/test/proj")
