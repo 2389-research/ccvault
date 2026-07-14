@@ -313,3 +313,34 @@ func (db *DB) GetToolUsageStats(limit int) (map[string]int, error) {
 
 	return result, rows.Err()
 }
+
+// GetToolNamesLike returns distinct tool names containing fragment
+// (case-insensitive), ordered by name. Used for "did you mean" hints
+// when a tool: search matches nothing.
+func (db *DB) GetToolNamesLike(fragment string, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+
+	rows, err := db.Query(`
+		SELECT DISTINCT tool_name
+		FROM tool_uses
+		WHERE tool_name LIKE '%' || ? || '%'
+		ORDER BY tool_name
+		LIMIT ?`, fragment, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query tool names: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("scan tool name: %w", err)
+		}
+		names = append(names, name)
+	}
+
+	return names, rows.Err()
+}

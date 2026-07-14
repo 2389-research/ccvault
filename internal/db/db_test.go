@@ -609,3 +609,46 @@ func TestUpsertProjectTxWithSource(t *testing.T) {
 		t.Errorf("source = %q, want %q", got.Source, "codex")
 	}
 }
+
+func TestGetToolNamesLike(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	p := &models.Project{Path: "/test", DisplayName: "test"}
+	_ = db.UpsertProject(p)
+	s := &models.Session{ID: "session-1", ProjectID: p.ID, StartedAt: time.Now(), SourceFile: "/test.jsonl"}
+	_ = db.UpsertSession(s)
+
+	toolUses := []models.ToolUse{
+		{TurnID: "turn-1", SessionID: s.ID, ToolName: "Bash", Timestamp: time.Now()},
+		{TurnID: "turn-2", SessionID: s.ID, ToolName: "mcp__ccvault__search_conversations", Timestamp: time.Now()},
+		{TurnID: "turn-3", SessionID: s.ID, ToolName: "mcp__chronicle__remember_this", Timestamp: time.Now()},
+	}
+	if err := db.InsertToolUses(toolUses); err != nil {
+		t.Fatalf("insert tool uses: %v", err)
+	}
+
+	names, err := db.GetToolNamesLike("ccvault", 5)
+	if err != nil {
+		t.Fatalf("GetToolNamesLike: %v", err)
+	}
+	if len(names) != 1 || names[0] != "mcp__ccvault__search_conversations" {
+		t.Errorf("names = %v, want [mcp__ccvault__search_conversations]", names)
+	}
+
+	upper, err := db.GetToolNamesLike("CCVAULT", 5)
+	if err != nil {
+		t.Fatalf("GetToolNamesLike upper: %v", err)
+	}
+	if len(upper) != 1 {
+		t.Errorf("case-insensitive match failed, got %v", upper)
+	}
+
+	none, err := db.GetToolNamesLike("zzz-no-such-tool", 5)
+	if err != nil {
+		t.Fatalf("GetToolNamesLike none: %v", err)
+	}
+	if len(none) != 0 {
+		t.Errorf("expected no matches, got %v", none)
+	}
+}
