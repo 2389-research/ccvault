@@ -23,28 +23,30 @@ import (
 
 // Server handles MCP protocol communication
 type Server struct {
-	db       *db.DB
-	cfg      *config.Config
-	analyzer *analytics.Analyzer
-	debug    bool
-	out      io.Writer // stdout by default; overridable for tests
+	db          *db.DB
+	cfg         *config.Config
+	analyzer    *analytics.Analyzer
+	analyzerErr error
+	debug       bool
+	out         io.Writer // stdout by default; overridable for tests
 }
 
 // NewServer creates a new MCP server
 func NewServer(database *db.DB, cfg *config.Config) (*Server, error) {
 	cacheDir := filepath.Join(cfg.DataDir, "analytics")
-	analyzer, err := analytics.NewAnalyzer(cacheDir)
-	if err != nil {
-		// Analytics not available, continue without it
+	analyzer, analyzerErr := analytics.NewAnalyzer(cacheDir)
+	if analyzerErr != nil {
+		// Analytics stays optional, but the reason is kept and surfaced by get_analytics
 		analyzer = nil
 	}
 
 	return &Server{
-		db:       database,
-		cfg:      cfg,
-		analyzer: analyzer,
-		debug:    os.Getenv("CCVAULT_MCP_DEBUG") == "1",
-		out:      os.Stdout,
+		db:          database,
+		cfg:         cfg,
+		analyzer:    analyzer,
+		analyzerErr: analyzerErr,
+		debug:       os.Getenv("CCVAULT_MCP_DEBUG") == "1",
+		out:         os.Stdout,
 	}, nil
 }
 
@@ -640,6 +642,24 @@ func (s *Server) searchConversations(args map[string]interface{}) (interface{}, 
 	return response, nil
 }
 
+// lookupProjectPath resolves a session's project path. Failures come back
+// as warning strings so callers surface them instead of dropping them.
+func (s *Server) lookupProjectPath(projectID int64) (string, []string) {
+	if projectID <= 0 {
+		return "", nil
+	}
+
+	project, err := s.db.GetProject(projectID)
+	switch {
+	case err != nil:
+		return "", []string{fmt.Sprintf("project lookup failed for project %d: %v", projectID, err)}
+	case project == nil:
+		return "", []string{fmt.Sprintf("project %d not found — session references a missing project", projectID)}
+	default:
+		return project.Path, nil
+	}
+}
+
 func (s *Server) getSessionSummary(args map[string]interface{}) (interface{}, error) {
 	sessionID, _ := args["session_id"].(string)
 	if sessionID == "" {
@@ -660,13 +680,7 @@ func (s *Server) getSessionSummary(args map[string]interface{}) (interface{}, er
 	}
 
 	// Get project info
-	var projectPath string
-	if session.ProjectID > 0 {
-		project, err := s.db.GetProject(session.ProjectID)
-		if err == nil && project != nil {
-			projectPath = project.Path
-		}
-	}
+	projectPath, warnings := s.lookupProjectPath(session.ProjectID)
 
 	// Count turn types and extract tool usage
 	turnTypeCounts := make(map[string]int)
@@ -756,7 +770,7 @@ func (s *Server) getSessionSummary(args map[string]interface{}) (interface{}, er
 		topToolsMap[i] = map[string]interface{}{"tool": t.name, "count": t.count}
 	}
 
-	return map[string]interface{}{
+	result := map[string]interface{}{
 		"session_id":     session.ID,
 		"project_path":   projectPath,
 		"source":         session.Source,
@@ -773,7 +787,11 @@ func (s *Server) getSessionSummary(args map[string]interface{}) (interface{}, er
 		"first_user_msg": firstUserMsg,
 		"last_user_msg":  lastUserMsg,
 		"hint":           "Use get_turns to paginate through the conversation",
-	}, nil
+	}
+	if len(warnings) > 0 {
+		result["warnings"] = warnings
+	}
+	return result, nil
 }
 
 func (s *Server) getTurns(args map[string]interface{}) (interface{}, error) {
@@ -913,22 +931,20 @@ func (s *Server) getSession(args map[string]interface{}) (interface{}, error) {
 	}
 
 	// Get project info
-	var projectPath string
-	if session.ProjectID > 0 {
-		project, err := s.db.GetProject(session.ProjectID)
-		if err == nil && project != nil {
-			projectPath = project.Path
-		}
-	}
+	projectPath, warnings := s.lookupProjectPath(session.ProjectID)
 
 	// For large sessions, recommend using get_session_summary + get_turns
 	if len(turns) > 100 {
-		return map[string]interface{}{
+		result := map[string]interface{}{
 			"warning":    "Large session with " + fmt.Sprintf("%d", len(turns)) + " turns. Use get_session_summary and get_turns for better results.",
 			"session_id": sessionID,
 			"turn_count": len(turns),
 			"hint":       "Call get_session_summary first, then use get_turns with offset/limit to paginate",
-		}, nil
+		}
+		if len(warnings) > 0 {
+			result["warnings"] = warnings
+		}
+		return result, nil
 	}
 
 	// Export to markdown for smaller sessions
@@ -946,11 +962,15 @@ func (s *Server) getSession(args map[string]interface{}) (interface{}, error) {
 		content = content[:50000] + "\n\n... [truncated - use get_turns for full content]"
 	}
 
-	return map[string]interface{}{
+	result := map[string]interface{}{
 		"session_id": sessionID,
 		"turn_count": len(turns),
 		"markdown":   content,
-	}, nil
+	}
+	if len(warnings) > 0 {
+		result["warnings"] = warnings
+	}
+	return result, nil
 }
 
 func (s *Server) listSessions(args map[string]interface{}) (interface{}, error) {
@@ -1063,9 +1083,17 @@ func (s *Server) getStats(args map[string]interface{}) (interface{}, error) {
 		return nil, fmt.Errorf("get tokens by model: %w", err)
 	}
 
-	firstActivity, lastActivity, _ := s.db.GetFirstAndLastActivity()
+	var warnings []string
 
-	toolStats, _ := s.db.GetToolUsageStats(10)
+	firstActivity, lastActivity, err := s.db.GetFirstAndLastActivity()
+	if err != nil {
+		warnings = append(warnings, fmt.Sprintf("activity range unavailable: %v", err))
+	}
+
+	toolStats, err := s.db.GetToolUsageStats(10)
+	if err != nil {
+		warnings = append(warnings, fmt.Sprintf("tool stats unavailable: %v", err))
+	}
 
 	result := map[string]interface{}{
 		"projects":     projectCount,
@@ -1084,6 +1112,9 @@ func (s *Server) getStats(args map[string]interface{}) (interface{}, error) {
 	}
 	if !firstActivity.IsZero() && !lastActivity.IsZero() {
 		result["days_span"] = int(lastActivity.Sub(firstActivity).Hours() / 24)
+	}
+	if len(warnings) > 0 {
+		result["warnings"] = warnings
 	}
 
 	return result, nil
@@ -1104,21 +1135,43 @@ func (s *Server) getAnalytics(args map[string]interface{}) (interface{}, error) 
 	}
 	result["summary"] = stats
 
-	// Try to get DuckDB analytics if available
+	// DuckDB analytics: report failures instead of silently omitting sections
 	if s.analyzer != nil {
+		var warnings []string
+
 		dailyTokens, err := s.analyzer.GetTokensByDay(days)
-		if err == nil {
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("tokens_by_day unavailable: %v", err))
+		} else {
 			result["tokens_by_day"] = dailyTokens
 		}
 
 		topProjects, err := s.analyzer.GetTopProjects(10)
-		if err == nil {
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("top_projects unavailable: %v", err))
+		} else {
 			result["top_projects"] = topProjects
 		}
 
 		modelStats, err := s.analyzer.GetTokensByModel()
-		if err == nil {
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("model_breakdown unavailable: %v", err))
+		} else {
 			result["model_breakdown"] = modelStats
+		}
+
+		if len(warnings) > 0 {
+			result["warnings"] = warnings
+		}
+	} else {
+		reason := "analytics cache not initialized"
+		if s.analyzerErr != nil {
+			reason = s.analyzerErr.Error()
+		}
+		result["analytics"] = map[string]interface{}{
+			"available": false,
+			"reason":    reason,
+			"hint":      "Run 'ccvault build-cache' to enable DuckDB analytics",
 		}
 	}
 
@@ -1293,21 +1346,21 @@ func (s *Server) promptReviewSession(args map[string]interface{}) (promptGetResu
 		return promptGetResult{}, err
 	}
 
-	// Get project info
-	var projectPath string
-	if session.ProjectID > 0 {
-		project, _ := s.db.GetProject(session.ProjectID)
-		if project != nil {
-			projectPath = project.Path
-		}
+	// Get project info — cosmetic in a prompt, so lookup failures only log
+	projectPath, projectWarnings := s.lookupProjectPath(session.ProjectID)
+	for _, w := range projectWarnings {
+		s.log("%s", w)
 	}
 
-	// Export to markdown for easier reading
+	// Export to markdown for easier reading; the markdown IS the prompt,
+	// so a failed export must error rather than produce an empty review
 	var buf strings.Builder
 	exporter := export.NewMarkdownExporter(
 		export.WithThinking(false), // Skip thinking for summary
 	)
-	_ = exporter.Export(&buf, session, turns, projectPath)
+	if err := exporter.Export(&buf, session, turns, projectPath); err != nil {
+		return promptGetResult{}, fmt.Errorf("export session markdown: %w", err)
+	}
 
 	return promptGetResult{
 		Description: fmt.Sprintf("Review of session %s", sessionID[:8]),

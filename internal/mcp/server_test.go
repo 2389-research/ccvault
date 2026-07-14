@@ -4,7 +4,9 @@
 package mcp
 
 import (
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -177,5 +179,101 @@ func TestListProjects_ReportsHasMoreAndClampsLimit(t *testing.T) {
 	}
 	if _, present := mZero["has_more"]; present {
 		t.Error("limit 0: has_more should be absent when everything fit")
+	}
+}
+
+func TestGetSessionSummary_WarnsWhenProjectMissing(t *testing.T) {
+	s, database := newTestServer(t)
+	// No project 9999 exists — a dangling reference the schema permits
+	seedSession(t, database, "session-orphan", 9999)
+
+	result, err := s.getSessionSummary(map[string]interface{}{"session_id": "session-orphan"})
+	if err != nil {
+		t.Fatalf("getSessionSummary: %v", err)
+	}
+
+	m := result.(map[string]interface{})
+	warnings, ok := m["warnings"].([]string)
+	if !ok || len(warnings) == 0 {
+		t.Fatalf("expected warnings about missing project, got %#v", m["warnings"])
+	}
+	if !strings.Contains(warnings[0], "9999") {
+		t.Errorf("warning should name the missing project id, got %q", warnings[0])
+	}
+}
+
+func TestGetSessionSummary_NoWarningsWhenProjectExists(t *testing.T) {
+	s, database := newTestServer(t)
+	p := seedProject(t, database, "/test/proj")
+	seedSession(t, database, "session-ok", p.ID)
+
+	result, err := s.getSessionSummary(map[string]interface{}{"session_id": "session-ok"})
+	if err != nil {
+		t.Fatalf("getSessionSummary: %v", err)
+	}
+
+	m := result.(map[string]interface{})
+	if _, present := m["warnings"]; present {
+		t.Errorf("healthy session should have no warnings, got %#v", m["warnings"])
+	}
+	if m["project_path"] != "/test/proj" {
+		t.Errorf("project_path = %v, want /test/proj", m["project_path"])
+	}
+}
+
+func TestGetSession_WarnsWhenProjectMissing(t *testing.T) {
+	s, database := newTestServer(t)
+	seedSession(t, database, "session-orphan", 9999)
+
+	result, err := s.getSession(map[string]interface{}{"session_id": "session-orphan"})
+	if err != nil {
+		t.Fatalf("getSession: %v", err)
+	}
+
+	m := result.(map[string]interface{})
+	warnings, ok := m["warnings"].([]string)
+	if !ok || len(warnings) == 0 {
+		t.Fatalf("expected warnings about missing project, got %#v", m["warnings"])
+	}
+}
+
+func TestGetAnalytics_ReportsUnavailableAnalytics(t *testing.T) {
+	s, _ := newTestServer(t)
+	s.analyzerErr = errors.New("duckdb cache missing")
+
+	result, err := s.getAnalytics(map[string]interface{}{})
+	if err != nil {
+		t.Fatalf("getAnalytics: %v", err)
+	}
+
+	m := result.(map[string]interface{})
+	info, ok := m["analytics"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected analytics availability object, got %#v", m["analytics"])
+	}
+	if info["available"] != false {
+		t.Errorf("available = %v, want false", info["available"])
+	}
+	if reason, _ := info["reason"].(string); !strings.Contains(reason, "duckdb cache missing") {
+		t.Errorf("reason should carry the init error, got %q", info["reason"])
+	}
+	if hint, _ := info["hint"].(string); !strings.Contains(hint, "build-cache") {
+		t.Errorf("hint should point at 'ccvault build-cache', got %q", info["hint"])
+	}
+}
+
+func TestGetStats_HealthyDBHasNoWarnings(t *testing.T) {
+	s, database := newTestServer(t)
+	p := seedProject(t, database, "/test/proj")
+	seedSession(t, database, "session-1", p.ID)
+
+	result, err := s.getStats(nil)
+	if err != nil {
+		t.Fatalf("getStats: %v", err)
+	}
+
+	m := result.(map[string]interface{})
+	if _, present := m["warnings"]; present {
+		t.Errorf("healthy db should have no warnings, got %#v", m["warnings"])
 	}
 }
