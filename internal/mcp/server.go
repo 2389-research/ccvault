@@ -353,7 +353,7 @@ func (s *Server) handleToolsList(req *jsonRPCRequest) {
 					},
 					"limit": {
 						Type:        "number",
-						Description: "Maximum results (default: 20, max: 100)",
+						Description: "Maximum sessions to return (default 20, max 100)",
 					},
 				},
 			},
@@ -371,7 +371,7 @@ func (s *Server) handleToolsList(req *jsonRPCRequest) {
 					},
 					"limit": {
 						Type:        "number",
-						Description: "Maximum results (default: 50)",
+						Description: "Maximum projects to return (default 50, max 100)",
 					},
 				},
 			},
@@ -624,6 +624,17 @@ func (s *Server) searchConversations(args map[string]interface{}) (interface{}, 
 	if hasMore {
 		response["next_offset"] = offset + limit
 		response["has_more"] = true
+	}
+
+	if len(compactResults) == 0 {
+		hint := "No results. Broaden the search: drop one filter or try different terms; use list_projects to verify project names."
+		if parsed.Tool != "" {
+			if names, err := s.db.GetToolNamesLike(parsed.Tool, 5); err == nil && len(names) > 0 {
+				response["similar_tool_names"] = names
+				hint = fmt.Sprintf("No results for tool:%s — tool matching requires the full tool name. See similar_tool_names for close matches.", parsed.Tool)
+			}
+		}
+		response["hint"] = hint
 	}
 
 	return response, nil
@@ -950,6 +961,9 @@ func (s *Server) listSessions(args map[string]interface{}) (interface{}, error) 
 			limit = 100
 		}
 	}
+	if limit <= 0 {
+		limit = 20
+	}
 
 	var projectID int64
 	if projectFilter, ok := args["project"].(string); ok && projectFilter != "" {
@@ -970,15 +984,27 @@ func (s *Server) listSessions(args map[string]interface{}) (interface{}, error) 
 		}
 	}
 
-	sessions, err := s.db.GetSessions(projectID, limit)
+	// Fetch one extra row to detect whether more sessions exist
+	sessions, err := s.db.GetSessions(projectID, limit+1)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get sessions: %w", err)
 	}
 
-	return map[string]interface{}{
+	hasMore := len(sessions) > limit
+	if hasMore {
+		sessions = sessions[:limit]
+	}
+
+	response := map[string]interface{}{
 		"count":    len(sessions),
 		"sessions": sessions,
-	}, nil
+	}
+	if hasMore {
+		response["has_more"] = true
+		response["hint"] = "More sessions exist. Raise limit (max 100) or narrow with the project filter."
+	}
+
+	return response, nil
 }
 
 func (s *Server) listProjects(args map[string]interface{}) (interface{}, error) {
@@ -990,17 +1016,35 @@ func (s *Server) listProjects(args map[string]interface{}) (interface{}, error) 
 	limit := 50
 	if l, ok := args["limit"].(float64); ok {
 		limit = int(l)
+		if limit > 100 {
+			limit = 100
+		}
+	}
+	if limit <= 0 {
+		limit = 50
 	}
 
-	projects, err := s.db.GetProjects(sortBy, limit)
+	// Fetch one extra row to detect whether more projects exist
+	projects, err := s.db.GetProjects(sortBy, limit+1)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get projects: %w", err)
 	}
 
-	return map[string]interface{}{
+	hasMore := len(projects) > limit
+	if hasMore {
+		projects = projects[:limit]
+	}
+
+	response := map[string]interface{}{
 		"count":    len(projects),
 		"projects": projects,
-	}, nil
+	}
+	if hasMore {
+		response["has_more"] = true
+		response["hint"] = "More projects exist. Raise limit (max 100) or use sort to surface the relevant ones."
+	}
+
+	return response, nil
 }
 
 func (s *Server) getStats(args map[string]interface{}) (interface{}, error) {

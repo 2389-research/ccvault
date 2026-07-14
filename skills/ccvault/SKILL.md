@@ -111,7 +111,7 @@ When in doubt, start with **Solution mining** if you have an error message or sp
 - Broad free-text searches without operators — returns too much noise
 - Ignoring pagination — the best results might be on page 2+
 - Using `get_session` for large sessions (100+ turns) — server returns a warning, not content
-- Searching `tool:` with a fragment like `tool:ccvault` — `tool:` matches the full tool name (case-insensitive), never substrings. Built-in tools are stored as `Bash`, `Read`, `Edit`; MCP tools under their full prefixed names like `mcp__ccvault__search_conversations`
+- Searching `tool:` with a fragment like `tool:ccvault` — `tool:` matches the full tool name (case-insensitive), never substrings. Built-in tools are stored as `Bash`, `Read`, `Edit`; MCP tools under their full prefixed names like `mcp__ccvault__search_conversations`. Empty results include `similar_tool_names` suggestions when close matches exist
 - Not using `type` filter on `get_turns` — reading all turn types when you only need user or assistant messages
 - Repeating searches with the same query — if it didn't work, change the query terms or operators, don't retry the same thing
 - Using `has:error` or `has:subagent` without a text query — these are session-level flags, so results show all turns from matching sessions, not just the error turns themselves

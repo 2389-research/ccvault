@@ -8,8 +8,8 @@
 | `get_session_summary` | `session_id` (string) | — | Metadata, turn counts by type, top 10 tools used, first/last user messages (500 chars each) | Most cost-effective entry point for any session |
 | `get_turns` | `session_id` (string) | `offset` (number, default 0), `limit` (number, default 20, max 50), `type` (user/assistant/tool_result) | Paginated turns, content truncated at 1000 chars | Includes tool names; `has_thinking` flag on assistant turns |
 | `get_session` | `session_id` (string) | — | Full session as markdown | WARNING: returns warning object (no markdown) for 100+ turn sessions; truncates at 50K chars. Prefer summary + turns for large sessions |
-| `list_sessions` | — | `project` (string, partial match), `limit` (number, default 20, max 100) | Recent sessions sorted by date desc | Partial match on path or display name; returns error (not empty) if no project matches |
-| `list_projects` | — | `sort` (name/activity/tokens/sessions, default: activity), `limit` (number, default 50) | Projects with session counts and token usage | Use to discover project names before searching |
+| `list_sessions` | — | `project` (string, partial match), `limit` (number, default 20, max 100) | Recent sessions sorted by date desc | Partial match on path or display name; returns error (not empty) if no project matches; sets has_more when truncated |
+| `list_projects` | — | `sort` (name/activity/tokens/sessions, default: activity), `limit` (number, default 50, max 100) | Projects with session counts and token usage | Use to discover project names before searching; sets has_more when truncated |
 | `get_stats` | — | — | Archive-wide counts: projects, sessions, turns, total tokens, model breakdown, top tools, date range | Fast overview of the entire archive |
 | `get_analytics` | — | `days` (number, default 30) | Daily token breakdown, top projects, model breakdown | Requires DuckDB analytics cache |
 
