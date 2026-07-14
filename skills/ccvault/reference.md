@@ -19,7 +19,7 @@
 |----------|--------|---------|-------|
 | Project | `project:name` | `project:myapp` | Partial match on path or display name |
 | Model | `model:name` | `model:opus` | Partial match (opus, sonnet, haiku) |
-| Tool | `tool:Name` | `tool:Bash` | Case-sensitive, must match exact tool name (e.g., `Bash`, `Read`, `Edit`, `Write`, `Grep`, `Glob`, `Task`, `WebFetch`) |
+| Tool | `tool:Name` | `tool:Bash` | Case-insensitive, must match the full tool name (e.g., `Bash`, `Read`, `Edit`, `Write`, `Grep`, `Glob`, `Task`, `WebFetch`; MCP tools are stored under their full prefixed names like `mcp__ccvault__search_conversations`) |
 | File | `file:path` | `file:auth.py` | Matches file paths mentioned in session |
 | Before | `before:DATE` | `before:2026-02-01` | See date formats below |
 | After | `after:DATE` | `after:thisweek` | See date formats below |
