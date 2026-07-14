@@ -124,6 +124,55 @@ var quickstartCmd = &cobra.Command{
 	},
 }
 
+// orientation holds the database state gathered for the orient command.
+type orientation struct {
+	ProjectCount  int
+	SessionCount  int
+	TurnCount     int
+	SessionTokens int64
+	FirstActivity time.Time
+	LastActivity  time.Time
+	ToolStats     map[string]int
+	TokensByModel map[string]int64
+	ProjectNames  []string
+	Warnings      []string
+}
+
+// gatherOrientation collects database state for the orient command.
+// Query failures land in Warnings instead of being silently dropped.
+func gatherOrientation(database *db.DB) orientation {
+	var o orientation
+	warn := func(what string, err error) {
+		if err != nil {
+			o.Warnings = append(o.Warnings, fmt.Sprintf("%s unavailable: %v", what, err))
+		}
+	}
+
+	var err error
+	o.ProjectCount, _, err = database.GetProjectStats()
+	warn("project stats", err)
+
+	o.SessionCount, o.TurnCount, o.SessionTokens, err = database.GetSessionStats()
+	warn("session stats", err)
+
+	o.FirstActivity, o.LastActivity, err = database.GetFirstAndLastActivity()
+	warn("activity range", err)
+
+	o.ToolStats, err = database.GetToolUsageStats(5)
+	warn("tool stats", err)
+
+	o.TokensByModel, err = database.GetTokensByModel()
+	warn("model stats", err)
+
+	projects, err := database.GetProjects("activity", 5)
+	warn("recent projects", err)
+	for _, p := range projects {
+		o.ProjectNames = append(o.ProjectNames, p.DisplayName)
+	}
+
+	return o
+}
+
 var orientCmd = &cobra.Command{
 	Use:   "orient",
 	Short: "Output database state for AI agents",
@@ -145,37 +194,25 @@ Use --json for machine-readable output.`,
 		}
 		defer func() { _ = database.Close() }()
 
-		// Gather stats
-		projectCount, projectTokens, _ := database.GetProjectStats()
-		sessionCount, turnCount, sessionTokens, _ := database.GetSessionStats()
-		firstActivity, lastActivity, _ := database.GetFirstAndLastActivity()
-		toolStats, _ := database.GetToolUsageStats(5)
-		tokensByModel, _ := database.GetTokensByModel()
+		o := gatherOrientation(database)
 
-		// Get recent projects
-		projects, _ := database.GetProjects("activity", 5)
-		projectNames := make([]string, 0, len(projects))
-		for _, p := range projects {
-			projectNames = append(projectNames, p.DisplayName)
-		}
-
-		orientation := map[string]interface{}{
+		orientationMap := map[string]interface{}{
 			"version": version,
 			"status":  "ready",
 			"database": map[string]interface{}{
-				"projects":     projectCount,
-				"sessions":     sessionCount,
-				"turns":        turnCount,
-				"total_tokens": sessionTokens,
+				"projects":     o.ProjectCount,
+				"sessions":     o.SessionCount,
+				"turns":        o.TurnCount,
+				"total_tokens": o.SessionTokens,
 			},
 			"activity": map[string]interface{}{
-				"first_session": firstActivity.Format(time.RFC3339),
-				"last_session":  lastActivity.Format(time.RFC3339),
-				"days_span":     int(lastActivity.Sub(firstActivity).Hours() / 24),
+				"first_session": o.FirstActivity.Format(time.RFC3339),
+				"last_session":  o.LastActivity.Format(time.RFC3339),
+				"days_span":     int(o.LastActivity.Sub(o.FirstActivity).Hours() / 24),
 			},
-			"recent_projects": projectNames,
-			"top_tools":       toolStats,
-			"models":          tokensByModel,
+			"recent_projects": o.ProjectNames,
+			"top_tools":       o.ToolStats,
+			"models":          o.TokensByModel,
 			"commands": map[string]string{
 				"search <query>":      "Full-text search across conversations",
 				"list-sessions":       "List recent sessions",
@@ -198,54 +235,62 @@ Use --json for machine-readable output.`,
 			},
 		}
 
+		if len(o.Warnings) > 0 {
+			orientationMap["warnings"] = o.Warnings
+		}
+
 		// Handle empty database
-		if sessionCount == 0 {
-			orientation["status"] = "empty"
-			orientation["hint"] = "Run 'ccvault sync' to index conversations from ~/.claude"
+		if o.SessionCount == 0 {
+			orientationMap["status"] = "empty"
+			orientationMap["hint"] = "Run 'ccvault sync' to index conversations from ~/.claude"
 		}
 
 		if jsonOutput {
 			enc := json.NewEncoder(os.Stdout)
 			enc.SetIndent("", "  ")
-			return enc.Encode(orientation)
+			return enc.Encode(orientationMap)
 		}
 
 		// Human-readable output
+		for _, w := range o.Warnings {
+			fmt.Fprintf(os.Stderr, "warning: %s\n", w)
+		}
+
 		fmt.Println("=== ccvault Orientation ===")
 		fmt.Println()
 		fmt.Printf("Version: %s\n", version)
-		fmt.Printf("Status:  %s\n", orientation["status"])
+		fmt.Printf("Status:  %s\n", orientationMap["status"])
 		fmt.Println()
 
-		if sessionCount == 0 {
+		if o.SessionCount == 0 {
 			fmt.Println("Database is empty. Run 'ccvault sync' to index conversations.")
 			return nil
 		}
 
 		fmt.Println("Database:")
-		fmt.Printf("  Projects: %d\n", projectCount)
-		fmt.Printf("  Sessions: %d\n", sessionCount)
-		fmt.Printf("  Turns:    %d\n", turnCount)
-		fmt.Printf("  Tokens:   %s\n", formatTokens(sessionTokens))
+		fmt.Printf("  Projects: %d\n", o.ProjectCount)
+		fmt.Printf("  Sessions: %d\n", o.SessionCount)
+		fmt.Printf("  Turns:    %d\n", o.TurnCount)
+		fmt.Printf("  Tokens:   %s\n", formatTokens(o.SessionTokens))
 		fmt.Println()
 
 		fmt.Println("Activity:")
-		fmt.Printf("  First: %s\n", firstActivity.Format("2006-01-02"))
-		fmt.Printf("  Last:  %s\n", lastActivity.Format("2006-01-02"))
-		fmt.Printf("  Span:  %d days\n", int(lastActivity.Sub(firstActivity).Hours()/24))
+		fmt.Printf("  First: %s\n", o.FirstActivity.Format("2006-01-02"))
+		fmt.Printf("  Last:  %s\n", o.LastActivity.Format("2006-01-02"))
+		fmt.Printf("  Span:  %d days\n", int(o.LastActivity.Sub(o.FirstActivity).Hours()/24))
 		fmt.Println()
 
-		if len(projectNames) > 0 {
+		if len(o.ProjectNames) > 0 {
 			fmt.Println("Recent Projects:")
-			for _, name := range projectNames {
+			for _, name := range o.ProjectNames {
 				fmt.Printf("  - %s\n", name)
 			}
 			fmt.Println()
 		}
 
-		if len(tokensByModel) > 0 {
+		if len(o.TokensByModel) > 0 {
 			fmt.Println("Models Used:")
-			for model, tokens := range tokensByModel {
+			for model, tokens := range o.TokensByModel {
 				shortModel := model
 				if len(shortModel) > 30 {
 					shortModel = shortModel[:27] + "..."
@@ -263,9 +308,6 @@ Use --json for machine-readable output.`,
 		fmt.Println("  mcp                   Start MCP server")
 		fmt.Println()
 		fmt.Println("Use --json for machine-readable output.")
-
-		// Suppress unused variable warning
-		_ = projectTokens
 
 		return nil
 	},
