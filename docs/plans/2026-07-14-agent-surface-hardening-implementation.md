@@ -921,9 +921,31 @@ func NewServer(database *db.DB, cfg *config.Config) (*Server, error) {
 }
 ```
 
-- [ ] **Step 4: Warnings in `getSessionSummary`**
+- [ ] **Step 4: Shared lookup helper + warnings in `getSessionSummary`**
 
-Replace the project block (lines ~636-643):
+Three call sites (`getSessionSummary`, `getSession`, `promptReviewSession`) do the same project lookup, so the warning logic lives in one helper. Add it directly above `getSessionSummary`:
+
+```go
+// lookupProjectPath resolves a session's project path. Failures come back
+// as warning strings so callers surface them instead of dropping them.
+func (s *Server) lookupProjectPath(projectID int64) (string, []string) {
+	if projectID <= 0 {
+		return "", nil
+	}
+
+	project, err := s.db.GetProject(projectID)
+	switch {
+	case err != nil:
+		return "", []string{fmt.Sprintf("project lookup failed for project %d: %v", projectID, err)}
+	case project == nil:
+		return "", []string{fmt.Sprintf("project %d not found — session references a missing project", projectID)}
+	default:
+		return project.Path, nil
+	}
+}
+```
+
+In `getSessionSummary`, replace the project block (lines ~636-643):
 
 ```go
 	// Get project info
@@ -940,19 +962,7 @@ with:
 
 ```go
 	// Get project info
-	var projectPath string
-	var warnings []string
-	if session.ProjectID > 0 {
-		project, err := s.db.GetProject(session.ProjectID)
-		switch {
-		case err != nil:
-			warnings = append(warnings, fmt.Sprintf("project lookup failed for project %d: %v", session.ProjectID, err))
-		case project == nil:
-			warnings = append(warnings, fmt.Sprintf("project %d not found — session references a missing project", session.ProjectID))
-		default:
-			projectPath = project.Path
-		}
-	}
+	projectPath, warnings := s.lookupProjectPath(session.ProjectID)
 ```
 
 Replace the final return (lines ~733-750) — same map contents, assigned to a variable so warnings can attach:
@@ -1001,19 +1011,7 @@ Replace it with:
 
 ```go
 	// Get project info
-	var projectPath string
-	var warnings []string
-	if session.ProjectID > 0 {
-		project, err := s.db.GetProject(session.ProjectID)
-		switch {
-		case err != nil:
-			warnings = append(warnings, fmt.Sprintf("project lookup failed for project %d: %v", session.ProjectID, err))
-		case project == nil:
-			warnings = append(warnings, fmt.Sprintf("project %d not found — session references a missing project", session.ProjectID))
-		default:
-			projectPath = project.Path
-		}
-	}
+	projectPath, warnings := s.lookupProjectPath(session.ProjectID)
 ```
 
 Then attach warnings to both return paths. The large-session return (lines ~899-906) becomes:
@@ -1175,16 +1173,10 @@ Replace (lines ~1237-1251):
 with:
 
 ```go
-	// Get project info — cosmetic in a prompt, so a lookup failure only logs
-	var projectPath string
-	if session.ProjectID > 0 {
-		project, err := s.db.GetProject(session.ProjectID)
-		if err != nil {
-			s.log("project lookup failed for project %d: %v", session.ProjectID, err)
-		}
-		if project != nil {
-			projectPath = project.Path
-		}
+	// Get project info — cosmetic in a prompt, so lookup failures only log
+	projectPath, projectWarnings := s.lookupProjectPath(session.ProjectID)
+	for _, w := range projectWarnings {
+		s.log("%s", w)
 	}
 
 	// Export to markdown for easier reading; the markdown IS the prompt,
