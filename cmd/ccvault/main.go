@@ -16,6 +16,7 @@ import (
 	_ "github.com/2389-research/ccvault/pkg/adapter/codex"
 	_ "github.com/2389-research/ccvault/pkg/adapter/hex"
 	_ "github.com/2389-research/ccvault/pkg/adapter/jeff"
+	_ "github.com/2389-research/ccvault/pkg/adapter/nanoclaw"
 
 	"github.com/2389-research/ccvault/internal/analytics"
 	"github.com/2389-research/ccvault/internal/config"
