@@ -6,6 +6,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -197,6 +198,65 @@ sources:
 
 	if _, err := LoadFrom(configFile); err == nil {
 		t.Fatal("expected error for empty source name, got nil")
+	}
+}
+
+func TestConfigLoadsRemotes(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	contents := `
+data_dir = "` + dir + `"
+
+[[sources]]
+name = "claude-code"
+type = "claude-code"
+path = "/tmp/whatever"
+
+[remotes.origin]
+url = "ccvault@vault.company.com"
+
+[remotes.backup]
+url = "ssh://backup.example.com:2222/team"
+`
+	if err := os.WriteFile(cfgPath, []byte(contents), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadFrom(cfgPath)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	if len(cfg.Remotes) != 2 {
+		t.Fatalf("expected 2 remotes, got %d", len(cfg.Remotes))
+	}
+	if cfg.Remotes["origin"].URL != "ccvault@vault.company.com" {
+		t.Errorf("origin URL = %q", cfg.Remotes["origin"].URL)
+	}
+	if cfg.Remotes["backup"].URL != "ssh://backup.example.com:2222/team" {
+		t.Errorf("backup URL = %q", cfg.Remotes["backup"].URL)
+	}
+}
+
+func TestConfigRejectsRemoteWithEmptyURL(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	contents := `
+data_dir = "` + dir + `"
+
+[remotes.origin]
+url = ""
+`
+	if err := os.WriteFile(cfgPath, []byte(contents), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := LoadFrom(cfgPath)
+	if err == nil {
+		t.Fatal("expected error for empty URL")
+	}
+	if !strings.Contains(err.Error(), "url") {
+		t.Errorf("error should mention url, got %v", err)
 	}
 }
 

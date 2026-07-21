@@ -19,11 +19,18 @@ type SourceConfig struct {
 	Path string `mapstructure:"path"`
 }
 
+// Remote describes a remote ccvault vault (a `ccvaultd` server).
+// Keyed by name in Config.Remotes (which maps to TOML `[remotes.<name>]`).
+type Remote struct {
+	URL string `mapstructure:"url"`
+}
+
 // Config holds all ccvault configuration
 type Config struct {
-	ClaudeHome string         `mapstructure:"claude_home"`
-	DataDir    string         `mapstructure:"data_dir"`
-	Sources    []SourceConfig `mapstructure:"sources"`
+	ClaudeHome string            `mapstructure:"claude_home"`
+	DataDir    string            `mapstructure:"data_dir"`
+	Sources    []SourceConfig    `mapstructure:"sources"`
+	Remotes    map[string]Remote `mapstructure:"remotes"`
 }
 
 // DefaultClaudeHome returns the default Claude Code data directory
@@ -105,6 +112,10 @@ func unmarshalAndApplyDefaults(v *viper.Viper) (*Config, error) {
 		return nil, err
 	}
 
+	if err := validateRemotes(cfg.Remotes); err != nil {
+		return nil, err
+	}
+
 	return &cfg, nil
 }
 
@@ -120,6 +131,21 @@ func validateSources(sources []SourceConfig) error {
 			return fmt.Errorf("duplicate source name %q at sources[%d] and sources[%d]; names must be unique", s.Name, prev, i)
 		}
 		seen[s.Name] = i
+	}
+	return nil
+}
+
+// validateRemotes rejects remotes with empty names or empty URLs. The name is
+// the key clients use to address a remote (e.g. `ccvault push origin`), and
+// the URL is what `ccvaultd` needs to connect.
+func validateRemotes(remotes map[string]Remote) error {
+	for name, r := range remotes {
+		if strings.TrimSpace(name) == "" {
+			return fmt.Errorf("remote name must not be empty")
+		}
+		if strings.TrimSpace(r.URL) == "" {
+			return fmt.Errorf("remote %q: url is required", name)
+		}
 	}
 	return nil
 }
