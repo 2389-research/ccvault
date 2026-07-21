@@ -37,7 +37,8 @@ type Session struct {
 	SourceFile       string    `json:"source_file"` // Path to .jsonl file
 	HasError         bool      `json:"has_error"`
 	HasSubagent      bool      `json:"has_subagent"`
-	Source           string    `json:"source"` // Which AI tool produced this data (e.g. "claude-code", "codex")
+	Source           string    `json:"source"`              // Which AI tool produced this data (e.g. "claude-code", "codex")
+	PushedBy         string    `json:"pushed_by,omitempty"` // Empty on local; set by ccvaultd from SSH identity
 }
 
 // TotalTokens returns the sum of all token usage

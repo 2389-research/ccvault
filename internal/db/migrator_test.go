@@ -34,8 +34,8 @@ func TestMigrator_FreshDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("query max version: %v", err)
 	}
-	if maxVersion != 5 {
-		t.Errorf("max version = %d, want 5", maxVersion)
+	if maxVersion != 6 {
+		t.Errorf("max version = %d, want 6", maxVersion)
 	}
 
 	// Count migration records
@@ -44,8 +44,8 @@ func TestMigrator_FreshDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("count schema_version: %v", err)
 	}
-	if count != 5 {
-		t.Errorf("schema_version count = %d, want 5", count)
+	if count != 6 {
+		t.Errorf("schema_version count = %d, want 6", count)
 	}
 
 	// Verify all core tables exist
@@ -115,14 +115,14 @@ func TestMigrator_ExistingDatabase(t *testing.T) {
 		t.Fatalf("second RunMigrations: %v", err)
 	}
 
-	// Verify exactly 5 migration records, not 10
+	// Verify exactly 6 migration records, not 12
 	var count int
 	err := db.QueryRow("SELECT COUNT(*) FROM schema_version").Scan(&count)
 	if err != nil {
 		t.Fatalf("count schema_version: %v", err)
 	}
-	if count != 5 {
-		t.Errorf("schema_version count = %d, want 5 (idempotent)", count)
+	if count != 6 {
+		t.Errorf("schema_version count = %d, want 6 (idempotent)", count)
 	}
 }
 
@@ -192,24 +192,24 @@ func TestMigrator_BootstrapExisting(t *testing.T) {
 		t.Fatalf("RunMigrations on pre-existing db: %v", err)
 	}
 
-	// Verify it bootstrapped to version 2 then applied migrations 003, 004, and 005
+	// Verify it bootstrapped to version 2 then applied migrations 003, 004, 005, and 006
 	var maxVersion int
 	err := db.QueryRow("SELECT MAX(version) FROM schema_version").Scan(&maxVersion)
 	if err != nil {
 		t.Fatalf("query max version: %v", err)
 	}
-	if maxVersion != 5 {
-		t.Errorf("max version = %d, want 5", maxVersion)
+	if maxVersion != 6 {
+		t.Errorf("max version = %d, want 6", maxVersion)
 	}
 
-	// Verify exactly 5 records (2 bootstrapped + 3 applied)
+	// Verify exactly 6 records (2 bootstrapped + 4 applied)
 	var count int
 	err = db.QueryRow("SELECT COUNT(*) FROM schema_version").Scan(&count)
 	if err != nil {
 		t.Fatalf("count schema_version: %v", err)
 	}
-	if count != 5 {
-		t.Errorf("schema_version count = %d, want 5", count)
+	if count != 6 {
+		t.Errorf("schema_version count = %d, want 6", count)
 	}
 }
 
@@ -244,19 +244,19 @@ func TestMigrator_BootstrapPartial(t *testing.T) {
 		}
 	}
 
-	// Run migrator — should bootstrap to version 1 and apply migrations 002-005
+	// Run migrator — should bootstrap to version 1 and apply migrations 002-006
 	if err := RunMigrations(db); err != nil {
 		t.Fatalf("RunMigrations: %v", err)
 	}
 
-	// Verify version is now 5 (bootstrapped to 1, applied 002, 003, 004, and 005)
+	// Verify version is now 6 (bootstrapped to 1, applied 002, 003, 004, 005, and 006)
 	var maxVersion int
 	err := db.QueryRow("SELECT MAX(version) FROM schema_version").Scan(&maxVersion)
 	if err != nil {
 		t.Fatalf("query max version: %v", err)
 	}
-	if maxVersion != 5 {
-		t.Errorf("max version = %d, want 5", maxVersion)
+	if maxVersion != 6 {
+		t.Errorf("max version = %d, want 6", maxVersion)
 	}
 
 	// Verify has_error column was added by migration 002
@@ -293,14 +293,14 @@ func TestMigrator_SourceColumns(t *testing.T) {
 		t.Fatalf("RunMigrations: %v", err)
 	}
 
-	// Verify version is 5
+	// Verify version is 6
 	var maxVersion int
 	err := db.QueryRow("SELECT MAX(version) FROM schema_version").Scan(&maxVersion)
 	if err != nil {
 		t.Fatalf("query max version: %v", err)
 	}
-	if maxVersion != 5 {
-		t.Errorf("max version = %d, want 5", maxVersion)
+	if maxVersion != 6 {
+		t.Errorf("max version = %d, want 6", maxVersion)
 	}
 
 	// Insert a project row and verify the source column defaults to "claude-code"
@@ -383,6 +383,45 @@ func TestMigration005CreatesRemotePushState(t *testing.T) {
 	`)
 	if err == nil {
 		t.Fatal("expected PK conflict on duplicate (remote_name, session_id)")
+	}
+}
+
+func TestMigration006AddsPushedByColumn(t *testing.T) {
+	db := openMemoryDB(t)
+	defer func() { _ = db.Close() }()
+
+	if err := RunMigrations(db); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := db.Query("PRAGMA table_info(sessions)")
+	if err != nil {
+		t.Fatalf("pragma: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var found bool
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull int
+		var dflt sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dflt, &pk); err != nil {
+			t.Fatal(err)
+		}
+		if name == "pushed_by" {
+			found = true
+			if colType != "TEXT" {
+				t.Errorf("pushed_by type = %q, want TEXT", colType)
+			}
+			if notNull != 1 {
+				t.Errorf("pushed_by should be NOT NULL")
+			}
+		}
+	}
+	if !found {
+		t.Fatal("sessions.pushed_by column not found after migrations")
 	}
 }
 
