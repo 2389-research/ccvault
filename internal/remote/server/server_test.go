@@ -8,10 +8,12 @@ import (
 	"encoding/json"
 	"io"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 
 	"github.com/2389-research/ccvault/internal/remote/protocol"
+	"github.com/2389-research/ccvault/pkg/models"
 )
 
 func TestServerVersionCommand(t *testing.T) {
@@ -54,4 +56,64 @@ func TestServerVersionCommand(t *testing.T) {
 		t.Errorf("build_version = %q, want 0.0.1-test", resp.BuildVersion)
 	}
 	_ = sess.Wait()
+}
+
+func TestServerIngestSession(t *testing.T) {
+	srv, addr, clientKey, cleanup := StartTestServer(t)
+	defer cleanup()
+
+	conn, err := ssh.Dial("tcp", addr, &ssh.ClientConfig{
+		User:            "ccvault",
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(clientKey)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	sess, err := conn.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = sess.Close() }()
+
+	stdin, _ := sess.StdinPipe()
+	if err := sess.Start("ingest"); err != nil {
+		t.Fatal(err)
+	}
+
+	enc := json.NewEncoder(stdin)
+	now := time.Now().UTC()
+	_ = enc.Encode(protocol.IngestMessage{
+		Kind: protocol.KindSession,
+		Session: &models.Session{
+			ID:          "sess-e2e-1",
+			ProjectPath: "/tmp/p",
+			StartedAt:   now,
+			EndedAt:     now,
+			Source:      "claude-code",
+		},
+	})
+	_ = enc.Encode(protocol.IngestMessage{
+		Kind: protocol.KindSessionEnd, SessionID: "sess-e2e-1",
+	})
+	_ = stdin.Close()
+	_ = sess.Wait()
+
+	var pushedBy string
+	var count int
+	row := srv.DB().QueryRow(
+		"SELECT COUNT(*), COALESCE(MAX(pushed_by), '') FROM sessions WHERE id = ?",
+		"sess-e2e-1",
+	)
+	if err := row.Scan(&count, &pushedBy); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("session not persisted, count=%d", count)
+	}
+	if pushedBy != "test-user" {
+		t.Errorf("pushed_by = %q, want test-user", pushedBy)
+	}
 }

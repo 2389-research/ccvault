@@ -21,8 +21,8 @@ func (db *DB) UpsertSession(s *models.Session) error {
 	query := `
 		INSERT INTO sessions (id, project_id, started_at, ended_at, model, git_branch,
 			turn_count, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-			source_file, source_mtime, has_error, has_subagent, source)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			source_file, source_mtime, has_error, has_subagent, source, pushed_by)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			ended_at = excluded.ended_at,
 			model = COALESCE(excluded.model, sessions.model),
@@ -34,7 +34,8 @@ func (db *DB) UpsertSession(s *models.Session) error {
 			source_mtime = excluded.source_mtime,
 			has_error = excluded.has_error,
 			has_subagent = excluded.has_subagent,
-			source = excluded.source`
+			source = excluded.source,
+			pushed_by = excluded.pushed_by`
 
 	_, err := db.Exec(query,
 		s.ID,
@@ -53,6 +54,7 @@ func (db *DB) UpsertSession(s *models.Session) error {
 		s.HasError,
 		s.HasSubagent,
 		source,
+		s.PushedBy,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert session: %w", err)
@@ -70,8 +72,8 @@ func (db *DB) UpsertSessionTx(tx *sql.Tx, s *models.Session) error {
 	query := `
 		INSERT INTO sessions (id, project_id, started_at, ended_at, model, git_branch,
 			turn_count, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-			source_file, source_mtime, has_error, has_subagent, source)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			source_file, source_mtime, has_error, has_subagent, source, pushed_by)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			ended_at = excluded.ended_at,
 			model = COALESCE(excluded.model, sessions.model),
@@ -83,7 +85,8 @@ func (db *DB) UpsertSessionTx(tx *sql.Tx, s *models.Session) error {
 			source_mtime = excluded.source_mtime,
 			has_error = excluded.has_error,
 			has_subagent = excluded.has_subagent,
-			source = excluded.source`
+			source = excluded.source,
+			pushed_by = excluded.pushed_by`
 
 	_, err := tx.Exec(query,
 		s.ID,
@@ -102,6 +105,7 @@ func (db *DB) UpsertSessionTx(tx *sql.Tx, s *models.Session) error {
 		s.HasError,
 		s.HasSubagent,
 		source,
+		s.PushedBy,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert session: %w", err)
@@ -114,7 +118,7 @@ func (db *DB) GetSession(id string) (*models.Session, error) {
 	query := `
 		SELECT id, project_id, started_at, ended_at, model, git_branch,
 			turn_count, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-			source_file, source
+			source_file, source, pushed_by
 		FROM sessions WHERE id = ?`
 
 	s := &models.Session{}
@@ -133,6 +137,7 @@ func (db *DB) GetSession(id string) (*models.Session, error) {
 		&s.CacheWriteTokens,
 		&s.SourceFile,
 		&s.Source,
+		&s.PushedBy,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil

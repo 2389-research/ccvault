@@ -30,9 +30,7 @@ func (s *Server) dispatch(command string, ctx HandlerCtx) int {
 	case "version":
 		return handleVersion(ctx)
 	case "ingest":
-		// Landed in T9
-		_, _ = fmt.Fprintln(ctx.Stderr, "ingest not implemented yet")
-		return 2
+		return handleIngest(ctx)
 	case "search", "sessions", "show", "stats":
 		// Landed in T14
 		_, _ = fmt.Fprintf(ctx.Stderr, "command %q not implemented yet\n", name)
