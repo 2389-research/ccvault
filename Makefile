@@ -1,13 +1,18 @@
 # ABOUTME: Build and development targets for ccvault
 # ABOUTME: Provides build, test, and release automation
 
-.PHONY: build test test-race test-short test-coverage clean install lint release
+.PHONY: build build-server build-all test test-race test-short test-coverage clean install lint release
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 LDFLAGS := -ldflags "-X main.version=$(VERSION)"
 
 build:
 	go build $(LDFLAGS) -o ccvault ./cmd/ccvault
+
+build-server:
+	go build $(LDFLAGS) -o ccvaultd ./cmd/ccvaultd
+
+build-all: build build-server
 
 test:
 	go test ./... -v
@@ -25,7 +30,7 @@ lint:
 	golangci-lint run
 
 clean:
-	rm -f ccvault
+	rm -f ccvault ccvaultd
 	rm -rf dist/
 
 install:

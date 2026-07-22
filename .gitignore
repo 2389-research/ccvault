@@ -3,6 +3,7 @@
 
 # Binaries (root level only)
 /ccvault
+/ccvaultd
 *.exe
 *.exe~
 *.dll
