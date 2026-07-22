@@ -89,6 +89,50 @@ func TestPushDryRunSendsNothing(t *testing.T) {
 	}
 }
 
+func TestPushDoesNotAdvanceWatermarkOnServerFailure(t *testing.T) {
+	// Bring up a server so we know the addr is valid, then tear it down so
+	// the Push dial fails. This is the cheapest way to guarantee that
+	// c.Run("ingest", pr) fails, exercising the error path.
+	_, addr, signer, cleanup := server.StartTestServer(t)
+	cleanup() // stop the server; the port should now refuse connections.
+
+	dir := t.TempDir()
+	localDB, err := db.Open(filepath.Join(dir, "local"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = localDB.Close() }()
+	seedLocalSession(t, localDB, "sess-fail-1")
+
+	c := &Client{
+		Addr:    addr,
+		User:    "ccvault",
+		Signers: []ssh.Signer{signer},
+		HostKey: ssh.InsecureIgnoreHostKey(),
+	}
+	stats, err := Push(c, localDB, "origin", false)
+	if err == nil {
+		t.Fatalf("expected Push to error against dead server, got stats=%+v", stats)
+	}
+
+	// Nothing should have been recorded — the same session must still be
+	// pending on the next attempt.
+	pending, perr := localDB.SessionsPendingPush("origin")
+	if perr != nil {
+		t.Fatalf("pending: %v", perr)
+	}
+	found := false
+	for _, id := range pending {
+		if id == "sess-fail-1" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("failed push should not advance watermark; pending=%v", pending)
+	}
+}
+
 // seedLocalSession creates a minimal project+session pair in the local DB.
 // Uses time.Time bindings for date columns (modernc.org/sqlite serializes them
 // consistently with production code; T5 hit this same gotcha).

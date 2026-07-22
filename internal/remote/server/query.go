@@ -114,12 +114,49 @@ func writeJSON(ctx HandlerCtx, v any) int {
 
 func parseKV(args string) map[string]string {
 	out := map[string]string{}
-	for _, part := range strings.Fields(args) {
+	for _, part := range tokenize(args) {
 		if i := strings.Index(part, "="); i >= 0 {
-			key := part[:i]
-			val := strings.Trim(part[i+1:], `"`)
-			out[key] = val
+			out[part[:i]] = part[i+1:]
 		}
 	}
 	return out
+}
+
+// tokenize splits a command-argument string into whitespace-separated tokens
+// while respecting double-quoted spans, so `q="two words" project=foo` yields
+// [`q=two words`, `project=foo`]. Backslash escapes a following character
+// inside a quoted span (`"has \"nested\" quotes"` → `has "nested" quotes`).
+// Unterminated quotes and stray escapes are handled best-effort: the current
+// token is emitted as-is at end of input.
+func tokenize(s string) []string {
+	var tokens []string
+	var cur strings.Builder
+	inQuote := false
+	hasContent := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '\\' && inQuote && i+1 < len(s):
+			// Escape sequence inside quotes — take the next byte literally.
+			cur.WriteByte(s[i+1])
+			hasContent = true
+			i++
+		case c == '"':
+			inQuote = !inQuote
+			hasContent = true
+		case (c == ' ' || c == '\t') && !inQuote:
+			if hasContent {
+				tokens = append(tokens, cur.String())
+				cur.Reset()
+				hasContent = false
+			}
+		default:
+			cur.WriteByte(c)
+			hasContent = true
+		}
+	}
+	if hasContent {
+		tokens = append(tokens, cur.String())
+	}
+	return tokens
 }

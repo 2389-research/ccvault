@@ -166,6 +166,49 @@ func TestServerStatsCommand(t *testing.T) {
 	_ = sess.Wait()
 }
 
+func TestServerRejectsMalformedExec(t *testing.T) {
+	_, addr, clientKey, cleanup := StartTestServer(t)
+	defer cleanup()
+
+	conn, err := ssh.Dial("tcp", addr, &ssh.ClientConfig{
+		User:            "ccvault",
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(clientKey)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	// Open a session channel directly so we can send a raw exec request
+	// with a truncated payload (only 2 bytes instead of the required 4+).
+	ch, reqs, err := conn.OpenChannel("session", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go ssh.DiscardRequests(reqs)
+	defer func() { _ = ch.Close() }()
+
+	ok, err := ch.SendRequest("exec", true, []byte{0x00, 0x00})
+	if err != nil {
+		t.Fatalf("SendRequest: %v", err)
+	}
+	if ok {
+		t.Errorf("server accepted malformed exec payload; expected reply=false")
+	}
+	// Server should not have panicked — a second, well-formed connection
+	// still succeeds.
+	conn2, err := ssh.Dial("tcp", addr, &ssh.ClientConfig{
+		User:            "ccvault",
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(clientKey)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	})
+	if err != nil {
+		t.Fatalf("server unhealthy after malformed exec: %v", err)
+	}
+	_ = conn2.Close()
+}
+
 func TestServerSearchAfterIngest(t *testing.T) {
 	_, addr, clientKey, cleanup := StartTestServer(t)
 	defer cleanup()
@@ -227,7 +270,9 @@ func TestServerSearchAfterIngest(t *testing.T) {
 	}
 	defer func() { _ = searchSess.Close() }()
 	stdout, _ := searchSess.StdoutPipe()
-	if err := searchSess.Start("search q=fox"); err != nil {
+	// Multi-word quoted query — guards against the parseKV regression where
+	// strings.Fields would split this into separate tokens and drop the tail.
+	if err := searchSess.Start(`search q="quick brown fox"`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -247,6 +292,6 @@ func TestServerSearchAfterIngest(t *testing.T) {
 		t.Fatalf("search wait: %v", err)
 	}
 	if !found {
-		t.Errorf("search q=fox did not return sess-search-1")
+		t.Errorf(`search q="quick brown fox" did not return sess-search-1`)
 	}
 }

@@ -175,8 +175,17 @@ type sessionReader struct {
 }
 
 func (s *sessionReader) Read(p []byte) (int, error) { return s.r.Read(p) }
+
+// Close waits for the remote command to finish and returns its exit-status
+// error (if any). A non-nil Wait error means the server rejected or errored
+// mid-command; callers should treat any local side effects predicated on a
+// successful run as invalid.
 func (s *sessionReader) Close() error {
-	_ = s.sess.Wait()
+	waitErr := s.sess.Wait()
 	_ = s.sess.Close()
-	return s.conn.Close()
+	connErr := s.conn.Close()
+	if waitErr != nil {
+		return waitErr
+	}
+	return connErr
 }

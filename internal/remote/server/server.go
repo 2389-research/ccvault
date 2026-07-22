@@ -92,6 +92,15 @@ func (s *Server) handleChannel(ch ssh.Channel, reqs <-chan *ssh.Request, identit
 	for req := range reqs {
 		switch req.Type {
 		case "exec":
+			// SSH exec payload is a 4-byte length prefix followed by the command
+			// string. Guard against malformed clients so a buggy build can't
+			// crash ccvaultd with an out-of-bounds slice.
+			if len(req.Payload) < 4 {
+				log.Printf("malformed exec payload (len=%d)", len(req.Payload))
+				_ = req.Reply(false, nil)
+				_ = ch.Close()
+				return
+			}
 			command := string(req.Payload[4:]) // strip 4-byte length prefix
 			_ = req.Reply(true, nil)
 			code := s.dispatch(command, HandlerCtx{
