@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -389,6 +390,9 @@ Supports Gmail-like query syntax:
 	Args: cobra.MinimumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		queryStr := strings.Join(args, " ")
+		if ran, err := runOnRemote(cmd, "search q="+strconv.Quote(queryStr)); ran {
+			return err
+		}
 		jsonOutput, _ := cmd.Flags().GetBool("json")
 		limit, _ := cmd.Flags().GetInt("limit")
 
@@ -441,6 +445,9 @@ var statsCmd = &cobra.Command{
 	Use:   "stats",
 	Short: "Show archive statistics",
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if ran, err := runOnRemote(cmd, "stats"); ran {
+			return err
+		}
 		cfg, err := config.Load()
 		if err != nil {
 			return fmt.Errorf("load config: %w", err)
@@ -574,6 +581,9 @@ var listSessionsCmd = &cobra.Command{
 	Use:   "list-sessions",
 	Short: "List sessions",
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if ran, err := runOnRemote(cmd, "sessions"); ran {
+			return err
+		}
 		jsonOutput, _ := cmd.Flags().GetBool("json")
 		projectFilter, _ := cmd.Flags().GetString("project")
 		limit, _ := cmd.Flags().GetInt("limit")
@@ -660,6 +670,9 @@ var showCmd = &cobra.Command{
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		sessionID := args[0]
+		if ran, err := runOnRemote(cmd, "show id="+sessionID); ran {
+			return err
+		}
 		jsonOutput, _ := cmd.Flags().GetBool("json")
 
 		cfg, err := config.Load()
@@ -915,6 +928,10 @@ func init() {
 	// Search flags
 	searchCmd.Flags().Bool("json", false, "Output results as JSON")
 	searchCmd.Flags().Int("limit", 20, "Maximum number of results")
+	searchCmd.Flags().String("remote", "", "Query a configured remote instead of the local vault")
+
+	// Stats flags
+	statsCmd.Flags().String("remote", "", "Query a configured remote instead of the local vault")
 
 	// List flags
 	listProjectsCmd.Flags().Bool("json", false, "Output as JSON")
@@ -923,9 +940,11 @@ func init() {
 	listSessionsCmd.Flags().Bool("json", false, "Output as JSON")
 	listSessionsCmd.Flags().String("project", "", "Filter by project")
 	listSessionsCmd.Flags().Int("limit", 50, "Maximum number of results")
+	listSessionsCmd.Flags().String("remote", "", "Query a configured remote instead of the local vault")
 
 	// Show flags
 	showCmd.Flags().Bool("json", false, "Output as JSON")
+	showCmd.Flags().String("remote", "", "Query a configured remote instead of the local vault")
 
 	// Export flags
 	exportCmd.Flags().StringP("output", "o", "", "Output file path (default: stdout)")
