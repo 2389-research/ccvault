@@ -139,6 +139,48 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
 }
 ```
 
+## Group Mode (Team Vault)
+
+ccvault supports pushing your local vault to a shared team server so a whole team can search and get analytics on their combined conversation history.
+
+### Server
+
+Run `ccvaultd` on any box the team can reach (SSH — no HTTP or TLS setup required):
+
+```bash
+ccvaultd --data /var/lib/ccvaultd \
+         --addr :2222 \
+         --authorized-keys /etc/ccvaultd/authorized_keys
+```
+
+Populate `authorized_keys` with one line per authorized developer, gitolite-style — the trailing comment becomes their attribution identity:
+
+```
+ssh-ed25519 AAAAC3Nz... alice@company.com
+ssh-ed25519 AAAAC3Nz... bob@company.com
+```
+
+Send `SIGHUP` after editing to reload without restarting.
+
+### Client
+
+```bash
+ccvault remote add origin ccvault@vault.company.com
+ccvault push                          # incremental, default remote=origin
+ccvault push --dry-run
+ccvault search "the payments bug" --remote origin
+ccvault stats --remote origin
+ccvault list-sessions --remote origin
+```
+
+Uses your ssh-agent (or `~/.ssh/id_ed25519`, `~/.ssh/id_rsa`). No tokens.
+
+### What gets pushed
+
+Every session in your local vault is pushed on first push; subsequent pushes are incremental (only new or updated sessions). Push is one-way — the team vault is not synced back to your laptop. Query it via `--remote` when you want team-wide search or analytics.
+
+**Trust model:** ccvaultd assumes a closed, trusted team. There is no client-side redaction of secrets or sensitive content — treat the team vault like a private git repo. Only add pubkeys you trust to `authorized_keys`.
+
 ## Claude Code Skill
 
 ccvault ships with a [Claude Code skill](skills/ccvault/SKILL.md) that teaches AI agents how to effectively mine conversation history. It includes search strategy patterns, workflow prompts for session orientation and on-demand recall, and a full tool/query reference card.
