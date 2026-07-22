@@ -900,6 +900,9 @@ func init() {
 	rootCmd.AddCommand(exportCmd)
 	rootCmd.AddCommand(mcpCmd)
 	rootCmd.AddCommand(buildCacheCmd)
+	remoteCmd.AddCommand(remoteListCmd, remoteAddCmd, remoteRemoveCmd)
+	rootCmd.AddCommand(remoteCmd)
+	rootCmd.AddCommand(pushCmd)
 
 	// Orient flags
 	orientCmd.Flags().Bool("json", false, "Output as JSON for machine parsing")
