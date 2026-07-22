@@ -31,10 +31,14 @@ func (s *Server) dispatch(command string, ctx HandlerCtx) int {
 		return handleVersion(ctx)
 	case "ingest":
 		return handleIngest(ctx)
-	case "search", "sessions", "show", "stats":
-		// Landed in T14
-		_, _ = fmt.Fprintf(ctx.Stderr, "command %q not implemented yet\n", name)
-		return 2
+	case "search":
+		return handleSearch(ctx)
+	case "sessions":
+		return handleSessions(ctx)
+	case "show":
+		return handleShow(ctx)
+	case "stats":
+		return handleStats(ctx)
 	default:
 		_, _ = fmt.Fprintf(ctx.Stderr, "unknown command: %q\n", name)
 		return 2
