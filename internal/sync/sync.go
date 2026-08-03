@@ -16,14 +16,18 @@ import (
 
 // Stats tracks sync statistics
 type Stats struct {
-	SessionsScanned int
-	SessionsIndexed int
-	SessionsSkipped int
-	TurnsIndexed    int
-	ToolUsesIndexed int
-	ProjectsFound   int
-	Errors          []error
-	Duration        time.Duration
+	SessionsScanned            int
+	SessionsIndexed            int
+	SessionsSkipped            int
+	SessionsWithSkippedLines   int
+	TotalSkippedLines          int
+	SessionsWithTruncatedTurns int
+	TurnsWithTruncatedRawJSON  int
+	TurnsIndexed               int
+	ToolUsesIndexed            int
+	ProjectsFound              int
+	Errors                     []error
+	Duration                   time.Duration
 }
 
 // Syncer handles syncing conversation data to ccvault
@@ -165,6 +169,14 @@ func (s *Syncer) Run() (*Stats, error) {
 
 	s.progress("Sync complete: %d sessions indexed, %d turns, %d tool uses",
 		stats.SessionsIndexed, stats.TurnsIndexed, stats.ToolUsesIndexed)
+	if stats.TotalSkippedLines > 0 {
+		s.progress("Skipped %d malformed line(s) across %d session(s)",
+			stats.TotalSkippedLines, stats.SessionsWithSkippedLines)
+	}
+	if stats.TurnsWithTruncatedRawJSON > 0 {
+		s.progress("Truncated raw_json for %d turn(s) across %d session(s)",
+			stats.TurnsWithTruncatedRawJSON, stats.SessionsWithTruncatedTurns)
+	}
 
 	return stats, nil
 }
@@ -185,6 +197,33 @@ func (s *Syncer) processSession(sf adapter.SessionFile, adpt adapter.SourceAdapt
 	parsed, err := adpt.Parse(sf.Path)
 	if err != nil {
 		return fmt.Errorf("parse session: %w", err)
+	}
+
+	// Aggregate parser diagnostics BEFORE the empty-session early-return.
+	// A file that consists entirely of malformed JSONL lines has parsed.ID
+	// == "" but still has skipped_lines / truncated turns we want to surface.
+	// Falls back to sf.Path for the verbose label when we have no session ID.
+	sessionLabel := parsed.ID
+	if sessionLabel == "" {
+		sessionLabel = sf.Path
+	}
+	if v, ok := parsed.Metadata["skipped_lines"]; ok {
+		if n, ok := v.(int); ok && n > 0 {
+			stats.SessionsWithSkippedLines++
+			stats.TotalSkippedLines += n
+			if s.verbose {
+				s.progress("session %s: skipped %d malformed line(s)", sessionLabel, n)
+			}
+		}
+	}
+	if v, ok := parsed.Metadata["turns_with_truncated_raw_json"]; ok {
+		if n, ok := v.(int); ok && n > 0 {
+			stats.SessionsWithTruncatedTurns++
+			stats.TurnsWithTruncatedRawJSON += n
+			if s.verbose {
+				s.progress("session %s: truncated raw_json for %d turn(s)", sessionLabel, n)
+			}
+		}
 	}
 
 	if parsed.ID == "" {
@@ -224,6 +263,9 @@ func (s *Syncer) processSession(sf adapter.SessionFile, adpt adapter.SourceAdapt
 			session.HasSubagent = b
 		}
 	}
+	// skipped_lines and turns_with_truncated_raw_json diagnostics are
+	// aggregated immediately after Parse, above the empty-session guard,
+	// so a file with no valid turns still contributes to sync totals.
 
 	// Convert parsed turns to model turns and collect tool uses
 	turns := make([]models.Turn, len(parsed.Turns))

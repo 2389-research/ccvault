@@ -6,6 +6,7 @@ package parser
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -15,51 +16,98 @@ import (
 	"github.com/2389-research/ccvault/pkg/models"
 )
 
-// ParseSession reads a session JSONL file and returns all turns
-func ParseSession(path string) ([]models.Turn, *models.Session, error) {
+// ParseStats reports counts of anomalies the parser handled while reading a
+// session. Populated even when Parse returns an error (partial progress may be
+// observable to callers).
+type ParseStats struct {
+	// SkippedLines is the number of lines the parser could not use, either
+	// because they failed to JSON-parse or (see T4) because they exceeded
+	// the per-line size cap and were dropped defensively.
+	SkippedLines int
+	// TurnsWithTruncatedRawJSON is the number of turns whose raw_json was
+	// replaced with a placeholder because the original line exceeded the
+	// raw_json size threshold. See strippedRawJSON.
+	TurnsWithTruncatedRawJSON int
+}
+
+// Package-level parser limits. Hard-coded on purpose; see the design doc at
+// docs/plans/2026-08-04-issue-11-bounded-and-truncated.md for rationale.
+const (
+	// maxLineBytes is the hard cap on the size of a single JSONL line the
+	// parser will accept. Above this the line is skipped and counted. Well
+	// above real-world Claude Code PDF-page lines (~12 MB) but low enough
+	// to bound memory on a pathological file.
+	maxLineBytes = 200 * 1024 * 1024
+
+	// maxRawJSONBytes is the threshold above which turn.RawJSON is replaced
+	// with a small placeholder (see strippedRawJSON). Real conversation
+	// turns are well under 1 MB; PDF pages and other embedded blobs are the
+	// only realistic overflow.
+	maxRawJSONBytes = 1 * 1024 * 1024
+)
+
+// ParseSession reads a session JSONL file and returns all turns.
+//
+// See ParseStats for the meaning of the third return value.
+func ParseSession(path string) ([]models.Turn, *models.Session, ParseStats, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, nil, fmt.Errorf("open session file: %w", err)
+		return nil, nil, ParseStats{}, fmt.Errorf("open session file: %w", err)
 	}
 	defer func() { _ = f.Close() }()
 
 	return ParseSessionReader(f, path)
 }
 
-// ParseSessionReader parses a session from an io.Reader
-func ParseSessionReader(r io.Reader, sourcePath string) ([]models.Turn, *models.Session, error) {
+// ParseSessionReader parses a session from an io.Reader using the package
+// default limits (maxLineBytes, maxRawJSONBytes). See parseSessionReaderWithLimits
+// for the underlying primitive.
+func ParseSessionReader(r io.Reader, sourcePath string) ([]models.Turn, *models.Session, ParseStats, error) {
+	return parseSessionReaderWithLimits(r, sourcePath, maxLineBytes, maxRawJSONBytes)
+}
+
+// parseSessionReaderWithLimits is the injectable core so tests can exercise the
+// cap/truncate paths without allocating hundreds of megabytes.
+//
+// Uses bufio.Reader.ReadSlice via readLineBounded rather than bufio.Scanner so
+// per-line size is bounded but not fixed at 10 MB. Claude Code embeds
+// base64-encoded PDF pages inside single JSONL lines (see issue #11) which
+// routinely exceeds any small token cap and, with a Scanner, aborts the whole
+// file. Lines above maxLine are skipped defensively; turns whose original raw
+// line was above maxRaw get a placeholder in place of the full blob so
+// turns.raw_json doesn't bloat the DB with content nothing indexes.
+func parseSessionReaderWithLimits(r io.Reader, sourcePath string, maxLine, maxRaw int) ([]models.Turn, *models.Session, ParseStats, error) {
 	var turns []models.Turn
 	session := &models.Session{
 		SourceFile: sourcePath,
 	}
+	stats := ParseStats{}
 
-	scanner := bufio.NewScanner(r)
-	// Increase buffer size for large JSONL entries
-	buf := make([]byte, 0, 1024*1024) // 1MB initial
-	scanner.Buffer(buf, 10*1024*1024) // 10MB max
+	reader := bufio.NewReader(r)
 
-	lineNum := 0
-	for scanner.Scan() {
-		lineNum++
-		line := scanner.Bytes()
-		if len(line) == 0 {
-			continue
+	for {
+		line, oversized, readErr := readLineBounded(reader, maxLine)
+		if oversized {
+			stats.SkippedLines++
+		} else if len(line) > 0 {
+			turn, raw, parseErr := parseTurnInternal(line)
+			if parseErr != nil {
+				stats.SkippedLines++
+			} else if turn != nil {
+				if len(line) > maxRaw {
+					turn.RawJSON = strippedRawJSON(raw, len(line))
+					stats.TurnsWithTruncatedRawJSON++
+				}
+				turns = append(turns, *turn)
+				updateSessionMetadata(session, turn, raw)
+			}
 		}
-
-		turn, raw, err := parseTurnInternal(line)
-		if err != nil {
-			// Log but continue - some entries may be malformed
-			continue
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			return nil, nil, stats, fmt.Errorf("read session file: %w", readErr)
 		}
-
-		if turn != nil {
-			turns = append(turns, *turn)
-			updateSessionMetadata(session, turn, raw)
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, nil, fmt.Errorf("scan session file: %w", err)
 	}
 
 	// Set session ID from first turn if available
@@ -74,13 +122,132 @@ func ParseSessionReader(r io.Reader, sourcePath string) ([]models.Turn, *models.
 
 	session.TurnCount = len(turns)
 
-	return turns, session, nil
+	return turns, session, stats, nil
+}
+
+// readLineBounded reads the next line from r, capped at maxBytes of content
+// (post-strip of CR/LF). If the line exceeds maxBytes, the excess is drained
+// up to the next '\n' and (nil, true, err) is returned; err carries io.EOF
+// when the drain hits EOF, so callers can break out cleanly. Uses
+// bufio.Reader.ReadSlice for chunk-by-chunk reads that keep memory bounded
+// even for pathological input (a multi-GB single "line" won't blow the heap).
+func readLineBounded(r *bufio.Reader, maxBytes int) ([]byte, bool, error) {
+	var acc []byte
+	for {
+		chunk, err := r.ReadSlice('\n')
+		switch {
+		case err == nil:
+			// chunk ends with '\n'. Strip \n and optional \r.
+			line := chunk
+			if len(line) > 0 && line[len(line)-1] == '\n' {
+				line = line[:len(line)-1]
+				if len(line) > 0 && line[len(line)-1] == '\r' {
+					line = line[:len(line)-1]
+				}
+			}
+			if len(acc)+len(line) > maxBytes {
+				return nil, true, nil
+			}
+			if len(acc) == 0 {
+				// Fast path: no accumulator yet. Copy out of r's internal
+				// buffer since chunk is not stable across further reads.
+				out := make([]byte, len(line))
+				copy(out, line)
+				return out, false, nil
+			}
+			acc = append(acc, line...)
+			return acc, false, nil
+		case errors.Is(err, bufio.ErrBufferFull):
+			// chunk fills the internal buffer without hitting '\n'.
+			if len(acc)+len(chunk) > maxBytes {
+				// Would exceed cap. Drain the rest of the line to '\n'
+				// (or EOF) and report the line as oversized.
+				drainErr := drainToNewline(r)
+				if drainErr != nil && !errors.Is(drainErr, io.EOF) {
+					return nil, true, drainErr
+				}
+				return nil, true, drainErr
+			}
+			// Copy out of r's internal buffer before the next read
+			// overwrites it.
+			acc = append(acc, chunk...)
+		default:
+			// io.EOF or another error. chunk may hold the final line if the
+			// file ended without a trailing newline.
+			if len(chunk) > 0 {
+				if len(acc)+len(chunk) > maxBytes {
+					// Cap exceeded on the terminal chunk. No newline to
+					// drain to (we're at EOF), so just report.
+					return nil, true, err
+				}
+				acc = append(acc, chunk...)
+			}
+			if len(acc) > 0 && acc[len(acc)-1] == '\r' {
+				acc = acc[:len(acc)-1]
+			}
+			return acc, false, err
+		}
+	}
+}
+
+// drainToNewline consumes bytes from r until a '\n' is found or an error occurs.
+// Used by readLineBounded to skip past the tail of an oversized line.
+func drainToNewline(r *bufio.Reader) error {
+	for {
+		_, err := r.ReadSlice('\n')
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		return err
+	}
 }
 
 // ParseTurn parses a single JSONL line into a Turn
 func ParseTurn(data []byte) (*models.Turn, error) {
 	turn, _, err := parseTurnInternal(data)
 	return turn, err
+}
+
+// strippedRawTurn is the JSON shape written in place of an oversized raw line.
+// Fields under the _ccvault_ namespace mark the shape as a ccvault-side
+// synthetic replacement, distinguishable from the source-format fields
+// (uuid/type/timestamp/etc.) which are preserved so downstream consumers can
+// still identify the turn.
+type strippedRawTurn struct {
+	Stripped     bool   `json:"_ccvault_stripped"`
+	OriginalSize int    `json:"_ccvault_original_size"`
+	UUID         string `json:"uuid"`
+	ParentUUID   string `json:"parentUuid,omitempty"`
+	SessionID    string `json:"sessionId"`
+	Type         string `json:"type"`
+	Timestamp    string `json:"timestamp"`
+}
+
+// strippedRawJSON returns a small JSON placeholder that stands in for the raw
+// line when the original exceeds maxRawJSONBytes. Callers use this to keep
+// turns.raw_json bounded while preserving the turn's identity and structural
+// metadata; the actual payload (which for the reported case is base64 PDF
+// content that no consumer indexes anyway) is dropped.
+func strippedRawJSON(raw *models.RawTurn, originalSize int) []byte {
+	stub := strippedRawTurn{
+		Stripped:     true,
+		OriginalSize: originalSize,
+		UUID:         raw.UUID,
+		ParentUUID:   raw.ParentUUID,
+		SessionID:    raw.SessionID,
+		Type:         raw.Type,
+		Timestamp:    raw.Timestamp,
+	}
+	out, err := json.Marshal(stub)
+	if err != nil {
+		// json.Marshal on a struct of primitives cannot realistically fail;
+		// fall back to a static string so we never lose the "stripped" signal.
+		return []byte(`{"_ccvault_stripped":true,"_ccvault_marshal_error":true}`)
+	}
+	return out
 }
 
 // parseTurnInternal parses a JSONL line and returns both the Turn and the
