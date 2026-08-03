@@ -64,14 +64,19 @@ func (a *Adapter) Discover(root string) ([]adapter.SessionFile, error) {
 		}
 		group := groupEntry.Name()
 		claudeDir := filepath.Join(root, group, ".claude")
-		projectPath := "nanoclaw/" + group
+		projectPath, _ := nanoclawProjectPath(group)
 
 		// Parent sessions — ScanClaudeHome walks .claude/projects/ and picks up
 		// UUID-named JSONLs, skipping any subagents/ subtrees.
 		parserFiles, err := parser.ScanClaudeHome(claudeDir)
 		if err != nil {
-			// Group has no .claude/projects/ yet — skip silently.
-			continue
+			if errors.Is(err, os.ErrNotExist) {
+				// Group has no .claude/projects/ yet — expected, skip.
+				continue
+			}
+			// Real error (permission denied, corrupt tree, etc.) — surface it
+			// so partial data loss isn't silent. See issue #13.
+			return nil, fmt.Errorf("scanning nanoclaw group %s: %w", group, err)
 		}
 		for _, pf := range parserFiles {
 			files = append(files, adapter.SessionFile{
@@ -139,6 +144,17 @@ func discoverSubagents(projectsDir, projectPath string) ([]adapter.SessionFile, 
 	return files, nil
 }
 
+// nanoclawProjectPath computes the ccvault projectPath and human-readable
+// display name for a given nanoclaw group. Extracted to a single source of
+// truth so Discover/parseParent/parseSubagent can't silently drift on the
+// naming scheme (see issue #13's related nit).
+func nanoclawProjectPath(group string) (projectPath, display string) {
+	if group == "" {
+		return "nanoclaw", "Nanoclaw"
+	}
+	return "nanoclaw/" + group, "nanoclaw/" + group
+}
+
 // Parse reads a nanoclaw JSONL session file and converts it to adapter.ParsedSession.
 // Dispatches to the subagent branch when the path lives under a subagents/ directory,
 // otherwise treats it as a parent session.
@@ -170,12 +186,7 @@ func parseParent(path string) (*adapter.ParsedSession, error) {
 		meta["turns_with_truncated_raw_json"] = stats.TurnsWithTruncatedRawJSON
 	}
 
-	projectPath := "nanoclaw"
-	display := "Nanoclaw"
-	if group != "" {
-		projectPath = "nanoclaw/" + group
-		display = "nanoclaw/" + group
-	}
+	projectPath, display := nanoclawProjectPath(group)
 
 	return &adapter.ParsedSession{
 		ID:          sessionIDPrefix + session.ID,
@@ -244,12 +255,7 @@ func parseSubagent(path string) (*adapter.ParsedSession, error) {
 		id += session.ID
 	}
 
-	projectPath := "nanoclaw"
-	display := "Nanoclaw"
-	if group != "" {
-		projectPath = "nanoclaw/" + group
-		display = "nanoclaw/" + group
-	}
+	projectPath, display := nanoclawProjectPath(group)
 
 	return &adapter.ParsedSession{
 		ID:          id,

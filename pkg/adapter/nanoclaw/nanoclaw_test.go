@@ -358,3 +358,73 @@ func writeJSONLLines(t *testing.T, path string, lines []string) {
 		t.Fatal(err)
 	}
 }
+
+// --- issue #13: error handling in Discover ---
+
+// TestNanoclawDiscover_MissingClaudeProjectsIsSilent confirms that a nanoclaw
+// group directory without a .claude/projects/ tree (i.e., created but never
+// used) does not cause Discover to error — it's an expected empty case.
+func TestNanoclawDiscover_MissingClaudeProjectsIsSilent(t *testing.T) {
+	root := t.TempDir()
+	// Group exists, .claude/ does not.
+	if err := os.MkdirAll(filepath.Join(root, "empty-group"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	files, err := New().Discover(root)
+	if err != nil {
+		t.Fatalf("Discover errored on missing .claude/projects: %v", err)
+	}
+	if len(files) != 0 {
+		t.Errorf("expected 0 files, got %d", len(files))
+	}
+}
+
+// TestNanoclawDiscover_PropagatesNonNotFoundErrors verifies that Discover
+// surfaces "real" errors (permission denied, corrupt layout, etc.) rather
+// than swallowing them into a silent continue — issue #13's core concern.
+// We trigger this by making <group>/.claude/projects a regular file, which
+// makes ScanClaudeHome return "projects path is not a directory" — an error
+// that MUST NOT match errors.Is(err, os.ErrNotExist).
+func TestNanoclawDiscover_PropagatesNonNotFoundErrors(t *testing.T) {
+	root := t.TempDir()
+	claudeDir := filepath.Join(root, "corrupt-group", ".claude")
+	if err := os.MkdirAll(claudeDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// .claude/projects is a file, not a directory.
+	if err := os.WriteFile(filepath.Join(claudeDir, "projects"), []byte("oops"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := New().Discover(root)
+	if err == nil {
+		t.Fatal("expected error when .claude/projects is a file, got nil (bug from issue #13)")
+	}
+	if !strings.Contains(err.Error(), "corrupt-group") {
+		t.Errorf("error should reference the group name for debuggability; got %v", err)
+	}
+}
+
+func TestNanoclawProjectPath(t *testing.T) {
+	tests := []struct {
+		group           string
+		wantProjectPath string
+		wantDisplay     string
+	}{
+		{"", "nanoclaw", "Nanoclaw"},
+		{"reed", "nanoclaw/reed", "nanoclaw/reed"},
+		{"main", "nanoclaw/main", "nanoclaw/main"},
+	}
+	for _, tc := range tests {
+		t.Run("group="+tc.group, func(t *testing.T) {
+			pp, disp := nanoclawProjectPath(tc.group)
+			if pp != tc.wantProjectPath {
+				t.Errorf("projectPath = %q, want %q", pp, tc.wantProjectPath)
+			}
+			if disp != tc.wantDisplay {
+				t.Errorf("display = %q, want %q", disp, tc.wantDisplay)
+			}
+		})
+	}
+}
