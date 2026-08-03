@@ -717,3 +717,30 @@ func TestParseSessionReaderWithLimits_TruncatesLargeRawJSON(t *testing.T) {
 			len(turns[0].RawJSON))
 	}
 }
+
+// TestExtractUserContent_IgnoresImageBlocks covers the scenario
+// "base64-payload-does-not-pollute-fts": Claude Code emits PDF Read
+// results as tool_result blocks whose `content` is an array of image
+// blocks with big base64 payloads. Those must not enter turn.Content
+// (which feeds the FTS index) — otherwise a 12 MB base64 blob would
+// bloat search results with unsearchable noise.
+//
+// UserContentBlock.Content is typed as string, so a JSON array in that
+// slot causes the whole []UserContentBlock unmarshal to fail; the
+// function then returns "". This test pins that behavior.
+func TestExtractUserContent_IgnoresImageBlocks(t *testing.T) {
+	// Distinctive marker to prove the payload is not surfaced anywhere.
+	needle := "BASE64PAYLOADCANARYAAAAAAAAAAAAAAAAAA"
+	content := json.RawMessage(fmt.Sprintf(
+		`[{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"%s"}}]}]`,
+		needle,
+	))
+
+	got := extractUserContent(content)
+	if strings.Contains(got, needle) {
+		t.Errorf("extractUserContent leaked base64 payload into indexable content: %q", got)
+	}
+	if got != "" {
+		t.Errorf("extractUserContent = %q, want empty for image-only tool_result", got)
+	}
+}

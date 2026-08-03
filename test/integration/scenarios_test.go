@@ -28,6 +28,11 @@ var scenarioCoverage = map[string]string{
 	"sync-real-hex":               "TestMultiSourceSyncAndSearch (hex fixture)",
 	"source-filtered-search-jeff": "TestMultiSourceSyncAndSearch (source:jeff assertions)",
 	"fts-across-sources":          "TestMultiSourceSyncAndSearch (unfiltered 'hello' reaches all four sources)",
+	// issue #11 (PR #12): oversized JSONL lines + truncation + malformed handling
+	"oversized-jsonl-line-does-not-drop-session": "pkg/parser TestParseSessionReader_OversizedLineDoesNotDropSession + TestReadLineBounded_OversizedMiddleLineIsSkippedAndDrained",
+	"malformed-only-file-surfaces-skipped-lines": "pkg/parser TestParseSessionReader_MalformedLinesAreSkippedAndCounted",
+	"raw-json-truncation-persists-to-db":         "pkg/parser TestParseSessionReaderWithLimits_TruncatesLargeRawJSON + TestStrippedRawJSON_ShapeAndFields",
+	"base64-payload-does-not-pollute-fts":        "pkg/parser TestExtractUserContent_IgnoresImageBlocks",
 }
 
 func TestScenariosHaveCoverage(t *testing.T) {
