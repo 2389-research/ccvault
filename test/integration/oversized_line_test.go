@@ -4,6 +4,7 @@
 package integration
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -77,6 +78,13 @@ this line is not valid json and should be counted as skipped
 	if stats.SessionsWithSkippedLines != 1 {
 		t.Errorf("SessionsWithSkippedLines = %d, want 1", stats.SessionsWithSkippedLines)
 	}
+	if stats.TurnsWithTruncatedRawJSON != 1 {
+		t.Errorf("TurnsWithTruncatedRawJSON = %d, want 1 (the 12MB middle turn)",
+			stats.TurnsWithTruncatedRawJSON)
+	}
+	if stats.SessionsWithTruncatedTurns != 1 {
+		t.Errorf("SessionsWithTruncatedTurns = %d, want 1", stats.SessionsWithTruncatedTurns)
+	}
 
 	// Verify the session actually landed with the expected turn count.
 	session, err := database.GetSession("sess-e2e-oversized")
@@ -88,6 +96,30 @@ this line is not valid json and should be counted as skipped
 	}
 	if session.TurnCount != 3 {
 		t.Errorf("session.TurnCount = %d, want 3", session.TurnCount)
+	}
+
+	// Load the persisted turns and verify the middle turn's raw_json is the
+	// small placeholder shape, not the original 12 MB blob.
+	turns, err := database.GetTurns("sess-e2e-oversized")
+	if err != nil {
+		t.Fatalf("get turns: %v", err)
+	}
+	if len(turns) != 3 {
+		t.Fatalf("expected 3 persisted turns, got %d", len(turns))
+	}
+	middleRaw := turns[1].RawJSON
+	if len(middleRaw) > 500 {
+		t.Errorf("middle turn raw_json not truncated in DB: len=%d bytes", len(middleRaw))
+	}
+	var placeholder map[string]any
+	if err := json.Unmarshal(middleRaw, &placeholder); err != nil {
+		t.Fatalf("persisted raw_json is not valid JSON: %v", err)
+	}
+	if placeholder["_ccvault_stripped"] != true {
+		t.Errorf("persisted raw_json missing _ccvault_stripped marker: %v", placeholder)
+	}
+	if origSize, ok := placeholder["_ccvault_original_size"].(float64); !ok || origSize < 12*1024*1024 {
+		t.Errorf("_ccvault_original_size = %v, want ≥ 12MB", placeholder["_ccvault_original_size"])
 	}
 
 	// Verify mtime was recorded — this is Bug B in the issue: previously,
