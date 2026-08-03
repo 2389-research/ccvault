@@ -27,6 +27,7 @@ type Server struct {
 	cfg      *config.Config
 	analyzer *analytics.Analyzer
 	debug    bool
+	out      io.Writer // stdout by default; overridable for tests
 }
 
 // NewServer creates a new MCP server
@@ -43,6 +44,7 @@ func NewServer(database *db.DB, cfg *config.Config) (*Server, error) {
 		cfg:      cfg,
 		analyzer: analyzer,
 		debug:    os.Getenv("CCVAULT_MCP_DEBUG") == "1",
+		out:      os.Stdout,
 	}, nil
 }
 
@@ -1395,5 +1397,5 @@ func (s *Server) send(v interface{}) {
 		return
 	}
 	s.log("Sending: %s", string(data))
-	fmt.Println(string(data))
+	_, _ = fmt.Fprintln(s.out, string(data))
 }
