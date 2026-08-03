@@ -222,12 +222,17 @@ func (a *Analyzer) GetTokensBySource() ([]SourceTokenStats, error) {
 		return nil, fmt.Errorf("analytics cache not found. Run 'ccvault build-cache' first")
 	}
 
+	// Alias intentionally not named `source`: on a legacy parquet without a
+	// source column, DuckDB's binder shadows the missing column with the
+	// SELECT alias and fails inside the COALESCE. Using `source_out` avoids
+	// the collision and rows.Scan is positional so the Go-side struct field
+	// mapping is unaffected.
 	query := fmt.Sprintf(`
 		SELECT
-			COALESCE(source, 'claude-code') as source,
+			COALESCE(source, 'claude-code') as source_out,
 			SUM(total_tokens) as total_tokens
 		FROM read_parquet('%s')
-		GROUP BY COALESCE(source, 'claude-code')
+		GROUP BY 1
 		ORDER BY total_tokens DESC
 	`, sessionsPath)
 
@@ -264,12 +269,14 @@ func (a *Analyzer) GetSessionsBySource() ([]SourceSessionStats, error) {
 		return nil, fmt.Errorf("analytics cache not found. Run 'ccvault build-cache' first")
 	}
 
+	// Alias intentionally not named `source` — see GetTokensBySource for
+	// the DuckDB binder rationale.
 	query := fmt.Sprintf(`
 		SELECT
-			COALESCE(source, 'claude-code') as source,
+			COALESCE(source, 'claude-code') as source_out,
 			COUNT(*) as session_count
 		FROM read_parquet('%s')
-		GROUP BY COALESCE(source, 'claude-code')
+		GROUP BY 1
 		ORDER BY session_count DESC
 	`, sessionsPath)
 
