@@ -322,7 +322,11 @@ func TestParseSessionReader_OversizedLineDoesNotDropSession(t *testing.T) {
 		t.Fatalf("expected 3 turns (oversized line preserved), got %d", len(turns))
 	}
 	if stats.SkippedLines != 0 {
-		t.Errorf("expected 0 skipped lines (oversized ≠ malformed), got %d", stats.SkippedLines)
+		t.Errorf("expected 0 skipped lines (oversized ≠ malformed under 200MB), got %d", stats.SkippedLines)
+	}
+	if stats.TurnsWithTruncatedRawJSON != 1 {
+		t.Errorf("expected 1 truncated raw_json (12MB > 1MB threshold), got %d",
+			stats.TurnsWithTruncatedRawJSON)
 	}
 
 	if turns[0].Content != "Hello" {
@@ -330,6 +334,20 @@ func TestParseSessionReader_OversizedLineDoesNotDropSession(t *testing.T) {
 	}
 	if turns[2].Content != "World" {
 		t.Errorf("last turn content = %q, want %q", turns[2].Content, "World")
+	}
+
+	// The middle turn's RawJSON should now be the placeholder shape, not
+	// the original 12 MB blob.
+	middle := turns[1]
+	if len(middle.RawJSON) > 500 {
+		t.Errorf("middle turn RawJSON not truncated: len=%d bytes", len(middle.RawJSON))
+	}
+	var placeholder map[string]any
+	if err := json.Unmarshal(middle.RawJSON, &placeholder); err != nil {
+		t.Fatalf("middle turn RawJSON not valid JSON: %v", err)
+	}
+	if placeholder["_ccvault_stripped"] != true {
+		t.Errorf("middle turn RawJSON missing _ccvault_stripped marker: %v", placeholder)
 	}
 
 	if session.ID != "sess-oversized" {
@@ -621,5 +639,81 @@ func TestStrippedRawJSON_UnmarshalsAsRawTurn(t *testing.T) {
 	}
 	if len(back.Message) != 0 {
 		t.Errorf("placeholder should have no Message body, got %s", back.Message)
+	}
+}
+
+// --- parseSessionReaderWithLimits: cap + truncation ---
+
+func TestParseSessionReaderWithLimits_LineExceedsMaxIsSkipped(t *testing.T) {
+	// Tiny maxLine forces even a modest JSON line to be dropped, so we can
+	// exercise the cap path without allocating hundreds of megabytes.
+	small := `{"uuid":"turn-1","sessionId":"s","type":"user","timestamp":"2026-08-04T10:00:00Z","message":{"role":"user","content":"hi"}}`
+	oversized := `{"uuid":"turn-huge","sessionId":"s","type":"user","timestamp":"2026-08-04T10:00:01Z","message":{"role":"user","content":"` +
+		strings.Repeat("X", 500) + `"}}`
+	tail := `{"uuid":"turn-3","sessionId":"s","type":"assistant","timestamp":"2026-08-04T10:00:02Z","message":{"model":"m","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}}`
+
+	input := small + "\n" + oversized + "\n" + tail + "\n"
+
+	// maxLine=256 rejects the middle line, keeps the outer two.
+	turns, _, stats, err := parseSessionReaderWithLimits(
+		strings.NewReader(input), "/test/cap.jsonl", 256, 1024*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(turns) != 2 {
+		t.Fatalf("expected 2 turns (middle skipped by cap), got %d", len(turns))
+	}
+	if stats.SkippedLines != 1 {
+		t.Errorf("SkippedLines = %d, want 1", stats.SkippedLines)
+	}
+	if stats.TurnsWithTruncatedRawJSON != 0 {
+		t.Errorf("TurnsWithTruncatedRawJSON = %d, want 0 (line was skipped, not truncated)",
+			stats.TurnsWithTruncatedRawJSON)
+	}
+	if turns[0].ID != "turn-1" || turns[1].ID != "turn-3" {
+		t.Errorf("expected [turn-1, turn-3], got [%s, %s]", turns[0].ID, turns[1].ID)
+	}
+}
+
+func TestParseSessionReaderWithLimits_TruncatesLargeRawJSON(t *testing.T) {
+	// Tiny maxRaw threshold: the middle line parses fine (well under maxLine)
+	// but its raw_json exceeds the truncation threshold, so it should be
+	// replaced with the placeholder.
+	small := `{"uuid":"turn-1","sessionId":"s","type":"user","timestamp":"2026-08-04T10:00:00Z","message":{"role":"user","content":"hi"}}`
+	large := `{"uuid":"turn-large","sessionId":"s","type":"user","timestamp":"2026-08-04T10:00:01Z","message":{"role":"user","content":"` +
+		strings.Repeat("X", 5000) + `"}}`
+	tail := `{"uuid":"turn-3","sessionId":"s","type":"assistant","timestamp":"2026-08-04T10:00:02Z","message":{"model":"m","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}}`
+	input := small + "\n" + large + "\n" + tail + "\n"
+
+	// maxLine=1_000_000 accepts everything; maxRaw=1024 triggers truncation
+	// only on the middle line.
+	turns, _, stats, err := parseSessionReaderWithLimits(
+		strings.NewReader(input), "/test/trunc.jsonl", 1000000, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(turns) != 3 {
+		t.Fatalf("expected 3 turns, got %d", len(turns))
+	}
+	if stats.SkippedLines != 0 {
+		t.Errorf("SkippedLines = %d, want 0", stats.SkippedLines)
+	}
+	if stats.TurnsWithTruncatedRawJSON != 1 {
+		t.Errorf("TurnsWithTruncatedRawJSON = %d, want 1", stats.TurnsWithTruncatedRawJSON)
+	}
+
+	middle := turns[1]
+	var placeholder map[string]any
+	if err := json.Unmarshal(middle.RawJSON, &placeholder); err != nil {
+		t.Fatalf("middle turn RawJSON not valid JSON: %v", err)
+	}
+	if placeholder["_ccvault_stripped"] != true {
+		t.Errorf("middle turn missing _ccvault_stripped marker: %v", placeholder)
+	}
+
+	// The outer turns should have their original raw_json intact.
+	if len(turns[0].RawJSON) < 50 || len(turns[0].RawJSON) > 200 {
+		t.Errorf("outer turn RawJSON len unexpected: %d (want normal-sized)",
+			len(turns[0].RawJSON))
 	}
 }

@@ -30,6 +30,22 @@ type ParseStats struct {
 	TurnsWithTruncatedRawJSON int
 }
 
+// Package-level parser limits. Hard-coded on purpose; see the design doc at
+// docs/plans/2026-08-04-issue-11-bounded-and-truncated.md for rationale.
+const (
+	// maxLineBytes is the hard cap on the size of a single JSONL line the
+	// parser will accept. Above this the line is skipped and counted. Well
+	// above real-world Claude Code PDF-page lines (~12 MB) but low enough
+	// to bound memory on a pathological file.
+	maxLineBytes = 200 * 1024 * 1024
+
+	// maxRawJSONBytes is the threshold above which turn.RawJSON is replaced
+	// with a small placeholder (see strippedRawJSON). Real conversation
+	// turns are well under 1 MB; PDF pages and other embedded blobs are the
+	// only realistic overflow.
+	maxRawJSONBytes = 1 * 1024 * 1024
+)
+
 // ParseSession reads a session JSONL file and returns all turns.
 //
 // See ParseStats for the meaning of the third return value.
@@ -43,16 +59,24 @@ func ParseSession(path string) ([]models.Turn, *models.Session, ParseStats, erro
 	return ParseSessionReader(f, path)
 }
 
-// ParseSessionReader parses a session from an io.Reader.
-//
-// Uses bufio.Reader.ReadBytes rather than bufio.Scanner so per-line size is
-// unbounded at the transport layer. Claude Code embeds base64-encoded PDF pages
-// inside single JSONL lines (see issue #11), which routinely exceeds any fixed
-// token cap and, with a Scanner, aborts the whole file. Mirrors the reader
-// pattern used by the Codex adapter (pkg/adapter/codex + pkg/adapter/util.go:
-// ReadLine); duplicated here rather than shared because pkg/adapter wraps
-// pkg/parser, not vice versa.
+// ParseSessionReader parses a session from an io.Reader using the package
+// default limits (maxLineBytes, maxRawJSONBytes). See parseSessionReaderWithLimits
+// for the underlying primitive.
 func ParseSessionReader(r io.Reader, sourcePath string) ([]models.Turn, *models.Session, ParseStats, error) {
+	return parseSessionReaderWithLimits(r, sourcePath, maxLineBytes, maxRawJSONBytes)
+}
+
+// parseSessionReaderWithLimits is the injectable core so tests can exercise the
+// cap/truncate paths without allocating hundreds of megabytes.
+//
+// Uses bufio.Reader.ReadSlice via readLineBounded rather than bufio.Scanner so
+// per-line size is bounded but not fixed at 10 MB. Claude Code embeds
+// base64-encoded PDF pages inside single JSONL lines (see issue #11) which
+// routinely exceeds any small token cap and, with a Scanner, aborts the whole
+// file. Lines above maxLine are skipped defensively; turns whose original raw
+// line was above maxRaw get a placeholder in place of the full blob so
+// turns.raw_json doesn't bloat the DB with content nothing indexes.
+func parseSessionReaderWithLimits(r io.Reader, sourcePath string, maxLine, maxRaw int) ([]models.Turn, *models.Session, ParseStats, error) {
 	var turns []models.Turn
 	session := &models.Session{
 		SourceFile: sourcePath,
@@ -62,12 +86,18 @@ func ParseSessionReader(r io.Reader, sourcePath string) ([]models.Turn, *models.
 	reader := bufio.NewReader(r)
 
 	for {
-		line, readErr := readLine(reader)
-		if len(line) > 0 {
+		line, oversized, readErr := readLineBounded(reader, maxLine)
+		if oversized {
+			stats.SkippedLines++
+		} else if len(line) > 0 {
 			turn, raw, parseErr := parseTurnInternal(line)
 			if parseErr != nil {
 				stats.SkippedLines++
 			} else if turn != nil {
+				if len(line) > maxRaw {
+					turn.RawJSON = strippedRawJSON(raw, len(line))
+					stats.TurnsWithTruncatedRawJSON++
+				}
 				turns = append(turns, *turn)
 				updateSessionMetadata(session, turn, raw)
 			}
@@ -93,21 +123,6 @@ func ParseSessionReader(r io.Reader, sourcePath string) ([]models.Turn, *models.
 	session.TurnCount = len(turns)
 
 	return turns, session, stats, nil
-}
-
-// readLine returns the next newline-terminated line from r with trailing CR/LF
-// stripped. A non-nil error (including io.EOF) may be paired with a non-empty
-// final line when the file does not end with a newline. There is no per-line
-// size cap.
-func readLine(r *bufio.Reader) ([]byte, error) {
-	line, err := r.ReadBytes('\n')
-	if len(line) > 0 && line[len(line)-1] == '\n' {
-		line = line[:len(line)-1]
-		if len(line) > 0 && line[len(line)-1] == '\r' {
-			line = line[:len(line)-1]
-		}
-	}
-	return line, err
 }
 
 // readLineBounded reads the next line from r, capped at maxBytes of content
