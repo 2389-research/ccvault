@@ -5,12 +5,15 @@ package parser
 
 import (
 	"bufio"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/2389-research/ccvault/pkg/models"
 )
 
 func TestParseTurn_UserMessage(t *testing.T) {
@@ -528,5 +531,95 @@ func TestReadLineBounded_OversizedAtEOFWithoutNewline(t *testing.T) {
 	}
 	if !errors.Is(err, io.EOF) {
 		t.Fatalf("want EOF, got %v", err)
+	}
+}
+
+// --- strippedRawJSON ---
+
+func TestStrippedRawJSON_ShapeAndFields(t *testing.T) {
+	raw := &models.RawTurn{
+		UUID:       "u-1234",
+		ParentUUID: "u-0000",
+		SessionID:  "sess-abc",
+		Type:       "user",
+		Timestamp:  "2026-08-04T10:00:00Z",
+	}
+
+	out := strippedRawJSON(raw, 12583168)
+
+	if len(out) > 500 {
+		t.Errorf("stripped placeholder too large: %d bytes (want < 500)", len(out))
+	}
+
+	var parsed map[string]any
+	if err := json.Unmarshal(out, &parsed); err != nil {
+		t.Fatalf("placeholder is not valid JSON: %v", err)
+	}
+
+	if parsed["_ccvault_stripped"] != true {
+		t.Errorf("_ccvault_stripped = %v, want true", parsed["_ccvault_stripped"])
+	}
+	if got, want := parsed["_ccvault_original_size"], float64(12583168); got != want {
+		t.Errorf("_ccvault_original_size = %v, want %v", got, want)
+	}
+	if parsed["uuid"] != "u-1234" {
+		t.Errorf("uuid = %v, want u-1234", parsed["uuid"])
+	}
+	if parsed["parentUuid"] != "u-0000" {
+		t.Errorf("parentUuid = %v, want u-0000", parsed["parentUuid"])
+	}
+	if parsed["sessionId"] != "sess-abc" {
+		t.Errorf("sessionId = %v, want sess-abc", parsed["sessionId"])
+	}
+	if parsed["type"] != "user" {
+		t.Errorf("type = %v, want user", parsed["type"])
+	}
+	if parsed["timestamp"] != "2026-08-04T10:00:00Z" {
+		t.Errorf("timestamp = %v, want 2026-08-04T10:00:00Z", parsed["timestamp"])
+	}
+}
+
+func TestStrippedRawJSON_OmitsEmptyParentUUID(t *testing.T) {
+	raw := &models.RawTurn{
+		UUID:      "u-root",
+		SessionID: "sess-1",
+		Type:      "user",
+		Timestamp: "2026-08-04T10:00:00Z",
+	}
+	out := strippedRawJSON(raw, 100)
+
+	var parsed map[string]any
+	if err := json.Unmarshal(out, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := parsed["parentUuid"]; present {
+		t.Error("parentUuid should be omitted when empty")
+	}
+}
+
+func TestStrippedRawJSON_UnmarshalsAsRawTurn(t *testing.T) {
+	// Existing consumers (TUI, MCP, export) json.Unmarshal turns.raw_json into
+	// models.RawTurn. The placeholder should decode into that shape without
+	// error, even if the message body is absent.
+	raw := &models.RawTurn{
+		UUID:      "u-1234",
+		SessionID: "sess-abc",
+		Type:      "user",
+		Timestamp: "2026-08-04T10:00:00Z",
+	}
+	out := strippedRawJSON(raw, 100)
+
+	var back models.RawTurn
+	if err := json.Unmarshal(out, &back); err != nil {
+		t.Fatalf("placeholder failed to decode as RawTurn: %v", err)
+	}
+	if back.UUID != raw.UUID {
+		t.Errorf("UUID = %q, want %q", back.UUID, raw.UUID)
+	}
+	if back.Type != raw.Type {
+		t.Errorf("Type = %q, want %q", back.Type, raw.Type)
+	}
+	if len(back.Message) != 0 {
+		t.Errorf("placeholder should have no Message body, got %s", back.Message)
 	}
 }

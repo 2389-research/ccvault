@@ -186,6 +186,45 @@ func ParseTurn(data []byte) (*models.Turn, error) {
 	return turn, err
 }
 
+// strippedRawTurn is the JSON shape written in place of an oversized raw line.
+// Fields under the _ccvault_ namespace mark the shape as a ccvault-side
+// synthetic replacement, distinguishable from the source-format fields
+// (uuid/type/timestamp/etc.) which are preserved so downstream consumers can
+// still identify the turn.
+type strippedRawTurn struct {
+	Stripped     bool   `json:"_ccvault_stripped"`
+	OriginalSize int    `json:"_ccvault_original_size"`
+	UUID         string `json:"uuid"`
+	ParentUUID   string `json:"parentUuid,omitempty"`
+	SessionID    string `json:"sessionId"`
+	Type         string `json:"type"`
+	Timestamp    string `json:"timestamp"`
+}
+
+// strippedRawJSON returns a small JSON placeholder that stands in for the raw
+// line when the original exceeds maxRawJSONBytes. Callers use this to keep
+// turns.raw_json bounded while preserving the turn's identity and structural
+// metadata; the actual payload (which for the reported case is base64 PDF
+// content that no consumer indexes anyway) is dropped.
+func strippedRawJSON(raw *models.RawTurn, originalSize int) []byte {
+	stub := strippedRawTurn{
+		Stripped:     true,
+		OriginalSize: originalSize,
+		UUID:         raw.UUID,
+		ParentUUID:   raw.ParentUUID,
+		SessionID:    raw.SessionID,
+		Type:         raw.Type,
+		Timestamp:    raw.Timestamp,
+	}
+	out, err := json.Marshal(stub)
+	if err != nil {
+		// json.Marshal on a struct of primitives cannot realistically fail;
+		// fall back to a static string so we never lose the "stripped" signal.
+		return []byte(`{"_ccvault_stripped":true,"_ccvault_marshal_error":true}`)
+	}
+	return out
+}
+
 // parseTurnInternal parses a JSONL line and returns both the Turn and the
 // intermediate RawTurn so callers can reuse it without re-unmarshalling.
 func parseTurnInternal(data []byte) (*models.Turn, *models.RawTurn, error) {
