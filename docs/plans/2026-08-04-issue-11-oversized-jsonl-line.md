@@ -65,7 +65,7 @@ Commit: `test: repro #11 — oversized JSONL line should not drop session`
 **Files:**
 - `pkg/parser/parser.go` — replace scanner loop with `bufio.Reader` + local `readLine` helper
 - Add a small local `readLine(*bufio.Reader) ([]byte, error)` mirroring `pkg/adapter/util.go`'s `ReadLine`. Two-line comment noting parity with the adapter helper (why we don't share: package layering).
-- Update loop to skip lines whose JSON fails to parse (existing behavior) AND lines whose read fails for reasons other than EOF (new behavior). Track skipped count.
+- Update loop to skip lines whose JSON fails to parse (existing behavior) and track the skipped count. A read failure for reasons other than EOF still aborts the parse and returns an error (unchanged fail-closed behavior), but the skipped count accumulated so far is returned alongside the error.
 
 Test from T1 should now pass. Also verify existing `TestParseSessionReader_*` tests still pass.
 

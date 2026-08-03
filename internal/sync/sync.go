@@ -199,6 +199,33 @@ func (s *Syncer) processSession(sf adapter.SessionFile, adpt adapter.SourceAdapt
 		return fmt.Errorf("parse session: %w", err)
 	}
 
+	// Aggregate parser diagnostics BEFORE the empty-session early-return.
+	// A file that consists entirely of malformed JSONL lines has parsed.ID
+	// == "" but still has skipped_lines / truncated turns we want to surface.
+	// Falls back to sf.Path for the verbose label when we have no session ID.
+	sessionLabel := parsed.ID
+	if sessionLabel == "" {
+		sessionLabel = sf.Path
+	}
+	if v, ok := parsed.Metadata["skipped_lines"]; ok {
+		if n, ok := v.(int); ok && n > 0 {
+			stats.SessionsWithSkippedLines++
+			stats.TotalSkippedLines += n
+			if s.verbose {
+				s.progress("session %s: skipped %d malformed line(s)", sessionLabel, n)
+			}
+		}
+	}
+	if v, ok := parsed.Metadata["turns_with_truncated_raw_json"]; ok {
+		if n, ok := v.(int); ok && n > 0 {
+			stats.SessionsWithTruncatedTurns++
+			stats.TurnsWithTruncatedRawJSON += n
+			if s.verbose {
+				s.progress("session %s: truncated raw_json for %d turn(s)", sessionLabel, n)
+			}
+		}
+	}
+
 	if parsed.ID == "" {
 		// Record mtime so we skip this empty file next time
 		_ = s.db.UpsertSourceFileMtime(sf.Path, sf.ModTime, sourceName)
@@ -236,28 +263,9 @@ func (s *Syncer) processSession(sf adapter.SessionFile, adpt adapter.SourceAdapt
 			session.HasSubagent = b
 		}
 	}
-	// Surface any lines the parser had to skip (see issue #11). We don't
-	// persist this on the session — it's diagnostic output for the sync run.
-	if v, ok := parsed.Metadata["skipped_lines"]; ok {
-		if n, ok := v.(int); ok && n > 0 {
-			stats.SessionsWithSkippedLines++
-			stats.TotalSkippedLines += n
-			if s.verbose {
-				s.progress("session %s: skipped %d malformed line(s)", parsed.ID, n)
-			}
-		}
-	}
-	// Surface turns whose raw_json was truncated to a small placeholder
-	// because the source line was above the raw_json size threshold.
-	if v, ok := parsed.Metadata["turns_with_truncated_raw_json"]; ok {
-		if n, ok := v.(int); ok && n > 0 {
-			stats.SessionsWithTruncatedTurns++
-			stats.TurnsWithTruncatedRawJSON += n
-			if s.verbose {
-				s.progress("session %s: truncated raw_json for %d turn(s)", parsed.ID, n)
-			}
-		}
-	}
+	// skipped_lines and turns_with_truncated_raw_json diagnostics are
+	// aggregated immediately after Parse, above the empty-session guard,
+	// so a file with no valid turns still contributes to sync totals.
 
 	// Convert parsed turns to model turns and collect tool uses
 	turns := make([]models.Turn, len(parsed.Turns))

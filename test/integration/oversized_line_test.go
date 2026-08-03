@@ -147,3 +147,50 @@ this line is not valid json and should be counted as skipped
 		t.Errorf("second sync SessionsSkipped = 0, want ≥1")
 	}
 }
+
+// TestSync_AllMalformedFile_StillCountsSkippedLines guards the regression
+// CodeRabbit flagged on PR #12: when a session file contains no parseable
+// turns, processSession's early return must not swallow the parser's
+// skipped-line diagnostics — otherwise a fully corrupt file is silently
+// invisible in the sync summary.
+func TestSync_AllMalformedFile_StillCountsSkippedLines(t *testing.T) {
+	tmpDir := t.TempDir()
+	claudeDir := filepath.Join(tmpDir, "claude")
+	projectDir := filepath.Join(claudeDir, "projects", "-Users-test-junk")
+	if err := os.MkdirAll(projectDir, 0755); err != nil {
+		t.Fatalf("create project dir: %v", err)
+	}
+
+	// Three malformed lines, zero valid turns → parsed.ID == "".
+	sessionFile := filepath.Join(projectDir, "77777777-8888-9999-aaaa-bbbbbbbbbbbb.jsonl")
+	if err := os.WriteFile(sessionFile, []byte("not json\nalso not json\n{unclosed\n"), 0644); err != nil {
+		t.Fatalf("write session: %v", err)
+	}
+
+	sources := []config.SourceConfig{
+		{Name: "claude-code", Type: "claude-code", Path: claudeDir},
+	}
+
+	database, err := db.Open(filepath.Join(tmpDir, "data"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+
+	stats, err := sync.New(database, sources, sync.WithFullSync(true)).Run()
+	if err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+
+	// The file has no valid session so it should not be "indexed"...
+	if stats.SessionsIndexed != 0 {
+		t.Errorf("SessionsIndexed = %d, want 0", stats.SessionsIndexed)
+	}
+	// ...but the malformed lines MUST still land in the totals.
+	if stats.TotalSkippedLines != 3 {
+		t.Errorf("TotalSkippedLines = %d, want 3", stats.TotalSkippedLines)
+	}
+	if stats.SessionsWithSkippedLines != 1 {
+		t.Errorf("SessionsWithSkippedLines = %d, want 1", stats.SessionsWithSkippedLines)
+	}
+}
