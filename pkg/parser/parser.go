@@ -6,6 +6,7 @@ package parser
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -26,40 +27,39 @@ func ParseSession(path string) ([]models.Turn, *models.Session, error) {
 	return ParseSessionReader(f, path)
 }
 
-// ParseSessionReader parses a session from an io.Reader
+// ParseSessionReader parses a session from an io.Reader.
+//
+// Uses bufio.Reader.ReadBytes rather than bufio.Scanner so per-line size is
+// unbounded. Claude Code embeds base64-encoded PDF pages inside single JSONL
+// lines (see issue #11), which routinely exceeds any fixed token cap and, with
+// a Scanner, aborts the whole file. Mirrors the reader pattern used by the
+// Codex adapter (pkg/adapter/codex + pkg/adapter/util.go:ReadLine); duplicated
+// here rather than shared because pkg/adapter wraps pkg/parser, not vice versa.
 func ParseSessionReader(r io.Reader, sourcePath string) ([]models.Turn, *models.Session, error) {
 	var turns []models.Turn
 	session := &models.Session{
 		SourceFile: sourcePath,
 	}
 
-	scanner := bufio.NewScanner(r)
-	// Increase buffer size for large JSONL entries
-	buf := make([]byte, 0, 1024*1024) // 1MB initial
-	scanner.Buffer(buf, 10*1024*1024) // 10MB max
+	reader := bufio.NewReader(r)
 
-	lineNum := 0
-	for scanner.Scan() {
-		lineNum++
-		line := scanner.Bytes()
-		if len(line) == 0 {
-			continue
+	for {
+		line, readErr := readLine(reader)
+		if len(line) > 0 {
+			turn, raw, parseErr := parseTurnInternal(line)
+			if parseErr == nil && turn != nil {
+				turns = append(turns, *turn)
+				updateSessionMetadata(session, turn, raw)
+			}
+			// parseErr on an individual line is silently skipped — matches
+			// prior behavior. Skipped-line accounting lands in a follow-up.
 		}
-
-		turn, raw, err := parseTurnInternal(line)
-		if err != nil {
-			// Log but continue - some entries may be malformed
-			continue
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			return nil, nil, fmt.Errorf("read session file: %w", readErr)
 		}
-
-		if turn != nil {
-			turns = append(turns, *turn)
-			updateSessionMetadata(session, turn, raw)
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, nil, fmt.Errorf("scan session file: %w", err)
 	}
 
 	// Set session ID from first turn if available
@@ -75,6 +75,21 @@ func ParseSessionReader(r io.Reader, sourcePath string) ([]models.Turn, *models.
 	session.TurnCount = len(turns)
 
 	return turns, session, nil
+}
+
+// readLine returns the next newline-terminated line from r with trailing CR/LF
+// stripped. A non-nil error (including io.EOF) may be paired with a non-empty
+// final line when the file does not end with a newline. There is no per-line
+// size cap.
+func readLine(r *bufio.Reader) ([]byte, error) {
+	line, err := r.ReadBytes('\n')
+	if len(line) > 0 && line[len(line)-1] == '\n' {
+		line = line[:len(line)-1]
+		if len(line) > 0 && line[len(line)-1] == '\r' {
+			line = line[:len(line)-1]
+		}
+	}
+	return line, err
 }
 
 // ParseTurn parses a single JSONL line into a Turn

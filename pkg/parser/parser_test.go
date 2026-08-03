@@ -4,6 +4,7 @@
 package parser
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -283,5 +284,49 @@ func TestGetDisplayName(t *testing.T) {
 				t.Errorf("GetDisplayName(%s) = %s, want %s", tc.input, result, tc.expected)
 			}
 		})
+	}
+}
+
+// TestParseSessionReader_OversizedLineDoesNotDropSession is the repro for
+// https://github.com/2389-research/ccvault/issues/11.
+//
+// Claude Code writes PDF Read results as base64 image blocks inside a single
+// JSONL line. A moderately sized PDF (~8 MB) produces lines of ~12 MB. When the
+// parser was backed by bufio.Scanner with a 10 MB cap, one oversized line
+// aborted the whole scan with bufio.ErrTooLong, dropping every turn in the
+// file. The fix reads with bufio.Reader instead, which has no per-line cap.
+func TestParseSessionReader_OversizedLineDoesNotDropSession(t *testing.T) {
+	// ~12 MB of ASCII inside a valid JSON string. This mirrors the shape of a
+	// base64-encoded PDF page block that Claude Code embeds in a user turn.
+	oversized := strings.Repeat("A", 12*1024*1024)
+
+	input := fmt.Sprintf(
+		`{"uuid":"turn-1","sessionId":"sess-oversized","type":"user","timestamp":"2026-08-04T10:00:00.000Z","message":{"role":"user","content":"Hello"}}
+{"uuid":"turn-huge","sessionId":"sess-oversized","type":"user","timestamp":"2026-08-04T10:00:01.000Z","message":{"role":"user","content":"%s"}}
+{"uuid":"turn-3","sessionId":"sess-oversized","type":"assistant","timestamp":"2026-08-04T10:00:02.000Z","message":{"model":"claude-opus-4-5-20251101","role":"assistant","content":[{"type":"text","text":"World"}],"usage":{"input_tokens":10,"output_tokens":5}}}`,
+		oversized,
+	)
+
+	turns, session, err := ParseSessionReader(strings.NewReader(input), "/test/oversized.jsonl")
+	if err != nil {
+		t.Fatalf("ParseSessionReader failed on file with oversized line: %v", err)
+	}
+
+	if len(turns) != 3 {
+		t.Fatalf("expected 3 turns (oversized line preserved), got %d", len(turns))
+	}
+
+	if turns[0].Content != "Hello" {
+		t.Errorf("first turn content = %q, want %q", turns[0].Content, "Hello")
+	}
+	if turns[2].Content != "World" {
+		t.Errorf("last turn content = %q, want %q", turns[2].Content, "World")
+	}
+
+	if session.ID != "sess-oversized" {
+		t.Errorf("session.ID = %q, want %q", session.ID, "sess-oversized")
+	}
+	if session.TurnCount != 3 {
+		t.Errorf("session.TurnCount = %d, want 3", session.TurnCount)
 	}
 }
