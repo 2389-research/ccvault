@@ -32,7 +32,10 @@ func ScanClaudeHome(claudeHome string) ([]SessionFile, error) {
 	info, err := os.Stat(projectsDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("projects directory does not exist: %s", projectsDir)
+			// %w preserves the os.ErrNotExist chain so callers can
+			// distinguish "no sessions yet" from other stat failures
+			// via errors.Is(err, os.ErrNotExist). See issue #13.
+			return nil, fmt.Errorf("projects directory %s: %w", projectsDir, err)
 		}
 		return nil, fmt.Errorf("stat projects dir: %w", err)
 	}
