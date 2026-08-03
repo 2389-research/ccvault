@@ -33,6 +33,12 @@ var scenarioCoverage = map[string]string{
 	"malformed-only-file-surfaces-skipped-lines": "pkg/parser TestParseSessionReader_MalformedLinesAreSkippedAndCounted",
 	"raw-json-truncation-persists-to-db":         "pkg/parser TestParseSessionReaderWithLimits_TruncatesLargeRawJSON + TestStrippedRawJSON_ShapeAndFields",
 	"base64-payload-does-not-pollute-fts":        "pkg/parser TestExtractUserContent_IgnoresImageBlocks",
+	// PR #10: agent surface hardening
+	"tool-filter-case-insensitive":   "internal/search TestSearch_ToolFilterIsCaseInsensitive",
+	"empty-tool-filter-returns-hint": "internal/mcp TestSearchConversations_EmptyResultsIncludeHint",
+	"list-sessions-pagination-hint":  "internal/mcp TestListSessions_ReportsHasMore",
+	"orient-warns-on-stat-failure":   "cmd/ccvault TestGatherOrientation_CollectsWarningsOnFailure",
+	"analytics-unavailable-hint":     "internal/mcp TestGetAnalytics_ReportsUnavailableAnalytics",
 }
 
 func TestScenariosHaveCoverage(t *testing.T) {
