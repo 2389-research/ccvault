@@ -4,7 +4,10 @@
 package parser
 
 import (
+	"bufio"
+	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -356,5 +359,174 @@ this is not valid json at all
 	}
 	if session.ID != "sess-mal" {
 		t.Errorf("session.ID = %q, want %q", session.ID, "sess-mal")
+	}
+}
+
+// --- readLineBounded ---
+
+func TestReadLineBounded_NormalLines(t *testing.T) {
+	r := bufio.NewReader(strings.NewReader("hello\nworld\n"))
+
+	line, oversized, err := readLineBounded(r, 100)
+	if err != nil {
+		t.Fatalf("first read: %v", err)
+	}
+	if oversized {
+		t.Fatal("first line should not be oversized")
+	}
+	if string(line) != "hello" {
+		t.Errorf("got %q, want hello", line)
+	}
+
+	line, oversized, err = readLineBounded(r, 100)
+	if err != nil {
+		t.Fatalf("second read: %v", err)
+	}
+	if oversized {
+		t.Fatal("second line should not be oversized")
+	}
+	if string(line) != "world" {
+		t.Errorf("got %q, want world", line)
+	}
+
+	_, _, err = readLineBounded(r, 100)
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("want EOF, got %v", err)
+	}
+}
+
+func TestReadLineBounded_EmptyLine(t *testing.T) {
+	r := bufio.NewReader(strings.NewReader("\nhi\n"))
+	line, oversized, err := readLineBounded(r, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oversized {
+		t.Fatal("empty line marked oversized")
+	}
+	if len(line) != 0 {
+		t.Errorf("expected empty line, got %q", line)
+	}
+}
+
+func TestReadLineBounded_NoTrailingNewline(t *testing.T) {
+	r := bufio.NewReader(strings.NewReader("hello"))
+	line, oversized, err := readLineBounded(r, 100)
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("want EOF, got %v", err)
+	}
+	if oversized {
+		t.Fatal("unexpected oversized")
+	}
+	if string(line) != "hello" {
+		t.Errorf("got %q, want hello", line)
+	}
+}
+
+func TestReadLineBounded_CRLF(t *testing.T) {
+	r := bufio.NewReader(strings.NewReader("hello\r\nworld\r\n"))
+
+	line, _, err := readLineBounded(r, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(line) != "hello" {
+		t.Errorf("first line got %q, want hello", line)
+	}
+
+	line, _, err = readLineBounded(r, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(line) != "world" {
+		t.Errorf("second line got %q, want world", line)
+	}
+}
+
+func TestReadLineBounded_ExactCap(t *testing.T) {
+	// A line of exactly maxBytes chars should be accepted.
+	r := bufio.NewReader(strings.NewReader("hello\n"))
+	line, oversized, err := readLineBounded(r, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oversized {
+		t.Fatal("exactly-at-cap should not be oversized")
+	}
+	if string(line) != "hello" {
+		t.Errorf("got %q, want hello", line)
+	}
+}
+
+func TestReadLineBounded_OversizedMiddleLineIsSkippedAndDrained(t *testing.T) {
+	// Line 1 fits under cap, line 2 exceeds cap and must be drained cleanly
+	// so line 3 reads correctly.
+	input := "hi\n" + strings.Repeat("A", 20) + "\nend\n"
+	r := bufio.NewReader(strings.NewReader(input))
+
+	line, oversized, err := readLineBounded(r, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oversized {
+		t.Fatal("first line should not be oversized")
+	}
+	if string(line) != "hi" {
+		t.Errorf("got %q", line)
+	}
+
+	line, oversized, err = readLineBounded(r, 5)
+	if err != nil {
+		t.Fatalf("drain unexpectedly errored: %v", err)
+	}
+	if !oversized {
+		t.Fatal("second (20-char) line should be oversized under maxBytes=5")
+	}
+	if line != nil {
+		t.Errorf("oversized should return nil line, got %q", line)
+	}
+
+	line, oversized, err = readLineBounded(r, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oversized {
+		t.Fatal("third line should not be oversized")
+	}
+	if string(line) != "end" {
+		t.Errorf("got %q, want end", line)
+	}
+}
+
+func TestReadLineBounded_LineLargerThanBufferButUnderCap(t *testing.T) {
+	// The default bufio buffer is 4096 bytes. Force a line to span multiple
+	// internal buffers to exercise the ErrBufferFull accumulator path.
+	big := strings.Repeat("A", 20000)
+	r := bufio.NewReader(strings.NewReader(big + "\n"))
+	line, oversized, err := readLineBounded(r, 100000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oversized {
+		t.Fatal("under-cap line marked oversized")
+	}
+	if len(line) != 20000 {
+		t.Errorf("got len=%d, want 20000", len(line))
+	}
+}
+
+func TestReadLineBounded_OversizedAtEOFWithoutNewline(t *testing.T) {
+	// A too-long line with no trailing newline should still be rejected
+	// as oversized and surface io.EOF.
+	r := bufio.NewReader(strings.NewReader(strings.Repeat("A", 100)))
+	line, oversized, err := readLineBounded(r, 50)
+	if !oversized {
+		t.Fatal("expected oversized")
+	}
+	if line != nil {
+		t.Errorf("expected nil line, got len=%d", len(line))
+	}
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("want EOF, got %v", err)
 	}
 }

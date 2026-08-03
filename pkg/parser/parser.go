@@ -100,6 +100,86 @@ func readLine(r *bufio.Reader) ([]byte, error) {
 	return line, err
 }
 
+// readLineBounded reads the next line from r, capped at maxBytes of content
+// (post-strip of CR/LF). If the line exceeds maxBytes, the excess is drained
+// up to the next '\n' and (nil, true, err) is returned; err carries io.EOF
+// when the drain hits EOF, so callers can break out cleanly. Uses
+// bufio.Reader.ReadSlice for chunk-by-chunk reads that keep memory bounded
+// even for pathological input (a multi-GB single "line" won't blow the heap).
+func readLineBounded(r *bufio.Reader, maxBytes int) ([]byte, bool, error) {
+	var acc []byte
+	for {
+		chunk, err := r.ReadSlice('\n')
+		switch {
+		case err == nil:
+			// chunk ends with '\n'. Strip \n and optional \r.
+			line := chunk
+			if len(line) > 0 && line[len(line)-1] == '\n' {
+				line = line[:len(line)-1]
+				if len(line) > 0 && line[len(line)-1] == '\r' {
+					line = line[:len(line)-1]
+				}
+			}
+			if len(acc)+len(line) > maxBytes {
+				return nil, true, nil
+			}
+			if len(acc) == 0 {
+				// Fast path: no accumulator yet. Copy out of r's internal
+				// buffer since chunk is not stable across further reads.
+				out := make([]byte, len(line))
+				copy(out, line)
+				return out, false, nil
+			}
+			acc = append(acc, line...)
+			return acc, false, nil
+		case errors.Is(err, bufio.ErrBufferFull):
+			// chunk fills the internal buffer without hitting '\n'.
+			if len(acc)+len(chunk) > maxBytes {
+				// Would exceed cap. Drain the rest of the line to '\n'
+				// (or EOF) and report the line as oversized.
+				drainErr := drainToNewline(r)
+				if drainErr != nil && !errors.Is(drainErr, io.EOF) {
+					return nil, true, drainErr
+				}
+				return nil, true, drainErr
+			}
+			// Copy out of r's internal buffer before the next read
+			// overwrites it.
+			acc = append(acc, chunk...)
+		default:
+			// io.EOF or another error. chunk may hold the final line if the
+			// file ended without a trailing newline.
+			if len(chunk) > 0 {
+				if len(acc)+len(chunk) > maxBytes {
+					// Cap exceeded on the terminal chunk. No newline to
+					// drain to (we're at EOF), so just report.
+					return nil, true, err
+				}
+				acc = append(acc, chunk...)
+			}
+			if len(acc) > 0 && acc[len(acc)-1] == '\r' {
+				acc = acc[:len(acc)-1]
+			}
+			return acc, false, err
+		}
+	}
+}
+
+// drainToNewline consumes bytes from r until a '\n' is found or an error occurs.
+// Used by readLineBounded to skip past the tail of an oversized line.
+func drainToNewline(r *bufio.Reader) error {
+	for {
+		_, err := r.ReadSlice('\n')
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		return err
+	}
+}
+
 // ParseTurn parses a single JSONL line into a Turn
 func ParseTurn(data []byte) (*models.Turn, error) {
 	turn, _, err := parseTurnInternal(data)
