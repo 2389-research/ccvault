@@ -211,9 +211,16 @@ func (s *Server) handleRequest(req *jsonRPCRequest) {
 	switch req.Method {
 	case "initialize":
 		s.handleInitialize(req)
-	case "initialized":
-		// Notification, no response needed
+	case "notifications/initialized":
+		// Client → server notification per MCP spec. No response.
 		s.log("Client initialized")
+	case "notifications/cancelled":
+		// Client cancelling an in-flight request. We don't have long-running
+		// work today, so just log. No response (notification).
+		s.log("Client cancelled request: %s", string(req.Params))
+	case "notifications/roots/list_changed":
+		// Client roots changed. We don't consume roots, so log-only.
+		s.log("Client roots changed")
 	case "ping":
 		s.sendResult(req.ID, map[string]interface{}{})
 	case "tools/list":
@@ -225,7 +232,13 @@ func (s *Server) handleRequest(req *jsonRPCRequest) {
 	case "prompts/get":
 		s.handlePromptsGet(req)
 	default:
+		// JSON-RPC 2.0: notifications (messages without an id) MUST NOT
+		// receive a response, even for unknown methods. Only respond when
+		// the caller supplied an id, indicating a request. See issue #7.
 		s.log("Unknown method: %s", req.Method)
+		if req.ID == nil {
+			return
+		}
 		s.sendError(req.ID, -32601, "Method not found", req.Method)
 	}
 }
