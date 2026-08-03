@@ -16,16 +16,18 @@ import (
 
 // Stats tracks sync statistics
 type Stats struct {
-	SessionsScanned          int
-	SessionsIndexed          int
-	SessionsSkipped          int
-	SessionsWithSkippedLines int
-	TotalSkippedLines        int
-	TurnsIndexed             int
-	ToolUsesIndexed          int
-	ProjectsFound            int
-	Errors                   []error
-	Duration                 time.Duration
+	SessionsScanned            int
+	SessionsIndexed            int
+	SessionsSkipped            int
+	SessionsWithSkippedLines   int
+	TotalSkippedLines          int
+	SessionsWithTruncatedTurns int
+	TurnsWithTruncatedRawJSON  int
+	TurnsIndexed               int
+	ToolUsesIndexed            int
+	ProjectsFound              int
+	Errors                     []error
+	Duration                   time.Duration
 }
 
 // Syncer handles syncing conversation data to ccvault
@@ -171,6 +173,10 @@ func (s *Syncer) Run() (*Stats, error) {
 		s.progress("Skipped %d malformed line(s) across %d session(s)",
 			stats.TotalSkippedLines, stats.SessionsWithSkippedLines)
 	}
+	if stats.TurnsWithTruncatedRawJSON > 0 {
+		s.progress("Truncated raw_json for %d turn(s) across %d session(s)",
+			stats.TurnsWithTruncatedRawJSON, stats.SessionsWithTruncatedTurns)
+	}
 
 	return stats, nil
 }
@@ -238,6 +244,17 @@ func (s *Syncer) processSession(sf adapter.SessionFile, adpt adapter.SourceAdapt
 			stats.TotalSkippedLines += n
 			if s.verbose {
 				s.progress("session %s: skipped %d malformed line(s)", parsed.ID, n)
+			}
+		}
+	}
+	// Surface turns whose raw_json was truncated to a small placeholder
+	// because the source line was above the raw_json size threshold.
+	if v, ok := parsed.Metadata["turns_with_truncated_raw_json"]; ok {
+		if n, ok := v.(int); ok && n > 0 {
+			stats.SessionsWithTruncatedTurns++
+			stats.TurnsWithTruncatedRawJSON += n
+			if s.verbose {
+				s.progress("session %s: truncated raw_json for %d turn(s)", parsed.ID, n)
 			}
 		}
 	}

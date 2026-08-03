@@ -343,6 +343,10 @@ var syncCmd = &cobra.Command{
 			fmt.Printf("  Skipped lines: %d across %d session(s)\n",
 				stats.TotalSkippedLines, stats.SessionsWithSkippedLines)
 		}
+		if stats.TurnsWithTruncatedRawJSON > 0 {
+			fmt.Printf("  Truncated raw_json: %d turn(s) across %d session(s)\n",
+				stats.TurnsWithTruncatedRawJSON, stats.SessionsWithTruncatedTurns)
+		}
 
 		if len(stats.Errors) > 0 {
 			fmt.Printf("  Errors:    %d\n", len(stats.Errors))
