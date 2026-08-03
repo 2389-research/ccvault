@@ -16,14 +16,27 @@ import (
 	"github.com/2389-research/ccvault/pkg/models"
 )
 
+// ParseStats reports counts of anomalies the parser handled while reading a
+// session. Populated even when Parse returns an error (partial progress may be
+// observable to callers).
+type ParseStats struct {
+	// SkippedLines is the number of lines the parser could not use, either
+	// because they failed to JSON-parse or (see T4) because they exceeded
+	// the per-line size cap and were dropped defensively.
+	SkippedLines int
+	// TurnsWithTruncatedRawJSON is the number of turns whose raw_json was
+	// replaced with a placeholder because the original line exceeded the
+	// raw_json size threshold. See strippedRawJSON.
+	TurnsWithTruncatedRawJSON int
+}
+
 // ParseSession reads a session JSONL file and returns all turns.
 //
-// The int return is the number of lines that failed to JSON-parse and were
-// skipped — sync surfaces this so users see when content was dropped.
-func ParseSession(path string) ([]models.Turn, *models.Session, int, error) {
+// See ParseStats for the meaning of the third return value.
+func ParseSession(path string) ([]models.Turn, *models.Session, ParseStats, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, nil, 0, fmt.Errorf("open session file: %w", err)
+		return nil, nil, ParseStats{}, fmt.Errorf("open session file: %w", err)
 	}
 	defer func() { _ = f.Close() }()
 
@@ -33,21 +46,18 @@ func ParseSession(path string) ([]models.Turn, *models.Session, int, error) {
 // ParseSessionReader parses a session from an io.Reader.
 //
 // Uses bufio.Reader.ReadBytes rather than bufio.Scanner so per-line size is
-// unbounded. Claude Code embeds base64-encoded PDF pages inside single JSONL
-// lines (see issue #11), which routinely exceeds any fixed token cap and, with
-// a Scanner, aborts the whole file. Mirrors the reader pattern used by the
-// Codex adapter (pkg/adapter/codex + pkg/adapter/util.go:ReadLine); duplicated
-// here rather than shared because pkg/adapter wraps pkg/parser, not vice versa.
-//
-// The int return is the count of lines that were read but failed to JSON-parse
-// (malformed entries are silently skipped, matching prior behavior — the count
-// makes that skipping observable).
-func ParseSessionReader(r io.Reader, sourcePath string) ([]models.Turn, *models.Session, int, error) {
+// unbounded at the transport layer. Claude Code embeds base64-encoded PDF pages
+// inside single JSONL lines (see issue #11), which routinely exceeds any fixed
+// token cap and, with a Scanner, aborts the whole file. Mirrors the reader
+// pattern used by the Codex adapter (pkg/adapter/codex + pkg/adapter/util.go:
+// ReadLine); duplicated here rather than shared because pkg/adapter wraps
+// pkg/parser, not vice versa.
+func ParseSessionReader(r io.Reader, sourcePath string) ([]models.Turn, *models.Session, ParseStats, error) {
 	var turns []models.Turn
 	session := &models.Session{
 		SourceFile: sourcePath,
 	}
-	skipped := 0
+	stats := ParseStats{}
 
 	reader := bufio.NewReader(r)
 
@@ -56,7 +66,7 @@ func ParseSessionReader(r io.Reader, sourcePath string) ([]models.Turn, *models.
 		if len(line) > 0 {
 			turn, raw, parseErr := parseTurnInternal(line)
 			if parseErr != nil {
-				skipped++
+				stats.SkippedLines++
 			} else if turn != nil {
 				turns = append(turns, *turn)
 				updateSessionMetadata(session, turn, raw)
@@ -66,7 +76,7 @@ func ParseSessionReader(r io.Reader, sourcePath string) ([]models.Turn, *models.
 			if errors.Is(readErr, io.EOF) {
 				break
 			}
-			return nil, nil, skipped, fmt.Errorf("read session file: %w", readErr)
+			return nil, nil, stats, fmt.Errorf("read session file: %w", readErr)
 		}
 	}
 
@@ -82,7 +92,7 @@ func ParseSessionReader(r io.Reader, sourcePath string) ([]models.Turn, *models.
 
 	session.TurnCount = len(turns)
 
-	return turns, session, skipped, nil
+	return turns, session, stats, nil
 }
 
 // readLine returns the next newline-terminated line from r with trailing CR/LF

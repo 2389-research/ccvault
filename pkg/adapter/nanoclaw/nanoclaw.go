@@ -153,7 +153,7 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 // writes, with nanoclaw's [SCHEDULED TASK - ...] user injections reclassified
 // as system turns.
 func parseParent(path string) (*adapter.ParsedSession, error) {
-	turns, session, skipped, err := parser.ParseSession(path)
+	turns, session, stats, err := parser.ParseSession(path)
 	if err != nil {
 		return nil, err
 	}
@@ -163,8 +163,11 @@ func parseParent(path string) (*adapter.ParsedSession, error) {
 	if group != "" {
 		meta["nanoclaw_group"] = group
 	}
-	if skipped > 0 {
-		meta["skipped_lines"] = skipped
+	if stats.SkippedLines > 0 {
+		meta["skipped_lines"] = stats.SkippedLines
+	}
+	if stats.TurnsWithTruncatedRawJSON > 0 {
+		meta["turns_with_truncated_raw_json"] = stats.TurnsWithTruncatedRawJSON
 	}
 
 	projectPath := "nanoclaw"
@@ -192,7 +195,7 @@ func parseParent(path string) (*adapter.ParsedSession, error) {
 // but sessionId inside the file points at the *parent* session, so we
 // disambiguate the ccvault-side ID with the file-derived agent ID.
 func parseSubagent(path string) (*adapter.ParsedSession, error) {
-	turns, session, skipped, err := parser.ParseSession(path)
+	turns, session, stats, err := parser.ParseSession(path)
 	if err != nil {
 		return nil, err
 	}
@@ -211,8 +214,11 @@ func parseSubagent(path string) (*adapter.ParsedSession, error) {
 	if group != "" {
 		meta["nanoclaw_group"] = group
 	}
-	if skipped > 0 {
-		meta["skipped_lines"] = skipped
+	if stats.SkippedLines > 0 {
+		meta["skipped_lines"] = stats.SkippedLines
+	}
+	if stats.TurnsWithTruncatedRawJSON > 0 {
+		meta["turns_with_truncated_raw_json"] = stats.TurnsWithTruncatedRawJSON
 	}
 	// parent_session_id points at whatever ccvault stored the parent under —
 	// keep it namespaced so cross-source joins can't collide.

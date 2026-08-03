@@ -52,7 +52,7 @@ func (a *Adapter) Discover(root string) ([]adapter.SessionFile, error) {
 // Parse reads a Claude Code JSONL session file and converts it to adapter.ParsedSession.
 // It also detects errors and subagent usage, storing them in Metadata.
 func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
-	turns, session, skipped, err := parser.ParseSession(path)
+	turns, session, stats, err := parser.ParseSession(path)
 	if err != nil {
 		return nil, err
 	}
@@ -111,8 +111,11 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 	if hasSubagent {
 		metadata["has_subagent"] = true
 	}
-	if skipped > 0 {
-		metadata["skipped_lines"] = skipped
+	if stats.SkippedLines > 0 {
+		metadata["skipped_lines"] = stats.SkippedLines
+	}
+	if stats.TurnsWithTruncatedRawJSON > 0 {
+		metadata["turns_with_truncated_raw_json"] = stats.TurnsWithTruncatedRawJSON
 	}
 
 	parsed := &adapter.ParsedSession{
