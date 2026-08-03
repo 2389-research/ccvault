@@ -16,11 +16,14 @@ import (
 	"github.com/2389-research/ccvault/pkg/models"
 )
 
-// ParseSession reads a session JSONL file and returns all turns
-func ParseSession(path string) ([]models.Turn, *models.Session, error) {
+// ParseSession reads a session JSONL file and returns all turns.
+//
+// The int return is the number of lines that failed to JSON-parse and were
+// skipped — sync surfaces this so users see when content was dropped.
+func ParseSession(path string) ([]models.Turn, *models.Session, int, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, nil, fmt.Errorf("open session file: %w", err)
+		return nil, nil, 0, fmt.Errorf("open session file: %w", err)
 	}
 	defer func() { _ = f.Close() }()
 
@@ -35,11 +38,16 @@ func ParseSession(path string) ([]models.Turn, *models.Session, error) {
 // a Scanner, aborts the whole file. Mirrors the reader pattern used by the
 // Codex adapter (pkg/adapter/codex + pkg/adapter/util.go:ReadLine); duplicated
 // here rather than shared because pkg/adapter wraps pkg/parser, not vice versa.
-func ParseSessionReader(r io.Reader, sourcePath string) ([]models.Turn, *models.Session, error) {
+//
+// The int return is the count of lines that were read but failed to JSON-parse
+// (malformed entries are silently skipped, matching prior behavior — the count
+// makes that skipping observable).
+func ParseSessionReader(r io.Reader, sourcePath string) ([]models.Turn, *models.Session, int, error) {
 	var turns []models.Turn
 	session := &models.Session{
 		SourceFile: sourcePath,
 	}
+	skipped := 0
 
 	reader := bufio.NewReader(r)
 
@@ -47,18 +55,18 @@ func ParseSessionReader(r io.Reader, sourcePath string) ([]models.Turn, *models.
 		line, readErr := readLine(reader)
 		if len(line) > 0 {
 			turn, raw, parseErr := parseTurnInternal(line)
-			if parseErr == nil && turn != nil {
+			if parseErr != nil {
+				skipped++
+			} else if turn != nil {
 				turns = append(turns, *turn)
 				updateSessionMetadata(session, turn, raw)
 			}
-			// parseErr on an individual line is silently skipped — matches
-			// prior behavior. Skipped-line accounting lands in a follow-up.
 		}
 		if readErr != nil {
 			if errors.Is(readErr, io.EOF) {
 				break
 			}
-			return nil, nil, fmt.Errorf("read session file: %w", readErr)
+			return nil, nil, skipped, fmt.Errorf("read session file: %w", readErr)
 		}
 	}
 
@@ -74,7 +82,7 @@ func ParseSessionReader(r io.Reader, sourcePath string) ([]models.Turn, *models.
 
 	session.TurnCount = len(turns)
 
-	return turns, session, nil
+	return turns, session, skipped, nil
 }
 
 // readLine returns the next newline-terminated line from r with trailing CR/LF

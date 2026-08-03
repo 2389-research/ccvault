@@ -16,14 +16,16 @@ import (
 
 // Stats tracks sync statistics
 type Stats struct {
-	SessionsScanned int
-	SessionsIndexed int
-	SessionsSkipped int
-	TurnsIndexed    int
-	ToolUsesIndexed int
-	ProjectsFound   int
-	Errors          []error
-	Duration        time.Duration
+	SessionsScanned          int
+	SessionsIndexed          int
+	SessionsSkipped          int
+	SessionsWithSkippedLines int
+	TotalSkippedLines        int
+	TurnsIndexed             int
+	ToolUsesIndexed          int
+	ProjectsFound            int
+	Errors                   []error
+	Duration                 time.Duration
 }
 
 // Syncer handles syncing conversation data to ccvault
@@ -165,6 +167,10 @@ func (s *Syncer) Run() (*Stats, error) {
 
 	s.progress("Sync complete: %d sessions indexed, %d turns, %d tool uses",
 		stats.SessionsIndexed, stats.TurnsIndexed, stats.ToolUsesIndexed)
+	if stats.TotalSkippedLines > 0 {
+		s.progress("Skipped %d malformed line(s) across %d session(s)",
+			stats.TotalSkippedLines, stats.SessionsWithSkippedLines)
+	}
 
 	return stats, nil
 }
@@ -222,6 +228,17 @@ func (s *Syncer) processSession(sf adapter.SessionFile, adpt adapter.SourceAdapt
 	if v, ok := parsed.Metadata["has_subagent"]; ok {
 		if b, ok := v.(bool); ok {
 			session.HasSubagent = b
+		}
+	}
+	// Surface any lines the parser had to skip (see issue #11). We don't
+	// persist this on the session — it's diagnostic output for the sync run.
+	if v, ok := parsed.Metadata["skipped_lines"]; ok {
+		if n, ok := v.(int); ok && n > 0 {
+			stats.SessionsWithSkippedLines++
+			stats.TotalSkippedLines += n
+			if s.verbose {
+				s.progress("session %s: skipped %d malformed line(s)", parsed.ID, n)
+			}
 		}
 	}
 

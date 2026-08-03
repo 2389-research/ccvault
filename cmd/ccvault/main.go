@@ -339,6 +339,10 @@ var syncCmd = &cobra.Command{
 		fmt.Printf("  Sessions:  %d indexed, %d skipped\n", stats.SessionsIndexed, stats.SessionsSkipped)
 		fmt.Printf("  Turns:     %d\n", stats.TurnsIndexed)
 		fmt.Printf("  Tool uses: %d\n", stats.ToolUsesIndexed)
+		if stats.TotalSkippedLines > 0 {
+			fmt.Printf("  Skipped lines: %d across %d session(s)\n",
+				stats.TotalSkippedLines, stats.SessionsWithSkippedLines)
+		}
 
 		if len(stats.Errors) > 0 {
 			fmt.Printf("  Errors:    %d\n", len(stats.Errors))

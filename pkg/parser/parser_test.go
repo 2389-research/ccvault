@@ -128,7 +128,7 @@ func TestParseSessionReader(t *testing.T) {
 {"uuid":"turn1","sessionId":"session1","type":"user","timestamp":"2026-02-02T20:00:00.000Z","message":{"role":"user","content":"Hello"}}
 {"uuid":"turn2","sessionId":"session1","type":"assistant","timestamp":"2026-02-02T20:01:00.000Z","message":{"model":"claude-opus-4-5-20251101","role":"assistant","content":[{"type":"text","text":"Hi there!"}],"usage":{"input_tokens":10,"output_tokens":5}}}`
 
-	turns, session, err := ParseSessionReader(strings.NewReader(input), "/test/session.jsonl")
+	turns, session, _, err := ParseSessionReader(strings.NewReader(input), "/test/session.jsonl")
 	if err != nil {
 		t.Fatalf("ParseSessionReader failed: %v", err)
 	}
@@ -187,7 +187,7 @@ func TestParseSessionReader_ExtractsCWD(t *testing.T) {
 	input := `{"uuid":"turn1","sessionId":"sess1","type":"user","timestamp":"2026-02-02T20:00:00.000Z","cwd":"/Users/harper/canvas-plugins","message":{"role":"user","content":"Hello"}}
 {"uuid":"turn2","sessionId":"sess1","type":"assistant","timestamp":"2026-02-02T20:01:00.000Z","cwd":"/Users/harper/canvas-plugins","message":{"model":"claude-opus-4-5-20251101","role":"assistant","content":[{"type":"text","text":"Hi!"}],"usage":{"input_tokens":10,"output_tokens":5}}}`
 
-	_, session, err := ParseSessionReader(strings.NewReader(input), "/test/session.jsonl")
+	_, session, _, err := ParseSessionReader(strings.NewReader(input), "/test/session.jsonl")
 	if err != nil {
 		t.Fatalf("ParseSessionReader failed: %v", err)
 	}
@@ -202,7 +202,7 @@ func TestParseSessionReader_CWDNotOverwrittenByEmpty(t *testing.T) {
 	input := `{"uuid":"turn1","sessionId":"sess1","type":"user","timestamp":"2026-02-02T20:00:00.000Z","cwd":"/Users/harper/buddy-web","message":{"role":"user","content":"Hello"}}
 {"uuid":"turn2","sessionId":"sess1","type":"assistant","timestamp":"2026-02-02T20:01:00.000Z","message":{"model":"claude-opus-4-5-20251101","role":"assistant","content":[{"type":"text","text":"Hi!"}],"usage":{"input_tokens":10,"output_tokens":5}}}`
 
-	_, session, err := ParseSessionReader(strings.NewReader(input), "/test/session.jsonl")
+	_, session, _, err := ParseSessionReader(strings.NewReader(input), "/test/session.jsonl")
 	if err != nil {
 		t.Fatalf("ParseSessionReader failed: %v", err)
 	}
@@ -217,7 +217,7 @@ func TestParseSessionReader_CWDLocksToFirstValue(t *testing.T) {
 	input := `{"uuid":"turn1","sessionId":"sess1","type":"user","timestamp":"2026-02-02T20:00:00.000Z","cwd":"/Users/harper/project-a","message":{"role":"user","content":"Hello"}}
 {"uuid":"turn2","sessionId":"sess1","type":"user","timestamp":"2026-02-02T20:01:00.000Z","cwd":"/Users/harper/project-b","message":{"role":"user","content":"Changed dir"}}`
 
-	_, session, err := ParseSessionReader(strings.NewReader(input), "/test/session.jsonl")
+	_, session, _, err := ParseSessionReader(strings.NewReader(input), "/test/session.jsonl")
 	if err != nil {
 		t.Fatalf("ParseSessionReader failed: %v", err)
 	}
@@ -232,7 +232,7 @@ func TestParseSessionReader_GitBranchExtracted(t *testing.T) {
 	input := `{"uuid":"turn1","sessionId":"sess1","type":"user","timestamp":"2026-02-02T20:00:00.000Z","cwd":"/Users/harper/project","gitBranch":"feature/cool-thing","message":{"role":"user","content":"Hello"}}
 {"uuid":"turn2","sessionId":"sess1","type":"assistant","timestamp":"2026-02-02T20:01:00.000Z","message":{"model":"claude-opus-4-5-20251101","role":"assistant","content":[{"type":"text","text":"Hi!"}],"usage":{"input_tokens":10,"output_tokens":5}}}`
 
-	_, session, err := ParseSessionReader(strings.NewReader(input), "/test/session.jsonl")
+	_, session, _, err := ParseSessionReader(strings.NewReader(input), "/test/session.jsonl")
 	if err != nil {
 		t.Fatalf("ParseSessionReader failed: %v", err)
 	}
@@ -307,13 +307,16 @@ func TestParseSessionReader_OversizedLineDoesNotDropSession(t *testing.T) {
 		oversized,
 	)
 
-	turns, session, err := ParseSessionReader(strings.NewReader(input), "/test/oversized.jsonl")
+	turns, session, skipped, err := ParseSessionReader(strings.NewReader(input), "/test/oversized.jsonl")
 	if err != nil {
 		t.Fatalf("ParseSessionReader failed on file with oversized line: %v", err)
 	}
 
 	if len(turns) != 3 {
 		t.Fatalf("expected 3 turns (oversized line preserved), got %d", len(turns))
+	}
+	if skipped != 0 {
+		t.Errorf("expected 0 skipped lines (oversized ≠ malformed), got %d", skipped)
 	}
 
 	if turns[0].Content != "Hello" {
@@ -328,5 +331,30 @@ func TestParseSessionReader_OversizedLineDoesNotDropSession(t *testing.T) {
 	}
 	if session.TurnCount != 3 {
 		t.Errorf("session.TurnCount = %d, want 3", session.TurnCount)
+	}
+}
+
+// TestParseSessionReader_MalformedLinesAreSkippedAndCounted verifies that
+// individual lines that fail JSON parsing are silently skipped (preserving the
+// prior behavior) but that the count is reported to callers so sync can
+// surface the fact that content was dropped.
+func TestParseSessionReader_MalformedLinesAreSkippedAndCounted(t *testing.T) {
+	input := `{"uuid":"turn-1","sessionId":"sess-mal","type":"user","timestamp":"2026-08-04T10:00:00.000Z","message":{"role":"user","content":"Hello"}}
+this is not valid json at all
+{"unclosed":
+{"uuid":"turn-2","sessionId":"sess-mal","type":"assistant","timestamp":"2026-08-04T10:00:01.000Z","message":{"model":"claude","role":"assistant","content":[{"type":"text","text":"World"}],"usage":{"input_tokens":1,"output_tokens":1}}}`
+
+	turns, session, skipped, err := ParseSessionReader(strings.NewReader(input), "/test/malformed.jsonl")
+	if err != nil {
+		t.Fatalf("ParseSessionReader failed: %v", err)
+	}
+	if len(turns) != 2 {
+		t.Fatalf("expected 2 turns (2 malformed lines skipped), got %d", len(turns))
+	}
+	if skipped != 2 {
+		t.Errorf("expected 2 skipped lines, got %d", skipped)
+	}
+	if session.ID != "sess-mal" {
+		t.Errorf("session.ID = %q, want %q", session.ID, "sess-mal")
 	}
 }
