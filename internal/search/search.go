@@ -101,7 +101,7 @@ func (s *Searcher) buildQuery(q *Query, limit int) (string, []interface{}) {
 	// Tool filter requires join
 	if q.Tool != "" {
 		baseQuery += ` JOIN tool_uses tu ON t.session_id = tu.session_id`
-		conditions = append(conditions, fmt.Sprintf("tu.tool_name = $%d", argNum))
+		conditions = append(conditions, fmt.Sprintf("tu.tool_name = $%d COLLATE NOCASE", argNum))
 		args = append(args, q.Tool)
 		argNum++
 	}
