@@ -616,7 +616,7 @@ var listProjectsCmd = &cobra.Command{
 				name = "..." + name[len(name)-25:]
 			}
 			path := p.Path
-			if home != "" && strings.HasPrefix(path, home) {
+			if home != "" && (path == home || strings.HasPrefix(path, home+string(os.PathSeparator))) {
 				path = "~" + path[len(home):]
 			}
 			if len(path) > 38 {
@@ -693,26 +693,44 @@ var listSessionsCmd = &cobra.Command{
 			return nil
 		}
 
-		fmt.Printf("%-38s %-25s %16s %6s %10s %s\n", "SESSION ID", "PROJECT", "STARTED", "TURNS", "TOKENS", "MODEL")
-		fmt.Println(strings.Repeat("-", 125))
+		// PROJECT column is redundant when the list is already filtered to
+		// one project — mirror the TUI's showProject := m.project == nil.
+		showProject := projectFilter == ""
+		if showProject {
+			fmt.Printf("%-38s %-25s %16s %6s %10s %s\n", "SESSION ID", "PROJECT", "STARTED", "TURNS", "TOKENS", "MODEL")
+			fmt.Println(strings.Repeat("-", 125))
+		} else {
+			fmt.Printf("%-38s %16s %6s %10s %s\n", "SESSION ID", "STARTED", "TURNS", "TOKENS", "MODEL")
+			fmt.Println(strings.Repeat("-", 100))
+		}
 		for _, s := range sessions {
-			project := parser.GetDisplayName(s.ProjectPath)
-			if len(project) > 23 {
-				project = "..." + project[len(project)-20:]
-			}
 			model := s.Model
 			if len(model) > 25 {
 				model = model[:22] + "..."
 			}
 			tokens := s.InputTokens + s.OutputTokens
-			fmt.Printf("%-38s %-25s %16s %6d %10s %s\n",
-				s.ID,
-				project,
-				s.StartedAt.Format("2006-01-02 15:04"),
-				s.TurnCount,
-				formatTokens(tokens),
-				model,
-			)
+			if showProject {
+				project := parser.GetDisplayName(s.ProjectPath)
+				if len(project) > 23 {
+					project = "..." + project[len(project)-20:]
+				}
+				fmt.Printf("%-38s %-25s %16s %6d %10s %s\n",
+					s.ID,
+					project,
+					s.StartedAt.Format("2006-01-02 15:04"),
+					s.TurnCount,
+					formatTokens(tokens),
+					model,
+				)
+			} else {
+				fmt.Printf("%-38s %16s %6d %10s %s\n",
+					s.ID,
+					s.StartedAt.Format("2006-01-02 15:04"),
+					s.TurnCount,
+					formatTokens(tokens),
+					model,
+				)
+			}
 		}
 
 		return nil

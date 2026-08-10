@@ -147,8 +147,15 @@ func isValidUUID(s string) bool {
 	return true
 }
 
-// GetDisplayName returns the last path component as the project name
+// GetDisplayName returns the last path component as the project name.
+// Returns "" for empty input so callers can distinguish "no project" from
+// a real path — filepath.Base("") returns "." which would leak a bare dot
+// into the CLI/TUI/MCP display surface and defeat the sync-side fallback
+// to ProjectPath.
 func GetDisplayName(projectPath string) string {
+	if projectPath == "" {
+		return ""
+	}
 	return filepath.Base(projectPath)
 }
 

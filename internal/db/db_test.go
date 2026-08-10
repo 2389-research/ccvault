@@ -677,12 +677,20 @@ func TestResetAll_ClearsDataAndPreservesSchema(t *testing.T) {
 		t.Fatalf("upsert session: %v", err)
 	}
 
+	// Distinctive token that we can MATCH against turns_fts after reset.
+	// If the AFTER DELETE trigger on turns cascades to the shadow index,
+	// the token disappears from the FTS index too. Without a MATCH check,
+	// asserting `COUNT(*) FROM turns_fts == 0` is a false positive: with
+	// external-content FTS5 (content='turns'), COUNT joins to the empty
+	// turns table and returns 0 regardless of trigger behavior.
+	preResetToken := "canaryphrasepreresetsentinel"
+
 	if err := db.InsertTurns([]models.Turn{{
 		ID:        "turn-1",
 		SessionID: s.ID,
 		Type:      "user",
 		Timestamp: time.Now(),
-		Content:   "hello world before reset",
+		Content:   "hello " + preResetToken + " world",
 	}}); err != nil {
 		t.Fatalf("insert turn: %v", err)
 	}
@@ -700,13 +708,15 @@ func TestResetAll_ClearsDataAndPreservesSchema(t *testing.T) {
 		t.Fatalf("record mtime: %v", err)
 	}
 
-	// Sanity check: FTS index has content (populated by INSERT trigger).
-	preFTS := 0
-	if err := db.QueryRow("SELECT COUNT(*) FROM turns_fts").Scan(&preFTS); err != nil {
-		t.Fatalf("pre-reset FTS count: %v", err)
+	// Sanity check: the token IS present in the FTS index before reset.
+	// MATCH against the token — this actually queries the shadow index,
+	// unlike COUNT(*) which reads through to the source table.
+	preMatch, err := db.SearchTurns(preResetToken, 10)
+	if err != nil {
+		t.Fatalf("pre-reset FTS MATCH: %v", err)
 	}
-	if preFTS == 0 {
-		t.Fatal("FTS index should have content after InsertTurns")
+	if len(preMatch) == 0 {
+		t.Fatal("FTS should return a hit for the pre-reset token before ResetAll")
 	}
 
 	if err := db.ResetAll(); err != nil {
@@ -724,13 +734,16 @@ func TestResetAll_ClearsDataAndPreservesSchema(t *testing.T) {
 		}
 	}
 
-	// FTS index cascades from turns DELETE via the AFTER DELETE trigger.
-	postFTS := 0
-	if err := db.QueryRow("SELECT COUNT(*) FROM turns_fts").Scan(&postFTS); err != nil {
-		t.Fatalf("post-reset FTS count: %v", err)
+	// The real cascade check: MATCH for the pre-reset token must now return
+	// zero hits. If the AFTER DELETE trigger on turns didn't cascade to
+	// turns_fts, the shadow index still holds the token and MATCH surfaces
+	// a stale rowid pointing at a nonexistent turn.
+	postMatch, err := db.SearchTurns(preResetToken, 10)
+	if err != nil {
+		t.Fatalf("post-reset FTS MATCH: %v", err)
 	}
-	if postFTS != 0 {
-		t.Errorf("FTS index has %d rows after ResetAll, want 0 (turns cascade trigger)", postFTS)
+	if len(postMatch) != 0 {
+		t.Errorf("FTS MATCH for pre-reset token returned %d hits after ResetAll, want 0 (cascade broken?)", len(postMatch))
 	}
 
 	// Schema still intact: turns_fts virtual table is queryable, triggers still fire.

@@ -328,6 +328,50 @@ func TestProjectsModel_ViewShowsPathColumn(t *testing.T) {
 	}
 }
 
+// TestProjectsModel_HomeSubstitutionRespectsPathSeparator guards the
+// boundary bug flagged in fresh-eyes review: `HasPrefix(path, home)` alone
+// matches paths that merely SHARE A PREFIX with HOME rather than being
+// under it. e.g. HOME="/Users/dyl" would rewrite "/Users/dylan/repo" as
+// "~an/repo" — a garbage path attributed to a different user. The fix is
+// to also require an OS path separator after the HOME prefix.
+func TestProjectsModel_HomeSubstitutionRespectsPathSeparator(t *testing.T) {
+	// Force HOME to a value that is a prefix of the project path but is
+	// NOT its parent directory.
+	t.Setenv("HOME", "/Users/dyl")
+
+	database := openTUITestDB(t)
+	now := time.Now().UTC()
+	// This path starts with the HOME string but "/Users/dylan/..." is not
+	// under "/Users/dyl/..." — no substitution should happen.
+	pathA := "/Users/dylan/repo"
+	if _, err := database.Exec(`INSERT INTO projects
+		(path, display_name, first_seen_at, last_activity_at, session_count, total_tokens, source)
+		VALUES (?, 'repo', ?, ?, 1, 100, 'claude-code')`,
+		pathA, now, now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+
+	m := NewProjectsModel(database)
+	msg := m.loadProjects()
+	loaded, ok := msg.(projectsLoadedMsg)
+	if !ok {
+		t.Fatalf("expected projectsLoadedMsg, got %T", msg)
+	}
+	m.Update(loaded)
+	m.SetSize(140, 30)
+
+	view := m.View()
+
+	// The full literal path must appear — no ~ substitution.
+	if !strings.Contains(view, pathA) {
+		t.Errorf("path %q should appear verbatim (HOME=/Users/dyl is a prefix but not parent):\n%s", pathA, view)
+	}
+	// Specifically: no "~an/repo" garbled form.
+	if strings.Contains(view, "~an/repo") {
+		t.Errorf("HOME prefix incorrectly substituted mid-path segment, producing '~an/repo':\n%s", view)
+	}
+}
+
 // TestSessionsModel_ViewShowsProjectColumnWhenUnfiltered covers PR #22's
 // conditional PROJECT column: when no project filter is set, the sessions
 // list renders a PROJECT column so users know which project each session
@@ -413,9 +457,16 @@ func TestSearchModel_VimNavIgnoredWhileFocused(t *testing.T) {
 	// consumed by the input widget as a literal character.
 	m.focused = true
 	m.input.Focus()
+	m.input.SetValue("") // start empty so we can detect the char was consumed
 	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'G'}})
 	if m.cursor != 2 {
 		t.Errorf("focused input: 'G' moved cursor from 2 to %d, want 2 (input should consume the char)", m.cursor)
+	}
+	// Positive-side assertion: guards against a broken impl that silently
+	// drops the char instead of forwarding to the input widget (a strictly
+	// worse regression than the original bug).
+	if got := m.input.Value(); got != "G" {
+		t.Errorf("focused input: expected 'G' to reach the search box, got value = %q", got)
 	}
 
 	// Unfocused: 'G' MUST jump cursor to the last row.

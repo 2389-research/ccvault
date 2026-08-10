@@ -214,7 +214,7 @@ func (m *DashboardModel) View() string {
 				name = "..." + name[len(name)-19:]
 			}
 			path := p.Path
-			if home != "" && strings.HasPrefix(path, home) {
+			if home != "" && (path == home || strings.HasPrefix(path, home+string(os.PathSeparator))) {
 				path = "~" + path[len(home):]
 			}
 			if len(path) > 35 {

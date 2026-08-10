@@ -279,19 +279,32 @@ func TestDecodeProjectPath(t *testing.T) {
 
 func TestGetDisplayName(t *testing.T) {
 	tests := []struct {
+		name     string
 		input    string
 		expected string
 	}{
-		{"/Users/harper/Public/src/2389/ccvault", "ccvault"},
-		{"/Users/harper/p/canvas-jira-summarizer", "canvas-jira-summarizer"},
-		{"/short/path", "path"},
+		// Normal shapes.
+		{"deep-path", "/Users/harper/Public/src/2389/ccvault", "ccvault"},
+		{"typical", "/Users/harper/p/canvas-jira-summarizer", "canvas-jira-summarizer"},
+		{"short", "/short/path", "path"},
+		// Edge cases. Empty must return "" so callers can distinguish
+		// "no project" from a real path (filepath.Base("") returns ".",
+		// which would leak a bare dot into CLI/TUI/MCP output and defeat
+		// the sync-side fallback to ProjectPath).
+		{"empty", "", ""},
+		// filepath.Base("/") returns "/" — pass through, we don't want to
+		// show a bare dot for the root either.
+		{"root", "/", "/"},
+		// Trailing slash: filepath.Base strips it and returns the last
+		// non-empty component.
+		{"trailing-slash", "/Users/dylan/repo/", "repo"},
 	}
 
 	for _, tc := range tests {
-		t.Run(tc.input, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			result := GetDisplayName(tc.input)
 			if result != tc.expected {
-				t.Errorf("GetDisplayName(%s) = %s, want %s", tc.input, result, tc.expected)
+				t.Errorf("GetDisplayName(%q) = %q, want %q", tc.input, result, tc.expected)
 			}
 		})
 	}
