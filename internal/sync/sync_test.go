@@ -473,3 +473,88 @@ func TestSyncer_IncrementalDoesNotClear(t *testing.T) {
 		t.Errorf("incremental sync sessions = %d, want 1 (row must survive an incremental resync)", n)
 	}
 }
+
+// TestSyncer_FullFlagInvalidatesAnalyticsCache: without this, ccvault sync
+// --full clears the SQLite tables but the TUI Analytics tab and MCP
+// get_analytics keep serving pre-reset numbers from sessions.parquet — a
+// project removed upstream still shows up in Top Projects.
+func TestSyncer_FullFlagInvalidatesAnalyticsCache(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	claudeHome, err := os.MkdirTemp("", "claude-home-cache-*")
+	if err != nil {
+		t.Fatalf("create claude home: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(claudeHome) }()
+
+	// Pre-populate an analytics cache dir with a placeholder parquet.
+	cacheDir, err := os.MkdirTemp("", "ccvault-cache-*")
+	if err != nil {
+		t.Fatalf("create cache dir: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(cacheDir) }()
+	parquetPath := filepath.Join(cacheDir, "sessions.parquet")
+	if err := os.WriteFile(parquetPath, []byte("stale content"), 0o644); err != nil {
+		t.Fatalf("seed stale parquet: %v", err)
+	}
+
+	writeTestSession(t, claudeHome, "dddddddd-1111-2222-3333-444444444444", "-Users-test-proj")
+	sources := []config.SourceConfig{
+		{Name: "claude-code", Type: "claude-code", Path: claudeHome},
+	}
+
+	syncer := New(database, sources,
+		WithFullSync(true),
+		WithCacheDir(cacheDir),
+	)
+	if _, err := syncer.Run(); err != nil {
+		t.Fatalf("full sync: %v", err)
+	}
+
+	// The stale parquet must be gone. The next analytics read will
+	// auto-rebuild it from the freshly-synced SQLite tables.
+	if _, err := os.Stat(parquetPath); !os.IsNotExist(err) {
+		t.Errorf("sessions.parquet should have been removed by --full sync; stat err=%v", err)
+	}
+}
+
+// TestSyncer_IncrementalDoesNotInvalidateCache: only --full invalidates.
+// An ordinary sync must leave sessions.parquet in place so subsequent
+// analytics queries still hit the cache without rebuilding.
+func TestSyncer_IncrementalDoesNotInvalidateCache(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	claudeHome, err := os.MkdirTemp("", "claude-home-cache-incr-*")
+	if err != nil {
+		t.Fatalf("create claude home: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(claudeHome) }()
+
+	cacheDir, err := os.MkdirTemp("", "ccvault-cache-incr-*")
+	if err != nil {
+		t.Fatalf("create cache dir: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(cacheDir) }()
+	parquetPath := filepath.Join(cacheDir, "sessions.parquet")
+	if err := os.WriteFile(parquetPath, []byte("cached content"), 0o644); err != nil {
+		t.Fatalf("seed cached parquet: %v", err)
+	}
+
+	writeTestSession(t, claudeHome, "eeeeeeee-1111-2222-3333-444444444444", "-Users-test-proj")
+	sources := []config.SourceConfig{
+		{Name: "claude-code", Type: "claude-code", Path: claudeHome},
+	}
+
+	// Incremental (NOT --full), with cache dir set.
+	syncer := New(database, sources, WithCacheDir(cacheDir))
+	if _, err := syncer.Run(); err != nil {
+		t.Fatalf("incremental sync: %v", err)
+	}
+
+	// Parquet must still be present.
+	if _, err := os.Stat(parquetPath); err != nil {
+		t.Errorf("sessions.parquet should survive an incremental sync; stat err=%v", err)
+	}
+}

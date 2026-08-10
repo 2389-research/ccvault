@@ -360,10 +360,12 @@ var syncCmd = &cobra.Command{
 		}
 		defer func() { _ = database.Close() }()
 
-		// Create syncer
+		// Create syncer. Cache dir is plumbed through so --full can
+		// invalidate the analytics parquet alongside SQLite.
 		syncer := sync.New(database, sources,
 			sync.WithFullSync(full),
 			sync.WithVerbose(verbose),
+			sync.WithCacheDir(filepath.Join(cfg.DataDir, "analytics")),
 			sync.WithProgressCallback(func(msg string) {
 				fmt.Println(msg)
 			}),
