@@ -34,8 +34,8 @@ func TestMigrator_FreshDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("query max version: %v", err)
 	}
-	if maxVersion != 4 {
-		t.Errorf("max version = %d, want 4", maxVersion)
+	if maxVersion != 5 {
+		t.Errorf("max version = %d, want 5", maxVersion)
 	}
 
 	// Count migration records
@@ -44,8 +44,8 @@ func TestMigrator_FreshDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("count schema_version: %v", err)
 	}
-	if count != 4 {
-		t.Errorf("schema_version count = %d, want 4", count)
+	if count != 5 {
+		t.Errorf("schema_version count = %d, want 5", count)
 	}
 
 	// Verify all core tables exist
@@ -115,14 +115,14 @@ func TestMigrator_ExistingDatabase(t *testing.T) {
 		t.Fatalf("second RunMigrations: %v", err)
 	}
 
-	// Verify exactly 4 migration records, not 8
+	// Verify exactly 5 migration records, not 10
 	var count int
 	err := db.QueryRow("SELECT COUNT(*) FROM schema_version").Scan(&count)
 	if err != nil {
 		t.Fatalf("count schema_version: %v", err)
 	}
-	if count != 4 {
-		t.Errorf("schema_version count = %d, want 4 (idempotent)", count)
+	if count != 5 {
+		t.Errorf("schema_version count = %d, want 5 (idempotent)", count)
 	}
 }
 
@@ -198,8 +198,8 @@ func TestMigrator_BootstrapExisting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("query max version: %v", err)
 	}
-	if maxVersion != 4 {
-		t.Errorf("max version = %d, want 4", maxVersion)
+	if maxVersion != 5 {
+		t.Errorf("max version = %d, want 5", maxVersion)
 	}
 
 	// Verify exactly 4 records (2 bootstrapped + 2 applied)
@@ -208,8 +208,8 @@ func TestMigrator_BootstrapExisting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("count schema_version: %v", err)
 	}
-	if count != 4 {
-		t.Errorf("schema_version count = %d, want 4", count)
+	if count != 5 {
+		t.Errorf("schema_version count = %d, want 5", count)
 	}
 }
 
@@ -255,8 +255,8 @@ func TestMigrator_BootstrapPartial(t *testing.T) {
 	if err != nil {
 		t.Fatalf("query max version: %v", err)
 	}
-	if maxVersion != 4 {
-		t.Errorf("max version = %d, want 4", maxVersion)
+	if maxVersion != 5 {
+		t.Errorf("max version = %d, want 5", maxVersion)
 	}
 
 	// Verify has_error column was added by migration 002
@@ -299,8 +299,8 @@ func TestMigrator_SourceColumns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("query max version: %v", err)
 	}
-	if maxVersion != 4 {
-		t.Errorf("max version = %d, want 4", maxVersion)
+	if maxVersion != 5 {
+		t.Errorf("max version = %d, want 5", maxVersion)
 	}
 
 	// Insert a project row and verify the source column defaults to "claude-code"
@@ -347,6 +347,102 @@ func TestMigrator_SourceColumns(t *testing.T) {
 	}
 	if source != "claude-code" {
 		t.Errorf("source_files source = %q, want %q", source, "claude-code")
+	}
+}
+
+// TestMigrator_005_NormalizesDisplayNames verifies migration 005 backfills
+// display_name to basename(path) for rows that predate PR #22. Before that
+// PR, GetDisplayName joined the last 2–3 path components with ~home
+// substitution ("src/2389/ccvault"). After, it's filepath.Base ("ccvault").
+// Without the migration, upgrading the binary without running --full leaves
+// the DB in a mixed-format state indefinitely.
+func TestMigrator_005_NormalizesDisplayNames(t *testing.T) {
+	db := openMemoryDB(t)
+	defer func() { _ = db.Close() }()
+
+	if err := RunMigrations(db); err != nil {
+		t.Fatalf("RunMigrations: %v", err)
+	}
+
+	// Simulate a database that was populated by the old binary: display_name
+	// holds multi-segment values. Then re-run the migration SQL directly
+	// against a wider set of shapes than the fresh-DB path would exercise.
+	fixtures := []struct {
+		path         string
+		staleName    string // what old binary would have stored
+		wantBasename string // what post-migration display_name must be
+	}{
+		{"/Users/harper/Public/src/2389/ccvault", "src/2389/ccvault", "ccvault"},
+		{"/Users/harper/p/canvas-jira-summarizer", "p/canvas-jira-summarizer", "canvas-jira-summarizer"},
+		{"/short/path", "/short/path", "path"},
+		{"/opt/proj/alpha", "proj/alpha", "alpha"},
+	}
+
+	for i, f := range fixtures {
+		_, err := db.Exec(`INSERT INTO projects (path, display_name, first_seen_at, last_activity_at)
+			VALUES (?, ?, datetime('now'), datetime('now'))`,
+			f.path, f.staleName)
+		if err != nil {
+			t.Fatalf("insert fixture %d: %v", i, err)
+		}
+	}
+
+	// The migration ran during RunMigrations at initial DB setup, but our
+	// fixtures were inserted AFTER — so they haven't been touched yet.
+	// Re-execute the migration's UPDATE to backfill them, using the exact
+	// SQL that 005 embeds.
+	migSQL := `UPDATE projects
+		SET display_name =
+			CASE
+				WHEN instr(path, '/') = 0 THEN path
+				ELSE substr(path, length(rtrim(path, replace(path, '/', ''))) + 1)
+			END
+		WHERE path IS NOT NULL
+		  AND path != ''
+		  AND path NOT LIKE '%/';`
+	if _, err := db.Exec(migSQL); err != nil {
+		t.Fatalf("apply migration SQL: %v", err)
+	}
+
+	for _, f := range fixtures {
+		var got string
+		if err := db.QueryRow("SELECT display_name FROM projects WHERE path = ?", f.path).Scan(&got); err != nil {
+			t.Fatalf("query display_name for %s: %v", f.path, err)
+		}
+		if got != f.wantBasename {
+			t.Errorf("path=%q: display_name = %q, want %q", f.path, got, f.wantBasename)
+		}
+	}
+
+	// Guard the edge cases: empty path, trailing-slash path — these are
+	// deliberately skipped by the migration so we don't corrupt anything
+	// unexpected. Their pre-existing display_name should survive untouched.
+	edgeCases := []struct {
+		path      string
+		staleName string
+	}{
+		{"", "keep-me-empty"},
+		{"/foo/bar/", "keep-me-trailing"},
+	}
+	for i, ec := range edgeCases {
+		_, err := db.Exec(`INSERT INTO projects (path, display_name, first_seen_at, last_activity_at)
+			VALUES (?, ?, datetime('now'), datetime('now'))`,
+			ec.path, ec.staleName)
+		if err != nil {
+			t.Fatalf("insert edge fixture %d: %v", i, err)
+		}
+	}
+	if _, err := db.Exec(migSQL); err != nil {
+		t.Fatalf("apply migration SQL (edge): %v", err)
+	}
+	for _, ec := range edgeCases {
+		var got string
+		if err := db.QueryRow("SELECT display_name FROM projects WHERE path = ?", ec.path).Scan(&got); err != nil {
+			t.Fatalf("query display_name for edge %q: %v", ec.path, err)
+		}
+		if got != ec.staleName {
+			t.Errorf("edge case path=%q: display_name = %q, want unchanged %q", ec.path, got, ec.staleName)
+		}
 	}
 }
 
