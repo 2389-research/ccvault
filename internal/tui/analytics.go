@@ -12,6 +12,8 @@ import (
 
 	"github.com/2389-research/ccvault/internal/analytics"
 	"github.com/2389-research/ccvault/internal/db"
+	"github.com/2389-research/ccvault/internal/projectref"
+	"github.com/2389-research/ccvault/pkg/models"
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -385,7 +387,8 @@ func (m *AnalyticsModel) renderTopProjects() string {
 	}
 
 	for i, p := range m.topProjects {
-		name := filepath.Base(p.ProjectPath)
+		// Class A — Label for the short column, path in its own column
+		name := projectref.Label(&models.Project{Path: p.ProjectPath})
 		if len(name) > 22 {
 			name = "..." + name[len(name)-19:]
 		}

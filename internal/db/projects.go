@@ -145,16 +145,20 @@ func (db *DB) GetProjectByPath(path string) (*models.Project, error) {
 
 // GetProjects retrieves all projects
 func (db *DB) GetProjects(orderBy string, limit int) ([]models.Project, error) {
+	// Every sort adds `path ASC` as a tiebreaker so results are stable
+	// across syncs even when the primary key (display_name, timestamp,
+	// count) collides — e.g. multiple projects sharing a basename don't
+	// swap positions between calls, and agent pagination stays coherent.
 	validOrders := map[string]string{
-		"name":     "display_name ASC",
-		"activity": "last_activity_at DESC",
-		"tokens":   "total_tokens DESC",
-		"sessions": "session_count DESC",
+		"name":     "display_name ASC, path ASC",
+		"activity": "last_activity_at DESC, path ASC",
+		"tokens":   "total_tokens DESC, path ASC",
+		"sessions": "session_count DESC, path ASC",
 	}
 
 	order, ok := validOrders[orderBy]
 	if !ok {
-		order = "last_activity_at DESC"
+		order = "last_activity_at DESC, path ASC"
 	}
 
 	query := fmt.Sprintf(`

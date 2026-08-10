@@ -23,10 +23,11 @@ import (
 	"github.com/2389-research/ccvault/internal/db"
 	"github.com/2389-research/ccvault/internal/export"
 	"github.com/2389-research/ccvault/internal/mcp"
+	"github.com/2389-research/ccvault/internal/projectref"
 	"github.com/2389-research/ccvault/internal/search"
 	"github.com/2389-research/ccvault/internal/sync"
 	"github.com/2389-research/ccvault/internal/tui"
-	"github.com/2389-research/ccvault/pkg/parser"
+	"github.com/2389-research/ccvault/pkg/models"
 	"github.com/spf13/cobra"
 )
 
@@ -127,16 +128,16 @@ var quickstartCmd = &cobra.Command{
 
 // orientation holds the database state gathered for the orient command.
 type orientation struct {
-	ProjectCount  int
-	SessionCount  int
-	TurnCount     int
-	SessionTokens int64
-	FirstActivity time.Time
-	LastActivity  time.Time
-	ToolStats     map[string]int
-	TokensByModel map[string]int64
-	ProjectNames  []string
-	Warnings      []string
+	ProjectCount   int
+	SessionCount   int
+	TurnCount      int
+	SessionTokens  int64
+	FirstActivity  time.Time
+	LastActivity   time.Time
+	ToolStats      map[string]int
+	TokensByModel  map[string]int64
+	RecentProjects []models.Project // full rows so JSON emits {name, path} via projectref.Ref
+	Warnings       []string
 }
 
 // gatherOrientation collects database state for the orient command.
@@ -167,9 +168,7 @@ func gatherOrientation(database *db.DB) orientation {
 
 	projects, err := database.GetProjects("activity", 5)
 	warn("recent projects", err)
-	for _, p := range projects {
-		o.ProjectNames = append(o.ProjectNames, p.DisplayName)
-	}
+	o.RecentProjects = projects
 
 	return o
 }
@@ -211,7 +210,7 @@ Use --json for machine-readable output.`,
 				"last_session":  o.LastActivity.Format(time.RFC3339),
 				"days_span":     int(o.LastActivity.Sub(o.FirstActivity).Hours() / 24),
 			},
-			"recent_projects": o.ProjectNames,
+			"recent_projects": projectref.RefsFromValues(o.RecentProjects),
 			"top_tools":       o.ToolStats,
 			"models":          o.TokensByModel,
 			"commands": map[string]string{
@@ -281,10 +280,11 @@ Use --json for machine-readable output.`,
 		fmt.Printf("  Span:  %d days\n", int(o.LastActivity.Sub(o.FirstActivity).Hours()/24))
 		fmt.Println()
 
-		if len(o.ProjectNames) > 0 {
+		if len(o.RecentProjects) > 0 {
 			fmt.Println("Recent Projects:")
-			for _, name := range o.ProjectNames {
-				fmt.Printf("  - %s\n", name)
+			for i := range o.RecentProjects {
+				// Class B — human-readable inline form, with disambiguating path
+				fmt.Printf("  - %s\n", projectref.Inline(&o.RecentProjects[i]))
 			}
 			fmt.Println()
 		}
@@ -479,7 +479,8 @@ Supports Gmail-like query syntax:
 		fmt.Printf("Found %d results:\n\n", len(results))
 		for i, r := range results {
 			fmt.Printf("%d. [%s] %s  Session: %s\n", i+1, r.Turn.Type, r.Turn.Timestamp.Format("2006-01-02 15:04"), r.Turn.SessionID)
-			fmt.Printf("   Project: %s\n", parser.GetDisplayName(r.ProjectPath))
+			// Class B — combined form so same-basename projects don't look identical
+			fmt.Printf("   Project: %s\n", projectref.Inline(&models.Project{Path: r.ProjectPath}))
 			if r.Model != "" {
 				fmt.Printf("   Model: %s\n", r.Model)
 			}
@@ -612,8 +613,10 @@ var listProjectsCmd = &cobra.Command{
 
 		fmt.Printf("%-30s %-40s %8s %10s %12s\n", "PROJECT", "PATH", "SESSIONS", "TOKENS", "LAST ACTIVE")
 		fmt.Println(strings.Repeat("-", 105))
-		for _, p := range projects {
-			name := p.DisplayName
+		for i := range projects {
+			p := &projects[i]
+			// Class A — Label for the short column, Path in its own column
+			name := projectref.Label(p)
 			if len(name) > 28 {
 				name = "..." + name[len(name)-25:]
 			}
@@ -658,24 +661,30 @@ var listSessionsCmd = &cobra.Command{
 			if err != nil {
 				return fmt.Errorf("get project: %w", err)
 			}
-			if project == nil {
-				// Try partial match
+			if project != nil {
+				projectID = project.ID
+			} else {
+				// Fall back to partial match. Class D — return every match
+				// via projectref.ResolveAll rather than silently picking one,
+				// and refuse when ambiguous so the user picks a longer filter.
 				projects, err := database.GetProjects("activity", 0)
 				if err != nil {
 					return fmt.Errorf("get projects: %w", err)
 				}
-				for _, p := range projects {
-					if strings.Contains(strings.ToLower(p.Path), strings.ToLower(projectFilter)) ||
-						strings.Contains(strings.ToLower(p.DisplayName), strings.ToLower(projectFilter)) {
-						projectID = p.ID
-						break
-					}
-				}
-				if projectID == 0 {
+				matches := projectref.ResolveAll(projects, projectFilter)
+				switch len(matches) {
+				case 0:
 					return fmt.Errorf("project not found: %s", projectFilter)
+				case 1:
+					projectID = matches[0].ID
+				default:
+					lines := make([]string, len(matches))
+					for i, m := range matches {
+						lines[i] = "  - " + m.Path
+					}
+					return fmt.Errorf("multiple projects match %q; be more specific:\n%s",
+						projectFilter, strings.Join(lines, "\n"))
 				}
-			} else {
-				projectID = project.ID
 			}
 		}
 
@@ -712,7 +721,11 @@ var listSessionsCmd = &cobra.Command{
 			}
 			tokens := s.InputTokens + s.OutputTokens
 			if showProject {
-				project := parser.GetDisplayName(s.ProjectPath)
+				// Class A — short label in a table column. Session ID
+				// column already disambiguates rows; same-basename
+				// projects render identically here and that's acceptable.
+				// Users who care can filter with --project <path>.
+				project := projectref.Label(&models.Project{Path: s.ProjectPath})
 				if len(project) > 23 {
 					project = "..." + project[len(project)-20:]
 				}

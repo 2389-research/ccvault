@@ -46,6 +46,13 @@ var scenarioCoverage = map[string]string{
 	"tui-projects-shows-path-column":          "internal/tui TestProjectsModel_ViewShowsPathColumn",
 	"tui-sessions-conditional-project-column": "internal/tui TestSessionsModel_ViewShowsProjectColumnWhenUnfiltered + TestSessionsModel_ViewOmitsProjectColumnWhenFiltered",
 	"tui-search-vim-nav-respects-focus":       "internal/tui TestSearchModel_VimNavIgnoredWhileFocused",
+	// PR #22 follow-ups 4-8: projectref discipline
+	"projectref-class-a-tabular":        "internal/projectref TestLabel_* + internal/tui TestProjectsModel_ViewShowsPathColumn",
+	"projectref-class-b-inline":         "internal/projectref TestInline_*",
+	"projectref-class-c-structured":     "internal/projectref TestRef_* + TestRefsFromValues_PreservesOrder",
+	"projectref-class-d-input-matching": "internal/projectref TestResolveAll_*",
+	"projectref-ast-allowlist-enforced": "test/integration TestProjectRefEnforcement",
+	"list-projects-sort-tiebreaker":     "internal/db TestGetProjects_SortStableTiebreaker",
 }
 
 func TestScenariosHaveCoverage(t *testing.T) {

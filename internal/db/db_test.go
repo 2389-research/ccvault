@@ -853,3 +853,47 @@ func TestResetAll_IsAtomicOnMidResetFailure(t *testing.T) {
 		}
 	}
 }
+
+// TestGetProjects_SortStableTiebreaker guards the secondary path ASC sort
+// added as follow-up 7 of PR #22 review. Multiple projects sharing a
+// display_name (or activity timestamp, token count, session count) must
+// come back in a stable order across calls — otherwise agents that
+// paginate the list see rows swap positions between requests.
+func TestGetProjects_SortStableTiebreaker(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	// Two projects sharing display_name. Insert them in one order; the
+	// path ASC secondary sort should return them in path order regardless.
+	paths := []string{"/Users/a/ccvault", "/Users/b/ccvault"}
+	for _, path := range paths {
+		p := &models.Project{Path: path, DisplayName: "ccvault"}
+		if err := db.UpsertProject(p); err != nil {
+			t.Fatalf("upsert %s: %v", path, err)
+		}
+	}
+
+	// Query twice; results must match exactly.
+	first, err := db.GetProjects("name", 10)
+	if err != nil {
+		t.Fatalf("first GetProjects: %v", err)
+	}
+	second, err := db.GetProjects("name", 10)
+	if err != nil {
+		t.Fatalf("second GetProjects: %v", err)
+	}
+	if len(first) != 2 || len(second) != 2 {
+		t.Fatalf("expected 2 rows both times, got %d/%d", len(first), len(second))
+	}
+	for i := range first {
+		if first[i].Path != second[i].Path {
+			t.Errorf("index %d: first.path=%q second.path=%q — sort must be stable",
+				i, first[i].Path, second[i].Path)
+		}
+	}
+	// Path ASC secondary means /Users/a/ccvault comes before /Users/b/ccvault.
+	if first[0].Path != "/Users/a/ccvault" || first[1].Path != "/Users/b/ccvault" {
+		t.Errorf("path-ASC tiebreaker not applied; got %q, %q",
+			first[0].Path, first[1].Path)
+	}
+}

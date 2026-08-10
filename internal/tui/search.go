@@ -5,11 +5,12 @@ package tui
 
 import (
 	"fmt"
-	"path/filepath"
 	"strings"
 
 	"github.com/2389-research/ccvault/internal/db"
+	"github.com/2389-research/ccvault/internal/projectref"
 	"github.com/2389-research/ccvault/internal/search"
+	"github.com/2389-research/ccvault/pkg/models"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -321,7 +322,10 @@ func (m *SearchModel) View() string {
 					turnType = "asst"
 				}
 
-				project := filepath.Base(r.ProjectPath)
+				// Class A — short label in a compact cell. Result row
+				// has its own timestamp + turn context; same-basename
+				// projects are acceptable ambiguity here.
+				project := projectref.Label(&models.Project{Path: r.ProjectPath})
 				if len(project) > 25 {
 					project = "..." + project[len(project)-22:]
 				}

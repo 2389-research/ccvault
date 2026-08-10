@@ -17,6 +17,7 @@ import (
 	"github.com/2389-research/ccvault/internal/config"
 	"github.com/2389-research/ccvault/internal/db"
 	"github.com/2389-research/ccvault/internal/export"
+	"github.com/2389-research/ccvault/internal/projectref"
 	"github.com/2389-research/ccvault/internal/search"
 	"github.com/2389-research/ccvault/pkg/models"
 )
@@ -987,20 +988,32 @@ func (s *Server) listSessions(args map[string]interface{}) (interface{}, error) 
 
 	var projectID int64
 	if projectFilter, ok := args["project"].(string); ok && projectFilter != "" {
-		// Find matching project
+		// Class D — return all matches, don't silently pick one.
 		projects, err := s.db.GetProjects("activity", 0)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get projects: %w", err)
 		}
-		for _, p := range projects {
-			if strings.Contains(strings.ToLower(p.Path), strings.ToLower(projectFilter)) ||
-				strings.Contains(strings.ToLower(p.DisplayName), strings.ToLower(projectFilter)) {
-				projectID = p.ID
-				break
-			}
-		}
-		if projectID == 0 {
+		matches := projectref.ResolveAll(projects, projectFilter)
+		switch len(matches) {
+		case 0:
 			return nil, fmt.Errorf("project not found: %s", projectFilter)
+		case 1:
+			projectID = matches[0].ID
+		default:
+			// Ambiguous — return the candidate set so the agent can
+			// re-issue the call with a more specific (usually the full
+			// path) filter. No sessions returned; that would silently
+			// mix rows from different projects.
+			candidates := make([]map[string]any, len(matches))
+			for i := range matches {
+				candidates[i] = projectref.Ref(&matches[i])
+			}
+			return map[string]interface{}{
+				"ambiguous_project_filter": true,
+				"filter":                   projectFilter,
+				"matched_projects":         candidates,
+				"hint":                     "Filter matched multiple projects. Re-call list_sessions with 'project' set to one of matched_projects[].path.",
+			}, nil
 		}
 	}
 
@@ -1242,17 +1255,23 @@ func (s *Server) promptAnalyzeProject(args map[string]interface{}) (promptGetRes
 		return promptGetResult{}, err
 	}
 
-	var project *models.Project
-	for _, p := range projects {
-		if strings.Contains(strings.ToLower(p.Path), strings.ToLower(projectName)) ||
-			strings.Contains(strings.ToLower(p.DisplayName), strings.ToLower(projectName)) {
-			project = &p
-			break
-		}
-	}
-	if project == nil {
+	// Class D — never silently pick a match. A prompt is a single-analysis
+	// contract; on ambiguous input the caller must narrow.
+	matches := projectref.ResolveAll(projects, projectName)
+	if len(matches) == 0 {
 		return promptGetResult{}, fmt.Errorf("project not found: %s", projectName)
 	}
+	if len(matches) > 1 {
+		var paths []string
+		for _, m := range matches {
+			paths = append(paths, m.Path)
+		}
+		return promptGetResult{}, fmt.Errorf(
+			"filter %q matched multiple projects; re-call with an exact path:\n  %s",
+			projectName, strings.Join(paths, "\n  "),
+		)
+	}
+	project := &matches[0]
 
 	// Get sessions for this project
 	sessions, err := s.db.GetSessions(project.ID, 50)
@@ -1261,7 +1280,9 @@ func (s *Server) promptAnalyzeProject(args map[string]interface{}) (promptGetRes
 	}
 
 	var context strings.Builder
-	fmt.Fprintf(&context, "## Project Analysis: %s\n\n", project.DisplayName)
+	// Class B — combined inline form so a same-basename project doesn't
+	// produce an ambiguous prompt header.
+	fmt.Fprintf(&context, "## Project Analysis: %s\n\n", projectref.Inline(project))
 	fmt.Fprintf(&context, "- **Path**: %s\n", project.Path)
 	fmt.Fprintf(&context, "- **Sessions**: %d\n", project.SessionCount)
 	fmt.Fprintf(&context, "- **Total Tokens**: %d\n", project.TotalTokens)
@@ -1277,7 +1298,7 @@ func (s *Server) promptAnalyzeProject(args map[string]interface{}) (promptGetRes
 	}
 
 	return promptGetResult{
-		Description: fmt.Sprintf("Analysis of Claude Code usage for project: %s", project.DisplayName),
+		Description: fmt.Sprintf("Analysis of Claude Code usage for project: %s", projectref.Inline(project)),
 		Messages: []promptMessage{
 			{
 				Role: "user",

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/2389-research/ccvault/internal/db"
+	"github.com/2389-research/ccvault/internal/projectref"
 	"github.com/2389-research/ccvault/pkg/models"
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
@@ -208,8 +209,10 @@ func (m *DashboardModel) View() string {
 		home, _ := os.UserHomeDir()
 		b.WriteString(lipgloss.NewStyle().Bold(true).Render("Recent Projects"))
 		b.WriteString("\n")
-		for _, p := range m.topProjects {
-			name := p.DisplayName
+		for i := range m.topProjects {
+			p := m.topProjects[i]
+			// Class A — Label for the short column
+			name := projectref.Label(&p)
 			if len(name) > 22 {
 				name = "..." + name[len(name)-19:]
 			}

@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/2389-research/ccvault/internal/db"
+	"github.com/2389-research/ccvault/internal/projectref"
 	"github.com/2389-research/ccvault/pkg/models"
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
@@ -155,7 +156,8 @@ func (m *ProjectsModel) View() string {
 
 		for i := m.offset; i < end; i++ {
 			p := m.projects[i]
-			name := p.DisplayName
+			// Class A — Label for the short column, Path shown separately below
+			name := projectref.Label(&p)
 			if len(name) > 22 {
 				name = "..." + name[len(name)-19:]
 			}

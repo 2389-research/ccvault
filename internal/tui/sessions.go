@@ -5,10 +5,10 @@ package tui
 
 import (
 	"fmt"
-	"path/filepath"
 	"strings"
 
 	"github.com/2389-research/ccvault/internal/db"
+	"github.com/2389-research/ccvault/internal/projectref"
 	"github.com/2389-research/ccvault/pkg/models"
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
@@ -145,10 +145,11 @@ func (m *SessionsModel) View() string {
 
 	var b strings.Builder
 
-	// Title
+	// Title — Class B (inline), path shown so same-basename projects don't
+	// render an ambiguous title when the user drills into one of them.
 	title := "Sessions"
 	if m.project != nil {
-		title = fmt.Sprintf("Sessions: %s", m.project.DisplayName)
+		title = fmt.Sprintf("Sessions: %s", projectref.Inline(m.project))
 	}
 	b.WriteString(titleStyle.Render(title))
 	b.WriteString("\n")
@@ -192,7 +193,9 @@ func (m *SessionsModel) View() string {
 
 			var line string
 			if showProject {
-				project := filepath.Base(s.ProjectPath)
+				// Class A — short label; session cell has its own row
+				// identifiers, same-basename ambiguity is acceptable here.
+				project := projectref.Label(&models.Project{Path: s.ProjectPath})
 				if len(project) > 20 {
 					project = "..." + project[len(project)-17:]
 				}
