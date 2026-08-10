@@ -10,7 +10,6 @@ import (
 	"github.com/2389-research/ccvault/internal/db"
 	"github.com/2389-research/ccvault/internal/projectref"
 	"github.com/2389-research/ccvault/internal/search"
-	"github.com/2389-research/ccvault/pkg/models"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -298,6 +297,11 @@ func (m *SearchModel) View() string {
 			}
 			b.WriteString("\n\n")
 
+			// Load all projects once so adapter DisplayNames surface in
+			// the result rows instead of falling through to basename.
+			projectsList, _ := m.db.GetProjects("activity", 0)
+			byPath := projectref.ProjectsByPath(projectsList)
+
 			// Results list
 			visibleRows := m.visibleRows()
 			end := m.offset + visibleRows
@@ -322,10 +326,11 @@ func (m *SearchModel) View() string {
 					turnType = "asst"
 				}
 
-				// Class A — short label in a compact cell. Result row
-				// has its own timestamp + turn context; same-basename
-				// projects are acceptable ambiguity here.
-				project := projectref.Label(&models.Project{Path: r.ProjectPath})
+				// Class A — short label in a compact cell. LabelFromPath
+				// surfaces adapter DisplayName instead of always
+				// synthesizing a bare Project stub (which drops
+				// jeff/hex/nanoclaw branded labels).
+				project := projectref.LabelFromPath(r.ProjectPath, byPath)
 				if len(project) > 25 {
 					project = "..." + project[len(project)-22:]
 				}

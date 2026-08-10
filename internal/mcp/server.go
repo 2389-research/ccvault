@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/2389-research/ccvault/internal/analytics"
+	"github.com/2389-research/ccvault/internal/compact"
 	"github.com/2389-research/ccvault/internal/config"
 	"github.com/2389-research/ccvault/internal/db"
 	"github.com/2389-research/ccvault/internal/export"
@@ -1028,9 +1029,15 @@ func (s *Server) listSessions(args map[string]interface{}) (interface{}, error) 
 		sessions = sessions[:limit]
 	}
 
+	// Class C — enrich sessions with {name, path} for each session's
+	// project so agents get the doctrine shape. Adapter-provided
+	// DisplayName is preserved via the ProjectsByID lookup.
+	allProjects, _ := s.db.GetProjects("activity", 0)
+	projectsByID := projectref.ProjectsByID(allProjects)
+
 	response := map[string]interface{}{
 		"count":    len(sessions),
-		"sessions": sessions,
+		"sessions": projectref.SessionRefsFromValues(sessions, projectsByID),
 	}
 	if hasMore {
 		response["has_more"] = true
@@ -1068,9 +1075,11 @@ func (s *Server) listProjects(args map[string]interface{}) (interface{}, error) 
 		projects = projects[:limit]
 	}
 
+	// Class C — emit each project with a Ref-doctrine {name, path}
+	// shape, plus the operational fields agents need.
 	response := map[string]interface{}{
 		"count":    len(projects),
-		"projects": projects,
+		"projects": projectref.EnrichedRefsFromValues(projects),
 	}
 	if hasMore {
 		response["has_more"] = true
@@ -1488,15 +1497,13 @@ func (s *Server) promptToolUsageReport(args map[string]interface{}) (promptGetRe
 
 // Helper functions
 
+// shortenModel is a thin adapter around compact.Model that discards the
+// Shortened flag (MCP prompt content doesn't have styling). Preserves
+// semantic identity — NEVER strips a trailing datestamp, because
+// opus-4-5-20251101 is a genuinely different model from opus-4-5.
+// See internal/compact/compact.go for the discipline.
 func shortenModel(model string) string {
-	if len(model) <= 20 {
-		return model
-	}
-	parts := strings.Split(model, "-")
-	if len(parts) >= 2 {
-		return parts[1]
-	}
-	return model[:17] + "..."
+	return compact.Model(model, 20).Text
 }
 
 func (s *Server) sendResult(id interface{}, result interface{}) {

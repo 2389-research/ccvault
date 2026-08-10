@@ -439,10 +439,10 @@ func (m *AnalyticsModel) renderModelStats() string {
 	}
 
 	for _, ms := range m.modelStats {
-		name := shortenModelName(ms.Model, 33)
+		nameCell := cellText(compact.Model(ms.Model, 33), 35)
 		bar := renderBar(ms.TotalTokens, maxTokens, 15)
-		row := fmt.Sprintf("%-35s %8d %15s %s",
-			name,
+		row := fmt.Sprintf("%s %8d %15s %s",
+			nameCell,
 			ms.SessionCount,
 			formatCompact(ms.TotalTokens),
 			bar)
@@ -477,20 +477,4 @@ func formatCompact(n int64) string {
 		return fmt.Sprintf("%.1fM", float64(n)/1000000)
 	}
 	return fmt.Sprintf("%.1fB", float64(n)/1000000000)
-}
-
-// shortenModelName shortens a model name for display
-func shortenModelName(model string, maxLen int) string {
-	if len(model) <= maxLen {
-		return model
-	}
-	// Extract meaningful part (e.g., "opus-4" from "claude-opus-4-...")
-	parts := strings.Split(model, "-")
-	if len(parts) >= 3 {
-		short := strings.Join(parts[1:3], "-")
-		if len(short) <= maxLen {
-			return short
-		}
-	}
-	return model[:maxLen-3] + "..."
 }

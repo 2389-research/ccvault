@@ -21,7 +21,7 @@ type DB struct {
 // Open opens or creates the ccvault database
 func Open(dataDir string) (*DB, error) {
 	// Ensure data directory exists
-	if err := os.MkdirAll(dataDir, 0755); err != nil {
+	if err := os.MkdirAll(dataDir, 0o750); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
 

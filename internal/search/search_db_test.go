@@ -85,3 +85,49 @@ func TestSearch_ToolFilterMatchesFullMCPNames(t *testing.T) {
 		t.Errorf("fragment 'ccvault' matched %d results, want 0 (full-name matching)", len(fragResults))
 	}
 }
+
+// TestSearch_ProjectFilterEscapesLikeWildcards guards against SQL LIKE
+// wildcard leakage flagged by adversarial review: a project: filter of
+// "foo%bar" should NOT expand to "foo<anything>bar" via SQLite's LIKE
+// wildcards. It should match the literal string.
+func TestSearch_ProjectFilterEscapesLikeWildcards(t *testing.T) {
+	database := setupSearchDB(t)
+	searcher := New(database.DB)
+
+	// Add a second project whose path CONTAINS "foobar" — the exploit
+	// would be a filter of "fo%ar" matching this project via wildcards.
+	p2 := &models.Project{Path: "/other/foobar-project", DisplayName: "foobar-project"}
+	if err := database.UpsertProject(p2); err != nil {
+		t.Fatalf("upsert second project: %v", err)
+	}
+	s2 := &models.Session{ID: "session-2", ProjectID: p2.ID, StartedAt: time.Now(), SourceFile: "/other.jsonl"}
+	if err := database.UpsertSession(s2); err != nil {
+		t.Fatalf("upsert session-2: %v", err)
+	}
+	if err := database.InsertTurns([]models.Turn{{
+		ID: "turn-2", SessionID: "session-2", Type: "user",
+		Timestamp: time.Now(), Content: "run the deploy script here too",
+	}}); err != nil {
+		t.Fatalf("insert turn-2: %v", err)
+	}
+
+	// A literal-percent filter — must not act as a wildcard.
+	// Contains substring match on "%" would match neither project
+	// because their paths/display_names don't contain a literal "%".
+	results, err := searcher.Search(Parse("project:fo%ar deploy"), 10)
+	if err != nil {
+		t.Fatalf("search escaped %%: %v", err)
+	}
+	if len(results) != 0 {
+		t.Errorf("filter 'fo%%ar' matched %d results, want 0 (literal '%%' should not wildcard-match foobar-project)", len(results))
+	}
+
+	// A literal-underscore filter — same story.
+	underscoreResults, err := searcher.Search(Parse("project:fo_ba deploy"), 10)
+	if err != nil {
+		t.Fatalf("search escaped _: %v", err)
+	}
+	if len(underscoreResults) != 0 {
+		t.Errorf("filter 'fo_ba' matched %d results, want 0 (literal '_' should not wildcard-match foobar-project)", len(underscoreResults))
+	}
+}

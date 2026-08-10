@@ -290,19 +290,11 @@ func (m *DashboardModel) renderStats() string {
 		})
 
 		for _, mt := range sorted {
-			// Shorten model name for display
-			modelName := mt.model
-			if len(modelName) > 30 {
-				// Extract meaningful part (e.g., "opus-4" from "claude-opus-4-...")
-				parts := strings.Split(modelName, "-")
-				if len(parts) >= 3 {
-					modelName = strings.Join(parts[1:3], "-")
-				} else {
-					modelName = modelName[:27] + "..."
-				}
-			}
-			lines = append(lines, fmt.Sprintf("  %-20s %s",
-				modelName,
+			// compact.Model preserves semantic identity — strips "claude-"
+			// but never the trailing datestamp.
+			modelCell := cellText(compact.Model(mt.model, 20), 20)
+			lines = append(lines, fmt.Sprintf("  %s %s",
+				modelCell,
 				formatTokens(mt.tokens)))
 		}
 	}

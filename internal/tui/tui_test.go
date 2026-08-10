@@ -199,13 +199,14 @@ func TestSessionsModel_ViewShowsSourceColumn(t *testing.T) {
 	if !strings.Contains(view, "SOURCE") {
 		t.Errorf("view missing SOURCE header:\n%s", view)
 	}
-	// "claude-code" (11 chars) gets truncated to "claude-cod.." by
-	// sessions.go's 10-char cap; assert on the visible prefix so the test
-	// verifies the source column is populated correctly without pinning
-	// exact truncation behavior.
-	for _, wantPrefix := range []string{"claude-cod", "codex"} {
-		if !strings.Contains(view, wantPrefix) {
-			t.Errorf("view missing source prefix %q:\n%s", wantPrefix, view)
+	// At 120 cols the layout gives SOURCE 10-12 cols. compact.Source
+	// abbreviates "claude-code" → "claude" (well-known shorthand under
+	// pressure), codex stays as-is when it fits. Assert on presence
+	// rather than exact truncation form so future ladder tweaks don't
+	// break the test.
+	for _, wantSubstr := range []string{"claude", "codex"} {
+		if !strings.Contains(view, wantSubstr) {
+			t.Errorf("view missing source substring %q:\n%s", wantSubstr, view)
 		}
 	}
 }
@@ -242,9 +243,12 @@ func TestProjectsModel_ViewShowsSourceColumn(t *testing.T) {
 	if !strings.Contains(view, "SOURCE") {
 		t.Errorf("view missing SOURCE header:\n%s", view)
 	}
-	for _, src := range []string{"claude-code", "codex"} {
+	// compact.Source abbreviates "claude-code" → "claude" at the layout
+	// tier's SOURCE width; "codex" stays as-is when it fits. Assert on
+	// per-adapter recognizable substrings.
+	for _, src := range []string{"claude", "codex"} {
 		if !strings.Contains(view, src) {
-			t.Errorf("view missing source %q:\n%s", src, view)
+			t.Errorf("view missing source substring %q:\n%s", src, view)
 		}
 	}
 }

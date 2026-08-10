@@ -20,6 +20,10 @@
 -- no valid ccvault row stores those shapes, and skipping avoids corrupting
 -- anything unusual we haven't anticipated.
 
+-- Scope: only rewrite rows whose source is 'claude-code'. Other adapters
+-- (nanoclaw's 'reed', hex's 'Hex', jeff's 'Jeff', etc.) set intentional
+-- non-basename DisplayNames as their branding; rewriting those to bare
+-- basenames would silently regress the adapter's branded label.
 UPDATE projects
 SET display_name =
     CASE
@@ -28,4 +32,5 @@ SET display_name =
     END
 WHERE path IS NOT NULL
   AND path != ''
-  AND path NOT LIKE '%/';
+  AND path NOT LIKE '%/'
+  AND source = 'claude-code';

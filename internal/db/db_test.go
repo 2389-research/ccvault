@@ -734,16 +734,19 @@ func TestResetAll_ClearsDataAndPreservesSchema(t *testing.T) {
 		}
 	}
 
-	// The real cascade check: MATCH for the pre-reset token must now return
-	// zero hits. If the AFTER DELETE trigger on turns didn't cascade to
-	// turns_fts, the shadow index still holds the token and MATCH surfaces
-	// a stale rowid pointing at a nonexistent turn.
-	postMatch, err := db.SearchTurns(preResetToken, 10)
-	if err != nil {
-		t.Fatalf("post-reset FTS MATCH: %v", err)
+	// The real cascade check: MATCH the shadow index DIRECTLY (not through
+	// SearchTurns which JOINs against `turns` and would silently mask
+	// stale shadow rowids because the base rows are gone). If the AFTER
+	// DELETE trigger on `turns` didn't cascade to `turns_fts`, this
+	// direct MATCH still finds the pre-reset token — proving the cascade
+	// is broken. Adversarial reviewer #4 flagged the JOIN version as a
+	// false positive of the same class the count-through-source was.
+	var directMatchCount int
+	if err := db.QueryRow("SELECT COUNT(*) FROM turns_fts WHERE turns_fts MATCH ?", preResetToken).Scan(&directMatchCount); err != nil {
+		t.Fatalf("post-reset direct FTS MATCH: %v", err)
 	}
-	if len(postMatch) != 0 {
-		t.Errorf("FTS MATCH for pre-reset token returned %d hits after ResetAll, want 0 (cascade broken?)", len(postMatch))
+	if directMatchCount != 0 {
+		t.Errorf("direct FTS MATCH for pre-reset token returned %d hits after ResetAll, want 0 (cascade broken?)", directMatchCount)
 	}
 
 	// Schema still intact: turns_fts virtual table is queryable, triggers still fire.
@@ -824,30 +827,51 @@ func TestResetAll_IsAtomicOnMidResetFailure(t *testing.T) {
 		}
 		return n
 	}
-	// Baseline: turns has 1, projects has 1, tool_uses has 0.
-	for tbl, want := range map[string]int{"tool_uses": 0, "turns": 1, "projects": 1} {
+	// Seed EVERY data table with a row so we can prove atomicity from
+	// both directions — tables before AND after the sabotage point must
+	// roll back. tool_uses gets a row too (baseline was 0 in the earlier
+	// version, which made the "fail early on tool_uses = still 0" case
+	// indistinguishable from real atomicity).
+	if err := db.InsertToolUses([]models.ToolUse{{
+		TurnID:    "turn-atomic",
+		SessionID: s.ID,
+		ToolName:  "Bash",
+		Timestamp: time.Now(),
+	}}); err != nil {
+		t.Fatalf("insert tool_use: %v", err)
+	}
+	if err := db.UpsertSourceFileMtime("/proj/atomic/session.jsonl", time.Now()); err != nil {
+		t.Fatalf("record mtime: %v", err)
+	}
+
+	// Baseline: every table has at least 1 row.
+	baseline := map[string]int{"tool_uses": 1, "turns": 1, "sessions": 1, "projects": 1, "source_files": 1}
+	for tbl, want := range baseline {
 		if got := countRows(tbl); got != want {
 			t.Fatalf("baseline %s = %d, want %d", tbl, got, want)
 		}
 	}
 
-	// Sabotage the third table ResetAll touches. Order in ResetAll is
-	// tool_uses, turns, sessions, projects, source_files — so dropping
-	// sessions makes ResetAll fail AFTER tool_uses and turns are DELETEd
-	// inside the tx. Without the transaction wrapper, tool_uses and turns
-	// would stay empty; with the wrapper, they roll back.
-	if _, err := db.Exec("DROP TABLE sessions"); err != nil {
-		t.Fatalf("sabotage sessions table: %v", err)
+	// Sabotage the LAST-touched table so failure happens after every
+	// preceding DELETE has fired inside the tx. ResetAll's order is
+	// tool_uses, turns, sessions, projects, source_files — dropping
+	// source_files means DELETE from tool_uses/turns/sessions/projects
+	// all succeed, THEN the source_files DELETE errors. Without WithTx,
+	// four tables would be empty; with WithTx, they all roll back.
+	// This catches the "fail-early = pass" false positive the adversarial
+	// reviewer flagged in the earlier (drop sessions) version.
+	if _, err := db.Exec("DROP TABLE source_files"); err != nil {
+		t.Fatalf("sabotage source_files table: %v", err)
 	}
 
 	if err := db.ResetAll(); err == nil {
-		t.Fatal("ResetAll should fail when the sessions table has been dropped")
+		t.Fatal("ResetAll should fail when the source_files table has been dropped")
 	}
 
-	// tool_uses, turns, projects must be in their pre-ResetAll state.
-	// Without WithTx, tool_uses would be 0 (it always was) but turns
-	// would ALSO be 0 — the partial-reset regression this test catches.
-	for tbl, want := range map[string]int{"tool_uses": 0, "turns": 1, "projects": 1} {
+	// tool_uses, turns, sessions, projects must ALL be in their
+	// pre-ResetAll state — proves the tx wrapping actually rolls back
+	// changes to tables that ResetAll had already touched successfully.
+	for tbl, want := range map[string]int{"tool_uses": 1, "turns": 1, "sessions": 1, "projects": 1} {
 		if got := countRows(tbl); got != want {
 			t.Errorf("post-failed-ResetAll %s = %d, want %d (transaction should have rolled back)", tbl, got, want)
 		}
@@ -863,9 +887,13 @@ func TestGetProjects_SortStableTiebreaker(t *testing.T) {
 	db, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	// Two projects sharing display_name. Insert them in one order; the
-	// path ASC secondary sort should return them in path order regardless.
-	paths := []string{"/Users/a/ccvault", "/Users/b/ccvault"}
+	// Two projects sharing display_name. INSERT ORDER is deliberately
+	// reversed from expected sort order so a broken implementation
+	// missing the tiebreaker would return them in insertion (== rowid)
+	// order — /Users/b first — instead of path-ASC — /Users/a first.
+	// Adversarial reviewer #4 flagged the previous test order as a
+	// false positive.
+	paths := []string{"/Users/b/ccvault", "/Users/a/ccvault"}
 	for _, path := range paths {
 		p := &models.Project{Path: path, DisplayName: "ccvault"}
 		if err := db.UpsertProject(p); err != nil {

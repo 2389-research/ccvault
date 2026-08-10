@@ -6,6 +6,7 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/2389-research/ccvault/internal/compact"
 	"github.com/2389-research/ccvault/internal/db"
@@ -182,6 +183,12 @@ func (m *SessionsModel) View() string {
 		b.WriteString(headerStyle.Render(strings.Join(headerParts, " ")))
 		b.WriteString("\n")
 
+		// Load all projects once so adapter DisplayNames (jeff, hex,
+		// nanoclaw) surface in the PROJECT column instead of falling
+		// through to basename via a synthetic Project stub.
+		projectsList, _ := m.db.GetProjects("activity", 0)
+		byPath := projectref.ProjectsByPath(projectsList)
+
 		// List
 		visibleRows := m.visibleRows()
 		end := m.offset + visibleRows
@@ -195,13 +202,16 @@ func (m *SessionsModel) View() string {
 
 			var parts []string
 			if layout.Project > 0 {
-				project := projectref.Label(&models.Project{Path: s.ProjectPath})
+				project := projectref.LabelFromPath(s.ProjectPath, byPath)
 				parts = append(parts, cellText(compact.Truncate(project, layout.Project), layout.Project))
 			}
 			// STARTED — date + time in a single cell. Renders differently
 			// based on how much space we've been given.
 			startedText := s.StartedAt.Format("2006-01-02 15:04")
-			if layout.Started < len(startedText) {
+			// Use rune count for consistency with the rest of the compact
+			// discipline. startedText is ASCII so bytes==runes here, but
+			// staying uniform means future format changes won't misalign.
+			if layout.Started < utf8.RuneCountInString(startedText) {
 				// Drop the time to fit
 				startedText = compact.Date(s.StartedAt, layout.Started).Text
 				parts = append(parts, cellText(compact.Result{Text: startedText, Shortened: true}, layout.Started))

@@ -1,0 +1,97 @@
+version: "2"
+
+# ABOUTME: golangci-lint config for ccvault. Enables gosec, bodyclose,
+# sqlclosecheck, and errorlint in addition to the default linters.
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard
+  enable:
+    # Security lens — flag SQL injection risk, hardcoded credentials,
+    # weak crypto, path traversal patterns. This is what "0 issues"
+    # should actually be checking against.
+    - gosec
+    # Ensure http response bodies get closed.
+    - bodyclose
+    # Ensure sql.Rows/sql.Stmt handles are closed.
+    - sqlclosecheck
+    # Catch fmt.Errorf(%s, err) drift when the callsite could use %w.
+    - errorlint
+    # Ensure context is threaded correctly (found operational bug in
+    # adversarial review).
+    - contextcheck
+
+  exclusions:
+    generated: strict
+    rules:
+      # Migration test fixtures and known-safe query builders that
+      # accept validated string args (whitelisted orderBy in
+      # internal/db/projects.go) trip gosec's G201 despite being safe.
+      # Suppress narrowly per-file rather than disabling the rule.
+      - path: internal/db/projects\.go
+        linters:
+          - gosec
+        text: "G201"
+      # False positive: "tokens" in the sort-column whitelist is a
+      # column name (total_tokens), not a credential.
+      - path: internal/db/projects\.go
+        linters:
+          - gosec
+        text: "G101"
+      # G202 in ResetAll: "DELETE FROM " + table where table comes from
+      # a hardcoded []string literal above — no user input path.
+      - path: internal/db/db\.go
+        linters:
+          - gosec
+        text: "G202"
+      # Analytics queries build SQL with fmt.Sprintf for the parquet
+      # file path (comes from config, not user input) and integer
+      # LIMIT/days — the token/session/model params ARE bound. Same
+      # pattern in export.go for directory perms.
+      - path: internal/analytics/queries\.go
+        linters:
+          - gosec
+        text: "G20[12]"
+      - path: internal/analytics/export\.go
+        linters:
+          - gosec
+        text: "G(30[126]|115)"
+      # test/integration parses files via go/parser with paths, not
+      # untrusted input — gosec's G304 false-positive.
+      - path: test/integration/.*_test\.go
+        linters:
+          - gosec
+        text: "G304"
+      # Adapters, parser, sync legitimately open files whose paths
+      # come from disk traversal — that's their whole job. G304 rings
+      # false in this context. Same for the analytics parquet layer
+      # and MCP config-driven file access.
+      - path: pkg/adapter/.*\.go
+        linters:
+          - gosec
+        text: "G304"
+      - path: pkg/parser/.*\.go
+        linters:
+          - gosec
+        text: "G304"
+      - path: internal/(sync|analytics|export|mcp|db)/.*\.go
+        linters:
+          - gosec
+        text: "G304"
+      - path: cmd/.*\.go
+        linters:
+          - gosec
+        text: "G304"
+      - path: internal/tui/.*\.go
+        linters:
+          - gosec
+        text: "G304"
+      # Test fixtures create files/dirs with dev-permissive modes so
+      # the tests can run under any UID. Not shipping code — suppress
+      # G301/G302/G306 in _test.go across the tree.
+      - path: .*_test\.go
+        linters:
+          - gosec
+        text: "G30[126]"

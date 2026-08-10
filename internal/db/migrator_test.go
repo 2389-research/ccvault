@@ -351,97 +351,124 @@ func TestMigrator_SourceColumns(t *testing.T) {
 }
 
 // TestMigrator_005_NormalizesDisplayNames verifies migration 005 backfills
-// display_name to basename(path) for rows that predate PR #22. Before that
-// PR, GetDisplayName joined the last 2–3 path components with ~home
-// substitution ("src/2389/ccvault"). After, it's filepath.Base ("ccvault").
-// Without the migration, upgrading the binary without running --full leaves
-// the DB in a mixed-format state indefinitely.
+// display_name to basename(path) for claude-code rows that predate PR #22.
+// The test simulates the real upgrade path: a database sitting at
+// schema_version=4 with legacy fixture rows, then RunMigrations to apply
+// 005 (rather than re-executing the SQL inline, which would silently pass
+// even if the migration file were empty).
 func TestMigrator_005_NormalizesDisplayNames(t *testing.T) {
 	db := openMemoryDB(t)
 	defer func() { _ = db.Close() }()
 
+	// Bring the DB up through migration 004 first, then roll schema_version
+	// back to 4 so RunMigrations re-applies 005 against our pre-seeded rows.
 	if err := RunMigrations(db); err != nil {
-		t.Fatalf("RunMigrations: %v", err)
+		t.Fatalf("initial RunMigrations: %v", err)
+	}
+	if _, err := db.Exec("DELETE FROM schema_version WHERE version >= 5"); err != nil {
+		t.Fatalf("roll back schema_version to 4: %v", err)
 	}
 
-	// Simulate a database that was populated by the old binary: display_name
-	// holds multi-segment values. Then re-run the migration SQL directly
-	// against a wider set of shapes than the fresh-DB path would exercise.
-	fixtures := []struct {
+	// Fixtures simulating what the old claude-code binary would have
+	// written: multi-segment display_names.
+	claudeCodeFixtures := []struct {
 		path         string
-		staleName    string // what old binary would have stored
-		wantBasename string // what post-migration display_name must be
+		staleName    string
+		wantBasename string
 	}{
 		{"/Users/harper/Public/src/2389/ccvault", "src/2389/ccvault", "ccvault"},
 		{"/Users/harper/p/canvas-jira-summarizer", "p/canvas-jira-summarizer", "canvas-jira-summarizer"},
 		{"/short/path", "/short/path", "path"},
 		{"/opt/proj/alpha", "proj/alpha", "alpha"},
 	}
-
-	for i, f := range fixtures {
-		_, err := db.Exec(`INSERT INTO projects (path, display_name, first_seen_at, last_activity_at)
-			VALUES (?, ?, datetime('now'), datetime('now'))`,
+	for i, f := range claudeCodeFixtures {
+		_, err := db.Exec(`INSERT INTO projects (path, display_name, first_seen_at, last_activity_at, source)
+			VALUES (?, ?, datetime('now'), datetime('now'), 'claude-code')`,
 			f.path, f.staleName)
 		if err != nil {
-			t.Fatalf("insert fixture %d: %v", i, err)
+			t.Fatalf("insert claude-code fixture %d: %v", i, err)
 		}
 	}
 
-	// The migration ran during RunMigrations at initial DB setup, but our
-	// fixtures were inserted AFTER — so they haven't been touched yet.
-	// Re-execute the migration's UPDATE to backfill them, using the exact
-	// SQL that 005 embeds.
-	migSQL := `UPDATE projects
-		SET display_name =
-			CASE
-				WHEN instr(path, '/') = 0 THEN path
-				ELSE substr(path, length(rtrim(path, replace(path, '/', ''))) + 1)
-			END
-		WHERE path IS NOT NULL
-		  AND path != ''
-		  AND path NOT LIKE '%/';`
-	if _, err := db.Exec(migSQL); err != nil {
-		t.Fatalf("apply migration SQL: %v", err)
+	// CRITICAL: fixtures from OTHER adapters. Their DisplayNames are
+	// intentional branded labels (e.g. nanoclaw's "reed"), NOT basenames of
+	// the path. Migration 005 must skip these.
+	otherAdapterFixtures := []struct {
+		path      string
+		source    string
+		labelKept string // must NOT be rewritten
+	}{
+		{"/adapters/nanoclaw/session/x", "nanoclaw", "reed"},
+		{"/adapters/hex/session/y", "hex", "Hex"},
+		{"/adapters/jeff/session/z", "jeff", "Jeff"},
+	}
+	for i, f := range otherAdapterFixtures {
+		_, err := db.Exec(`INSERT INTO projects (path, display_name, first_seen_at, last_activity_at, source)
+			VALUES (?, ?, datetime('now'), datetime('now'), ?)`,
+			f.path, f.labelKept, f.source)
+		if err != nil {
+			t.Fatalf("insert %s fixture %d: %v", f.source, i, err)
+		}
 	}
 
-	for _, f := range fixtures {
+	// Run migrations — 005 should apply to the pre-seeded rows.
+	if err := RunMigrations(db); err != nil {
+		t.Fatalf("second RunMigrations: %v", err)
+	}
+
+	// Claude-code fixtures normalized.
+	for _, f := range claudeCodeFixtures {
 		var got string
 		if err := db.QueryRow("SELECT display_name FROM projects WHERE path = ?", f.path).Scan(&got); err != nil {
 			t.Fatalf("query display_name for %s: %v", f.path, err)
 		}
 		if got != f.wantBasename {
-			t.Errorf("path=%q: display_name = %q, want %q", f.path, got, f.wantBasename)
+			t.Errorf("claude-code path=%q: display_name = %q, want %q", f.path, got, f.wantBasename)
 		}
 	}
 
-	// Guard the edge cases: empty path, trailing-slash path — these are
-	// deliberately skipped by the migration so we don't corrupt anything
-	// unexpected. Their pre-existing display_name should survive untouched.
-	edgeCases := []struct {
-		path      string
-		staleName string
-	}{
+	// Other-adapter branded labels preserved — this is the regression guard
+	// the adversarial review demanded.
+	for _, f := range otherAdapterFixtures {
+		var got string
+		if err := db.QueryRow("SELECT display_name FROM projects WHERE path = ?", f.path).Scan(&got); err != nil {
+			t.Fatalf("query display_name for %s (%s): %v", f.path, f.source, err)
+		}
+		if got != f.labelKept {
+			t.Errorf("%s adapter path=%q: display_name = %q, want %q (migration must not touch non-claude-code rows)",
+				f.source, f.path, got, f.labelKept)
+		}
+	}
+
+	// Edge cases: empty path, trailing-slash path, and claude-code rows
+	// whose staleName is somehow already a basename — all deliberately
+	// skipped or no-op by the WHERE clause. Confirm the WHERE clause is
+	// working; a broken WHERE that skips too many rows would fail the
+	// claude-code assertions above, and one that includes too many rows
+	// would fail here.
+	if _, err := db.Exec(`INSERT INTO projects (path, display_name, first_seen_at, last_activity_at, source)
+		VALUES ('', 'keep-me-empty', datetime('now'), datetime('now'), 'claude-code'),
+		       ('/foo/bar/', 'keep-me-trailing', datetime('now'), datetime('now'), 'claude-code')`); err != nil {
+		t.Fatalf("insert edge fixtures: %v", err)
+	}
+	// Re-apply by rolling back version and re-migrating — proves the WHERE
+	// still holds under re-application.
+	if _, err := db.Exec("DELETE FROM schema_version WHERE version >= 5"); err != nil {
+		t.Fatalf("roll back for edge test: %v", err)
+	}
+	if err := RunMigrations(db); err != nil {
+		t.Fatalf("third RunMigrations: %v", err)
+	}
+	for _, want := range []struct{ path, name string }{
 		{"", "keep-me-empty"},
 		{"/foo/bar/", "keep-me-trailing"},
-	}
-	for i, ec := range edgeCases {
-		_, err := db.Exec(`INSERT INTO projects (path, display_name, first_seen_at, last_activity_at)
-			VALUES (?, ?, datetime('now'), datetime('now'))`,
-			ec.path, ec.staleName)
-		if err != nil {
-			t.Fatalf("insert edge fixture %d: %v", i, err)
-		}
-	}
-	if _, err := db.Exec(migSQL); err != nil {
-		t.Fatalf("apply migration SQL (edge): %v", err)
-	}
-	for _, ec := range edgeCases {
+	} {
 		var got string
-		if err := db.QueryRow("SELECT display_name FROM projects WHERE path = ?", ec.path).Scan(&got); err != nil {
-			t.Fatalf("query display_name for edge %q: %v", ec.path, err)
+		if err := db.QueryRow("SELECT display_name FROM projects WHERE path = ?", want.path).Scan(&got); err != nil {
+			t.Fatalf("query edge %q: %v", want.path, err)
 		}
-		if got != ec.staleName {
-			t.Errorf("edge case path=%q: display_name = %q, want unchanged %q", ec.path, got, ec.staleName)
+		if got != want.name {
+			t.Errorf("edge path=%q: display_name = %q, want unchanged %q", want.path, got, want.name)
 		}
 	}
 }

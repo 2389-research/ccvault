@@ -19,6 +19,7 @@ import (
 	_ "github.com/2389-research/ccvault/pkg/adapter/nanoclaw"
 
 	"github.com/2389-research/ccvault/internal/analytics"
+	"github.com/2389-research/ccvault/internal/compact"
 	"github.com/2389-research/ccvault/internal/config"
 	"github.com/2389-research/ccvault/internal/db"
 	"github.com/2389-research/ccvault/internal/export"
@@ -477,10 +478,20 @@ Supports Gmail-like query syntax:
 		}
 
 		fmt.Printf("Found %d results:\n\n", len(results))
+		// Load projects once so adapter DisplayNames surface in results.
+		allProjects, _ := database.GetProjects("activity", 0)
+		byPath := projectref.ProjectsByPath(allProjects)
 		for i, r := range results {
 			fmt.Printf("%d. [%s] %s  Session: %s\n", i+1, r.Turn.Type, r.Turn.Timestamp.Format("2006-01-02 15:04"), r.Turn.SessionID)
-			// Class B — combined form so same-basename projects don't look identical
-			fmt.Printf("   Project: %s\n", projectref.Inline(&models.Project{Path: r.ProjectPath}))
+			// Class B — combined form so same-basename projects don't look identical.
+			// Look up the full project so adapter DisplayName is preserved.
+			var p *models.Project
+			if hit, ok := byPath[r.ProjectPath]; ok {
+				p = hit
+			} else {
+				p = &models.Project{Path: r.ProjectPath}
+			}
+			fmt.Printf("   Project: %s\n", projectref.Inline(p))
 			if r.Model != "" {
 				fmt.Printf("   Model: %s\n", r.Model)
 			}
@@ -601,7 +612,8 @@ var listProjectsCmd = &cobra.Command{
 		if jsonOutput {
 			enc := json.NewEncoder(os.Stdout)
 			enc.SetIndent("", "  ")
-			return enc.Encode(projects)
+			// Class C — Ref shape via projectref so agents see {name, path}.
+			return enc.Encode(projectref.EnrichedRefsFromValues(projects))
 		}
 
 		if len(projects) == 0 {
@@ -609,26 +621,25 @@ var listProjectsCmd = &cobra.Command{
 			return nil
 		}
 
-		home, _ := os.UserHomeDir()
-
-		fmt.Printf("%-30s %-40s %8s %10s %12s\n", "PROJECT", "PATH", "SESSIONS", "TOKENS", "LAST ACTIVE")
-		fmt.Println(strings.Repeat("-", 105))
+		// Route CLI cell rendering through compact so wide paths get
+		// smart initialing (via segment initialing) rather than "..." +
+		// tail truncation. Widths chosen to fit an 80-col terminal:
+		// 20+28+8+10+10 = 76 + 4 seps = 80.
+		fmt.Printf("%s %s %8s %10s %10s\n",
+			padVisualCLI("PROJECT", 20),
+			padVisualCLI("PATH", 28),
+			"SESSIONS", "TOKENS", "ACTIVE")
+		fmt.Println(strings.Repeat("-", 80))
 		for i := range projects {
 			p := &projects[i]
-			// Class A — Label for the short column, Path in its own column
-			name := projectref.Label(p)
-			if len(name) > 28 {
-				name = "..." + name[len(name)-25:]
-			}
-			path := p.Path
-			if home != "" && (path == home || strings.HasPrefix(path, home+string(os.PathSeparator))) {
-				path = "~" + path[len(home):]
-			}
-			if len(path) > 38 {
-				path = "..." + path[len(path)-35:]
-			}
-			lastActive := p.LastActivityAt.Format("2006-01-02")
-			fmt.Printf("%-30s %-40s %8d %10s %12s\n", name, path, p.SessionCount, formatTokens(p.TotalTokens), lastActive)
+			// Class A — Label for the short column, compact.Path for the path.
+			nameText := compact.Truncate(projectref.Label(p), 20).Text
+			pathText := compact.Path(p.Path, 28).Text
+			lastActive := compact.Date(p.LastActivityAt, 10).Text
+			fmt.Printf("%s %s %8d %10s %10s\n",
+				padVisualCLI(nameText, 20),
+				padVisualCLI(pathText, 28),
+				p.SessionCount, formatTokens(p.TotalTokens), lastActive)
 		}
 
 		return nil
@@ -696,7 +707,10 @@ var listSessionsCmd = &cobra.Command{
 		if jsonOutput {
 			enc := json.NewEncoder(os.Stdout)
 			enc.SetIndent("", "  ")
-			return enc.Encode(sessions)
+			// Class C — enrich with project_name so agents get the
+			// doctrine {name, path} shape on session objects.
+			allProjects, _ := database.GetProjects("activity", 0)
+			return enc.Encode(projectref.SessionRefsFromValues(sessions, projectref.ProjectsByID(allProjects)))
 		}
 
 		if len(sessions) == 0 {
@@ -707,6 +721,13 @@ var listSessionsCmd = &cobra.Command{
 		// PROJECT column is redundant when the list is already filtered to
 		// one project — mirror the TUI's showProject := m.project == nil.
 		showProject := projectFilter == ""
+		// Load projects once so adapter DisplayNames (jeff/hex/nanoclaw)
+		// surface in the PROJECT column.
+		var byPath map[string]*models.Project
+		if showProject {
+			allProjects, _ := database.GetProjects("activity", 0)
+			byPath = projectref.ProjectsByPath(allProjects)
+		}
 		if showProject {
 			fmt.Printf("%-38s %-25s %16s %6s %10s %s\n", "SESSION ID", "PROJECT", "STARTED", "TURNS", "TOKENS", "MODEL")
 			fmt.Println(strings.Repeat("-", 125))
@@ -721,11 +742,9 @@ var listSessionsCmd = &cobra.Command{
 			}
 			tokens := s.InputTokens + s.OutputTokens
 			if showProject {
-				// Class A — short label in a table column. Session ID
-				// column already disambiguates rows; same-basename
-				// projects render identically here and that's acceptable.
-				// Users who care can filter with --project <path>.
-				project := projectref.Label(&models.Project{Path: s.ProjectPath})
+				// Class A — LabelFromPath surfaces adapter DisplayName
+				// instead of falling through to basename.
+				project := projectref.LabelFromPath(s.ProjectPath, byPath)
 				if len(project) > 23 {
 					project = "..." + project[len(project)-20:]
 				}
@@ -1047,4 +1066,19 @@ func formatTokens(n int64) string {
 		return fmt.Sprintf("%.1fK", float64(n)/1_000)
 	}
 	return fmt.Sprintf("%d", n)
+}
+
+// padVisualCLI left-pads s to visual column width using rune count.
+// Mirrors internal/tui.padVisual — sprintf's %-Ns pads by bytes and
+// would misalign columns when compact.* returns strings containing "…"
+// (3 bytes / 1 col) or non-ASCII path segments.
+func padVisualCLI(s string, width int) string {
+	visW := 0
+	for range s {
+		visW++
+	}
+	if visW >= width {
+		return s
+	}
+	return s + strings.Repeat(" ", width-visW)
 }

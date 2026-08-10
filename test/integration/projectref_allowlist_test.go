@@ -9,6 +9,7 @@ import (
 	"go/token"
 	"io/fs"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -106,7 +107,7 @@ func TestProjectRefEnforcement(t *testing.T) {
 			// projectref, or add themselves to the allowlist with a
 			// justification in review.
 			pos := fset.Position(sel.Pos())
-			violations = append(violations, rel+":"+intToStr(pos.Line))
+			violations = append(violations, rel+":"+strconv.Itoa(pos.Line))
 			return true
 		})
 		return nil
@@ -145,24 +146,4 @@ func findRepoRoot(t *testing.T) string {
 		t.Fatalf("cwd: %v", err)
 	}
 	return filepath.Dir(filepath.Dir(cwd))
-}
-
-func intToStr(n int) string {
-	// Avoid strconv import — the file already has plenty.
-	if n == 0 {
-		return "0"
-	}
-	var digits []byte
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	for n > 0 {
-		digits = append([]byte{byte('0' + n%10)}, digits...)
-		n /= 10
-	}
-	if neg {
-		digits = append([]byte{'-'}, digits...)
-	}
-	return string(digits)
 }

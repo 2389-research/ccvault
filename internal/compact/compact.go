@@ -45,6 +45,23 @@ import (
 // still overflow maxWidth after "compaction".
 func visLen(s string) int { return utf8.RuneCountInString(s) }
 
+// runeSlice returns the first n runes of s as a string. Guards against
+// the "byte-slice a UTF-8 string" bug that produces mojibake and
+// invalid codepoints — a source name like "αβγδε" byte-sliced to [:3]
+// yields "\xce\xb1\xce" (invalid UTF-8), whereas rune-slice to 3
+// correctly yields "αβγ". Returns s unchanged when n is >= its rune
+// count so callers can chain unconditionally.
+func runeSlice(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if n >= len(runes) {
+		return s
+	}
+	return string(runes[:n])
+}
+
 // Result carries the compacted text plus a flag saying whether any
 // compaction happened. TUI callers style the cell (dim) when Shortened
 // is true so users know to look for the fuller form elsewhere.
@@ -123,15 +140,21 @@ func Path(path string, maxWidth int) Result {
 	return shortened(truncateFromLeft(allInit, maxWidth))
 }
 
-// initialParts joins parts with "/", keeping only the first character of
-// each part BEFORE preservePastIdx (in [0, len(parts)]). Empty parts and
-// "~" are preserved as-is regardless of position — they carry structural
-// meaning that a one-letter form can't.
+// initialParts joins parts with "/", keeping only the first RUNE of
+// each part BEFORE preservePastIdx (in [0, len(parts)]). Empty parts
+// and "~" are preserved as-is regardless of position — they carry
+// structural meaning that a one-letter form can't.
+//
+// Rune-based first-character extraction so multi-byte segments (e.g.
+// paths with Cyrillic, CJK, or emoji) produce a valid single-glyph
+// initial rather than a mojibake byte prefix — /Users/user/Ярослав/repo
+// initialed to ~/U/u/Я/repo, not ~/U/u/Ð/repo.
 func initialParts(parts []string, preservePastIdx int) string {
 	out := make([]string, len(parts))
 	for i, p := range parts {
-		if i < preservePastIdx && len(p) > 1 && p != "~" && p != "" {
-			out[i] = string(p[0])
+		if i < preservePastIdx && visLen(p) > 1 && p != "~" && p != "" {
+			first, _ := utf8.DecodeRuneInString(p)
+			out[i] = string(first)
 		} else {
 			out[i] = p
 		}
@@ -180,22 +203,22 @@ func Source(source string, maxWidth int) Result {
 			return shortened("cx")
 		}
 	case "hex":
-		// Already short; only truncate if width is truly tiny.
-		if maxWidth >= 1 {
-			return shortened(source[:maxWidth])
-		}
+		// Already short; only truncate if width is truly tiny. Rune-based
+		// slice — "hex" is ASCII so this is trivially correct, but stay
+		// consistent so this branch survives if someone later renames it.
+		return shortened(runeSlice(source, maxWidth))
 	case "jeff":
-		if maxWidth >= 1 {
-			return shortened(source[:maxWidth])
-		}
+		return shortened(runeSlice(source, maxWidth))
 	}
 
 	// Unknown adapter: end-truncate with "…" so nothing gets mapped to a
-	// wrong shorthand.
+	// wrong shorthand. Rune-based slice — a source name like "αβγδε"
+	// (10 bytes / 5 runes) at maxWidth 4 must NOT byte-slice; that would
+	// produce an invalid UTF-8 sequence.
 	if maxWidth <= 1 {
 		return shortened("…")
 	}
-	return shortened(source[:maxWidth-1] + "…")
+	return shortened(runeSlice(source, maxWidth-1) + "…")
 }
 
 // Model shortens a model identifier. Only performs semantically SAFE
