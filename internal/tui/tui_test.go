@@ -485,3 +485,133 @@ func TestSearchModel_VimNavIgnoredWhileFocused(t *testing.T) {
 		t.Errorf("unfocused: 'g' did not jump to top, cursor = %d, want 0", m.cursor)
 	}
 }
+
+// --- Follow-up 8: narrow-terminal layout tiers ---------------------------
+
+// stripANSI removes ANSI escape sequences so we can measure visible
+// column width. Rendering fills each terminal cell; we care about how
+// many columns those cells span in the actual output, not how many
+// bytes the styled string carries.
+func stripANSI(s string) string {
+	var out strings.Builder
+	inEscape := false
+	for _, r := range s {
+		if inEscape {
+			if r == 'm' {
+				inEscape = false
+			}
+			continue
+		}
+		if r == '\x1b' {
+			inEscape = true
+			continue
+		}
+		out.WriteRune(r)
+	}
+	return out.String()
+}
+
+// widestRowVisible returns the max visible-column width of any row in
+// the rendered view, ignoring ANSI escapes.
+func widestRowVisible(view string) int {
+	max := 0
+	for _, line := range strings.Split(view, "\n") {
+		w := 0
+		for range stripANSI(line) {
+			w++
+		}
+		if w > max {
+			max = w
+		}
+	}
+	return max
+}
+
+// TestProjectsModel_ViewFitsAt80Cols guards follow-up 8: the Projects
+// list must not overflow an 80-column terminal. Before the compaction
+// discipline landed, the header alone was ~103 chars.
+func TestProjectsModel_ViewFitsAt80Cols(t *testing.T) {
+	database := openTUITestDB(t)
+	now := time.Now().UTC()
+	// A path with several segments that would blow past a naive
+	// truncation but should compress via segment initialing.
+	_, err := database.Exec(`INSERT INTO projects
+		(path, display_name, first_seen_at, last_activity_at, session_count, total_tokens, source)
+		VALUES (?, ?, ?, ?, 5, 12345, 'claude-code')`,
+		"/Users/dylan/work/2389/deep/nested/ccvault", "ccvault", now, now)
+	if err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+
+	m := NewProjectsModel(database)
+	msg := m.loadProjects()
+	loaded, ok := msg.(projectsLoadedMsg)
+	if !ok {
+		t.Fatalf("expected projectsLoadedMsg, got %T", msg)
+	}
+	m.Update(loaded)
+	m.SetSize(80, 30)
+
+	view := m.View()
+
+	if got := widestRowVisible(view); got > 80 {
+		t.Errorf("Projects view widest row = %d cols at 80-col terminal, want ≤ 80\n%s", got, view)
+	}
+	// Still should mention the project label somewhere.
+	if !strings.Contains(view, "ccvault") {
+		t.Errorf("view missing project label 'ccvault':\n%s", view)
+	}
+}
+
+// TestSessionsModel_ViewFitsAt80Cols is the sessions counterpart.
+func TestSessionsModel_ViewFitsAt80Cols(t *testing.T) {
+	database := openTUITestDB(t)
+	_, _ = seedProjectAndSessions(t, database, []string{"claude-code"})
+
+	m := NewSessionsModel(database)
+	msg := m.loadSessions()
+	loaded, ok := msg.(sessionsLoadedMsg)
+	if !ok {
+		t.Fatalf("expected sessionsLoadedMsg, got %T", msg)
+	}
+	m.Update(loaded)
+	m.SetSize(80, 30)
+
+	view := m.View()
+
+	if got := widestRowVisible(view); got > 80 {
+		t.Errorf("Sessions view widest row = %d cols at 80-col terminal, want ≤ 80\n%s", got, view)
+	}
+}
+
+// TestProjectsModel_ViewShowsFullPathWhenRoomy is the opposite side of
+// the compaction discipline — when the terminal has enough columns, we
+// must NOT prematurely compress the path. Users should see the fullest
+// form their terminal can hold.
+func TestProjectsModel_ViewShowsFullPathWhenRoomy(t *testing.T) {
+	database := openTUITestDB(t)
+	now := time.Now().UTC()
+	// A 24-char path that fits within the tier-0 PATH budget (30 cols).
+	// Realistic length for a typical user project directory.
+	longPath := "/opt/proj/team/ccvault"
+	_, err := database.Exec(`INSERT INTO projects
+		(path, display_name, first_seen_at, last_activity_at, session_count, total_tokens, source)
+		VALUES (?, ?, ?, ?, 1, 100, 'claude-code')`,
+		longPath, "ccvault", now, now)
+	if err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+
+	m := NewProjectsModel(database)
+	msg := m.loadProjects()
+	loaded, _ := msg.(projectsLoadedMsg)
+	m.Update(loaded)
+	m.SetSize(140, 30)
+
+	view := m.View()
+
+	// At 140 cols, the full path should appear (no aggressive initialing).
+	if !strings.Contains(view, longPath) {
+		t.Errorf("Projects view at 140 cols did not show full path %q:\n%s", longPath, view)
+	}
+}

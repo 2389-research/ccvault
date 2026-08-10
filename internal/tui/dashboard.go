@@ -5,11 +5,11 @@ package tui
 
 import (
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/2389-research/ccvault/internal/compact"
 	"github.com/2389-research/ccvault/internal/db"
 	"github.com/2389-research/ccvault/internal/projectref"
 	"github.com/2389-research/ccvault/pkg/models"
@@ -204,26 +204,27 @@ func (m *DashboardModel) View() string {
 	}
 	b.WriteString("\n")
 
-	// Top projects
+	// Top projects — dashboard is compact so we use tighter budgets than
+	// the full Projects list. Both cells route through compact so the
+	// row visibly signals when values have been shortened.
 	if len(m.topProjects) > 0 {
-		home, _ := os.UserHomeDir()
 		b.WriteString(lipgloss.NewStyle().Bold(true).Render("Recent Projects"))
 		b.WriteString("\n")
+
+		// Allocate slightly less than the full Projects list because the
+		// dashboard mixes several sections; leave breathing room.
+		nameW, pathW := 22, 32
+		if m.width >= 100 {
+			nameW, pathW = 24, 37
+		} else if m.width < 80 {
+			nameW, pathW = 18, 22
+		}
+
 		for i := range m.topProjects {
 			p := m.topProjects[i]
-			// Class A — Label for the short column
-			name := projectref.Label(&p)
-			if len(name) > 22 {
-				name = "..." + name[len(name)-19:]
-			}
-			path := p.Path
-			if home != "" && (path == home || strings.HasPrefix(path, home+string(os.PathSeparator))) {
-				path = "~" + path[len(home):]
-			}
-			if len(path) > 35 {
-				path = "..." + path[len(path)-32:]
-			}
-			b.WriteString(normalStyle.Render(fmt.Sprintf("  %-24s %-37s %3d sessions", name, path, p.SessionCount)))
+			nameCell := cellText(compact.Truncate(projectref.Label(&p), nameW), nameW)
+			pathCell := cellText(compact.Path(p.Path, pathW), pathW)
+			b.WriteString(normalStyle.Render(fmt.Sprintf("  %s %s %3d sessions", nameCell, pathCell, p.SessionCount)))
 			b.WriteString("\n")
 		}
 		b.WriteString("\n")

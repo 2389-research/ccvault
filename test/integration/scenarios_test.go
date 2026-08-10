@@ -53,6 +53,13 @@ var scenarioCoverage = map[string]string{
 	"projectref-class-d-input-matching": "internal/projectref TestResolveAll_*",
 	"projectref-ast-allowlist-enforced": "test/integration TestProjectRefEnforcement",
 	"list-projects-sort-tiebreaker":     "internal/db TestGetProjects_SortStableTiebreaker",
+	// PR #22 follow-up 8: width-aware compaction
+	"compact-path-progressive-initialing":      "internal/compact TestPath_*",
+	"compact-model-never-drops-datestamp":      "internal/compact TestModel_NeverDropsTrailingDatestamp",
+	"compact-source-ladder":                    "internal/compact TestSource_*",
+	"compact-shortened-signals-tui-cell-style": "internal/compact TestPath_InitialsIntermediateSegmentsWhenTight (Shortened=true) + internal/tui TestProjectsModel_ViewFitsAt80Cols",
+	"tui-projects-fits-at-80-cols":             "internal/tui TestProjectsModel_ViewFitsAt80Cols + TestSessionsModel_ViewFitsAt80Cols",
+	"tui-shows-full-form-when-roomy":           "internal/tui TestProjectsModel_ViewShowsFullPathWhenRoomy",
 }
 
 func TestScenariosHaveCoverage(t *testing.T) {

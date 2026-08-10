@@ -32,10 +32,10 @@ package projectref
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/2389-research/ccvault/internal/compact"
 	"github.com/2389-research/ccvault/pkg/models"
 )
 
@@ -70,7 +70,7 @@ func Inline(p *models.Project) string {
 	if p.Path == "" {
 		return name
 	}
-	path := tildeAbbreviate(p.Path)
+	path := compact.Tilde(p.Path)
 	if name == "" || name == filepath.Base(p.Path) {
 		// Degenerate case: label is just the basename, so "name (path)"
 		// would repeat the basename. Show the path alone, which already
@@ -124,21 +124,4 @@ func ResolveAll(projects []models.Project, filter string) []models.Project {
 		}
 	}
 	return out
-}
-
-// tildeAbbreviate rewrites paths under $HOME as "~/rest". The separator
-// boundary check prevents /Users/dyl from rewriting /Users/dylan/x into
-// "~an/x" — that's the bug fresh-eyes review caught in PR #22.
-func tildeAbbreviate(path string) string {
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
-		return path
-	}
-	if path == home {
-		return "~"
-	}
-	if strings.HasPrefix(path, home+string(os.PathSeparator)) {
-		return "~" + path[len(home):]
-	}
-	return path
 }

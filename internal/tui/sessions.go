@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/2389-research/ccvault/internal/compact"
 	"github.com/2389-research/ccvault/internal/db"
 	"github.com/2389-research/ccvault/internal/projectref"
 	"github.com/2389-research/ccvault/pkg/models"
@@ -160,15 +161,25 @@ func (m *SessionsModel) View() string {
 		b.WriteString(normalStyle.Render("No sessions found."))
 		b.WriteString("\n")
 	} else {
-		// Header — show project column when not filtered to a specific project
 		showProject := m.project == nil
-		var header string
-		if showProject {
-			header = fmt.Sprintf("%-22s %-20s %-12s %6s %10s %-30s", "PROJECT", "STARTED", "SOURCE", "TURNS", "TOKENS", "MODEL")
-		} else {
-			header = fmt.Sprintf("%-20s %-12s %6s %10s %-30s", "STARTED", "SOURCE", "TURNS", "TOKENS", "MODEL")
+		layout := pickSessionsLayout(m.width, showProject)
+
+		// Build the header from the layout — same set of cells shown in
+		// the rows, so tier decisions carry through automatically.
+		var headerParts []string
+		if layout.Project > 0 {
+			headerParts = append(headerParts, padVisual("PROJECT", layout.Project))
 		}
-		b.WriteString(headerStyle.Render(header))
+		headerParts = append(headerParts, padVisual("STARTED", layout.Started))
+		if layout.Source > 0 {
+			headerParts = append(headerParts, padVisual("SOURCE", layout.Source))
+		}
+		headerParts = append(headerParts,
+			padVisual("TURNS", layout.Turns),
+			padVisual("TOKENS", layout.Tokens),
+			padVisual("MODEL", layout.Model),
+		)
+		b.WriteString(headerStyle.Render(strings.Join(headerParts, " ")))
 		b.WriteString("\n")
 
 		// List
@@ -180,41 +191,33 @@ func (m *SessionsModel) View() string {
 
 		for i := m.offset; i < end; i++ {
 			s := m.sessions[i]
-			model := s.Model
-			if len(model) > 28 {
-				model = model[:25] + "..."
-			}
 			tokens := s.InputTokens + s.OutputTokens
 
-			source := s.Source
-			if len(source) > 10 {
-				source = source[:10] + ".."
-			}
-
-			var line string
-			if showProject {
-				// Class A — short label; session cell has its own row
-				// identifiers, same-basename ambiguity is acceptable here.
+			var parts []string
+			if layout.Project > 0 {
 				project := projectref.Label(&models.Project{Path: s.ProjectPath})
-				if len(project) > 20 {
-					project = "..." + project[len(project)-17:]
-				}
-				line = fmt.Sprintf("%-22s %-20s %-12s %6d %10s %-30s",
-					project,
-					s.StartedAt.Format("2006-01-02 15:04"),
-					source,
-					s.TurnCount,
-					formatTokensPlain(tokens),
-					model)
-			} else {
-				line = fmt.Sprintf("%-20s %-12s %6d %10s %-30s",
-					s.StartedAt.Format("2006-01-02 15:04"),
-					source,
-					s.TurnCount,
-					formatTokensPlain(tokens),
-					model)
+				parts = append(parts, cellText(compact.Truncate(project, layout.Project), layout.Project))
 			}
+			// STARTED — date + time in a single cell. Renders differently
+			// based on how much space we've been given.
+			startedText := s.StartedAt.Format("2006-01-02 15:04")
+			if layout.Started < len(startedText) {
+				// Drop the time to fit
+				startedText = compact.Date(s.StartedAt, layout.Started).Text
+				parts = append(parts, cellText(compact.Result{Text: startedText, Shortened: true}, layout.Started))
+			} else {
+				parts = append(parts, padVisual(startedText, layout.Started))
+			}
+			if layout.Source > 0 {
+				parts = append(parts, cellText(compact.Source(s.Source, layout.Source), layout.Source))
+			}
+			parts = append(parts,
+				padVisual(fmt.Sprintf("%d", s.TurnCount), layout.Turns),
+				padVisual(formatTokensPlain(tokens), layout.Tokens),
+				cellText(compact.Model(s.Model, layout.Model), layout.Model),
+			)
 
+			line := strings.Join(parts, " ")
 			if i == m.cursor {
 				b.WriteString(selectedStyle.Render(line))
 			} else {

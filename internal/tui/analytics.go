@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/2389-research/ccvault/internal/analytics"
+	"github.com/2389-research/ccvault/internal/compact"
 	"github.com/2389-research/ccvault/internal/db"
 	"github.com/2389-research/ccvault/internal/projectref"
 	"github.com/2389-research/ccvault/pkg/models"
@@ -368,13 +369,23 @@ func (m *AnalyticsModel) renderTopProjects() string {
 		return dimStyle.Render("No project data available")
 	}
 
-	home, _ := os.UserHomeDir()
+	// Column budgets adapt slightly to width — analytics has a bar column
+	// that eats space, so we're conservative.
+	nameW, pathW := 22, 28
+	if m.width >= 100 {
+		nameW, pathW = 24, 30
+	} else if m.width < 80 {
+		nameW, pathW = 18, 22
+	}
 
 	var lines []string
 
 	// Header
-	header := fmt.Sprintf("%4s %-24s %-30s %8s %12s %12s",
-		"#", "Project", "Path", "Sessions", "Tokens", "Last Active")
+	header := fmt.Sprintf("%4s %s %s %8s %12s %12s",
+		"#",
+		padVisual("Project", nameW),
+		padVisual("Path", pathW),
+		"Sessions", "Tokens", "Last Active")
 	lines = append(lines, lipgloss.NewStyle().Bold(true).Render(header))
 	lines = append(lines, strings.Repeat("─", 96))
 
@@ -387,23 +398,15 @@ func (m *AnalyticsModel) renderTopProjects() string {
 	}
 
 	for i, p := range m.topProjects {
-		// Class A — Label for the short column, path in its own column
-		name := projectref.Label(&models.Project{Path: p.ProjectPath})
-		if len(name) > 22 {
-			name = "..." + name[len(name)-19:]
-		}
-		path := p.ProjectPath
-		if home != "" && (path == home || strings.HasPrefix(path, home+string(os.PathSeparator))) {
-			path = "~" + path[len(home):]
-		}
-		if len(path) > 28 {
-			path = "..." + path[len(path)-25:]
-		}
+		// Class A — Label + Path go through compact so cells signal
+		// when they've been abbreviated at this width.
+		nameCell := cellText(compact.Truncate(projectref.Label(&models.Project{Path: p.ProjectPath}), nameW), nameW)
+		pathCell := cellText(compact.Path(p.ProjectPath, pathW), pathW)
 		bar := renderBar(p.TotalTokens, maxTokens, 10)
-		row := fmt.Sprintf("%4d %-24s %-30s %8d %12s %12s %s",
+		row := fmt.Sprintf("%4d %s %s %8d %12s %12s %s",
 			i+1,
-			name,
-			path,
+			nameCell,
+			pathCell,
 			p.SessionCount,
 			formatCompact(p.TotalTokens),
 			p.LastActive.Format("Jan 02"),
