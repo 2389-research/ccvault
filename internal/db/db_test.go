@@ -779,3 +779,77 @@ func TestResetAll_ClearsDataAndPreservesSchema(t *testing.T) {
 		t.Errorf("post-reset search: got %d results, want 1 (FTS trigger should still fire)", len(results))
 	}
 }
+
+// TestResetAll_IsAtomicOnMidResetFailure guards the transactional guarantee
+// added as follow-up 3 of PR #22 review. If a DELETE mid-way through
+// ResetAll fails (disk full, SIGKILL, SQLITE_BUSY on a concurrent write),
+// the whole reset must roll back — leaving the DB in its pre-reset state
+// rather than half-cleared with inconsistent turn_count / session_count
+// aggregates.
+//
+// We simulate the failure by dropping one of the tables ResetAll DELETEs
+// from RIGHT BEFORE calling it. The DELETE against the missing table
+// errors, and the transaction rolls back all preceding DELETEs.
+func TestResetAll_IsAtomicOnMidResetFailure(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	p := &models.Project{Path: "/proj/atomic", DisplayName: "atomic"}
+	if err := db.UpsertProject(p); err != nil {
+		t.Fatalf("upsert project: %v", err)
+	}
+	s := &models.Session{
+		ID:         "session-atomic",
+		ProjectID:  p.ID,
+		StartedAt:  time.Now(),
+		SourceFile: "/proj/atomic/session.jsonl",
+	}
+	if err := db.UpsertSession(s); err != nil {
+		t.Fatalf("upsert session: %v", err)
+	}
+	if err := db.InsertTurns([]models.Turn{{
+		ID:        "turn-atomic",
+		SessionID: s.ID,
+		Type:      "user",
+		Timestamp: time.Now(),
+		Content:   "atomic content",
+	}}); err != nil {
+		t.Fatalf("insert turn: %v", err)
+	}
+
+	countRows := func(table string) int {
+		var n int
+		if err := db.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&n); err != nil {
+			t.Fatalf("count %s: %v", table, err)
+		}
+		return n
+	}
+	// Baseline: turns has 1, projects has 1, tool_uses has 0.
+	for tbl, want := range map[string]int{"tool_uses": 0, "turns": 1, "projects": 1} {
+		if got := countRows(tbl); got != want {
+			t.Fatalf("baseline %s = %d, want %d", tbl, got, want)
+		}
+	}
+
+	// Sabotage the third table ResetAll touches. Order in ResetAll is
+	// tool_uses, turns, sessions, projects, source_files — so dropping
+	// sessions makes ResetAll fail AFTER tool_uses and turns are DELETEd
+	// inside the tx. Without the transaction wrapper, tool_uses and turns
+	// would stay empty; with the wrapper, they roll back.
+	if _, err := db.Exec("DROP TABLE sessions"); err != nil {
+		t.Fatalf("sabotage sessions table: %v", err)
+	}
+
+	if err := db.ResetAll(); err == nil {
+		t.Fatal("ResetAll should fail when the sessions table has been dropped")
+	}
+
+	// tool_uses, turns, projects must be in their pre-ResetAll state.
+	// Without WithTx, tool_uses would be 0 (it always was) but turns
+	// would ALSO be 0 — the partial-reset regression this test catches.
+	for tbl, want := range map[string]int{"tool_uses": 0, "turns": 1, "projects": 1} {
+		if got := countRows(tbl); got != want {
+			t.Errorf("post-failed-ResetAll %s = %d, want %d (transaction should have rolled back)", tbl, got, want)
+		}
+	}
+}

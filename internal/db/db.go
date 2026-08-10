@@ -75,17 +75,24 @@ func (db *DB) Close() error {
 // Schema (tables, triggers, FTS index) is left in place — migrations own
 // its lifecycle. Deleting turns cascades to turns_fts via the AFTER DELETE
 // trigger, so no FTS drop is needed here.
+//
+// The five DELETEs run inside a single transaction so mid-reset failure
+// (disk full, SIGKILL, SQLITE_BUSY on a WAL-mode writer collision) rolls
+// back to the pre-reset state. Otherwise a partial reset would leave
+// tool_uses empty but turns still populated, and the per-session /
+// per-project aggregate counters would silently drift from row counts.
 func (db *DB) ResetAll() error {
 	// Delete data in child-to-parent order so foreign-key-like invariants hold
 	// (turns before sessions, sessions before projects, etc.)
 	tables := []string{"tool_uses", "turns", "sessions", "projects", "source_files"}
-	for _, table := range tables {
-		if _, err := db.Exec("DELETE FROM " + table); err != nil {
-			return fmt.Errorf("delete from %s: %w", table, err)
+	return db.WithTx(func(tx *sql.Tx) error {
+		for _, table := range tables {
+			if _, err := tx.Exec("DELETE FROM " + table); err != nil {
+				return fmt.Errorf("delete from %s: %w", table, err)
+			}
 		}
-	}
-
-	return nil
+		return nil
+	})
 }
 
 // BeginTx starts a new transaction
