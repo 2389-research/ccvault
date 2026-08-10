@@ -39,6 +39,13 @@ var scenarioCoverage = map[string]string{
 	"list-sessions-pagination-hint":  "internal/mcp TestListSessions_ReportsHasMore",
 	"orient-warns-on-stat-failure":   "cmd/ccvault TestGatherOrientation_CollectsWarningsOnFailure",
 	"analytics-unavailable-hint":     "internal/mcp TestGetAnalytics_ReportsUnavailableAnalytics",
+	// PR #22 (beau): --full sync fix + display improvements
+	"full-sync-clears-stale-data":             "internal/db TestResetAll_ClearsDataAndPreservesSchema + internal/sync TestSyncer_FullFlagClearsStaleData",
+	"incremental-sync-preserves-stale-rows":   "internal/sync TestSyncer_IncrementalDoesNotClear",
+	"display-name-is-basename":                "pkg/parser TestGetDisplayName",
+	"tui-projects-shows-path-column":          "internal/tui TestProjectsModel_ViewShowsPathColumn",
+	"tui-sessions-conditional-project-column": "internal/tui TestSessionsModel_ViewShowsProjectColumnWhenUnfiltered + TestSessionsModel_ViewOmitsProjectColumnWhenFiltered",
+	"tui-search-vim-nav-respects-focus":       "internal/tui TestSearchModel_VimNavIgnoredWhileFocused",
 }
 
 func TestScenariosHaveCoverage(t *testing.T) {

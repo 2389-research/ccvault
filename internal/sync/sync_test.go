@@ -345,3 +345,131 @@ func TestOptionsApply(t *testing.T) {
 		t.Error("count progress callback not called")
 	}
 }
+
+// TestSyncer_FullFlagClearsStaleData is the integration test for the --full
+// bug fix from PR #22. Without ResetAll(), running --full against a source
+// where files have been renamed or removed leaves the old rows behind and
+// the DB drifts from the source of truth. With ResetAll(), --full wipes
+// the archive so re-scanning produces a clean state.
+func TestSyncer_FullFlagClearsStaleData(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	claudeHome, err := os.MkdirTemp("", "claude-home-full-*")
+	if err != nil {
+		t.Fatalf("create claude home: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(claudeHome) }()
+
+	// First sync: one session that we'll later "delete" from disk to simulate
+	// a rename/removal upstream.
+	writeTestSession(t, claudeHome, "aaaaaaaa-1111-2222-3333-444444444444", "-Users-test-old-project")
+	sources := []config.SourceConfig{
+		{Name: "claude-code", Type: "claude-code", Path: claudeHome},
+	}
+
+	first := New(database, sources)
+	stats1, err := first.Run()
+	if err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	if stats1.SessionsIndexed != 1 {
+		t.Fatalf("first sync: SessionsIndexed = %d, want 1", stats1.SessionsIndexed)
+	}
+
+	var beforeSessions, beforeProjects int
+	if err := database.QueryRow("SELECT COUNT(*) FROM sessions").Scan(&beforeSessions); err != nil {
+		t.Fatalf("count sessions before: %v", err)
+	}
+	if err := database.QueryRow("SELECT COUNT(*) FROM projects").Scan(&beforeProjects); err != nil {
+		t.Fatalf("count projects before: %v", err)
+	}
+	if beforeSessions != 1 || beforeProjects != 1 {
+		t.Fatalf("pre-condition: sessions=%d projects=%d, want 1/1", beforeSessions, beforeProjects)
+	}
+
+	// Simulate the upstream state changing: the old project directory is
+	// removed and a new one takes its place.
+	if err := os.RemoveAll(filepath.Join(claudeHome, "projects", "-Users-test-old-project")); err != nil {
+		t.Fatalf("remove old project dir: %v", err)
+	}
+	writeTestSession(t, claudeHome, "bbbbbbbb-5555-6666-7777-888888888888", "-Users-test-new-project")
+
+	// Full sync: should wipe the old session/project and index the new one.
+	full := New(database, sources, WithFullSync(true))
+	stats2, err := full.Run()
+	if err != nil {
+		t.Fatalf("full sync: %v", err)
+	}
+	if stats2.SessionsIndexed != 1 {
+		t.Errorf("full sync SessionsIndexed = %d, want 1", stats2.SessionsIndexed)
+	}
+
+	var afterSessions, afterProjects int
+	if err := database.QueryRow("SELECT COUNT(*) FROM sessions").Scan(&afterSessions); err != nil {
+		t.Fatalf("count sessions after: %v", err)
+	}
+	if err := database.QueryRow("SELECT COUNT(*) FROM projects").Scan(&afterProjects); err != nil {
+		t.Fatalf("count projects after: %v", err)
+	}
+	// Must be exactly 1 of each — the old rows are gone, only the new session survives.
+	if afterSessions != 1 {
+		t.Errorf("sessions after full sync = %d, want 1 (old row should be gone)", afterSessions)
+	}
+	if afterProjects != 1 {
+		t.Errorf("projects after full sync = %d, want 1 (old row should be gone)", afterProjects)
+	}
+
+	// The one surviving session must be the new one, not the old one.
+	var surviving string
+	if err := database.QueryRow("SELECT id FROM sessions").Scan(&surviving); err != nil {
+		t.Fatalf("read surviving session: %v", err)
+	}
+	if surviving != "bbbbbbbb-5555-6666-7777-888888888888" {
+		t.Errorf("surviving session = %q, want bbbbbbbb-... (old session should have been wiped)", surviving)
+	}
+}
+
+// TestSyncer_IncrementalDoesNotClear guards against the opposite regression:
+// an ordinary (non-full) sync must NOT invoke ResetAll and must preserve
+// rows that no longer have a corresponding source file (e.g. a user briefly
+// moved their ~/.claude to another disk). Only --full is destructive.
+func TestSyncer_IncrementalDoesNotClear(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	claudeHome, err := os.MkdirTemp("", "claude-home-incr-*")
+	if err != nil {
+		t.Fatalf("create claude home: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(claudeHome) }()
+
+	writeTestSession(t, claudeHome, "cccccccc-9999-0000-1111-222222222222", "-Users-test-persist")
+	sources := []config.SourceConfig{
+		{Name: "claude-code", Type: "claude-code", Path: claudeHome},
+	}
+
+	first := New(database, sources)
+	if _, err := first.Run(); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+
+	// Remove the source file; run another INCREMENTAL sync.
+	if err := os.RemoveAll(filepath.Join(claudeHome, "projects", "-Users-test-persist")); err != nil {
+		t.Fatalf("remove source: %v", err)
+	}
+
+	second := New(database, sources) // NOT WithFullSync(true)
+	if _, err := second.Run(); err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+
+	// The old session should still be in the DB — incremental does NOT prune.
+	var n int
+	if err := database.QueryRow("SELECT COUNT(*) FROM sessions").Scan(&n); err != nil {
+		t.Fatalf("count sessions: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("incremental sync sessions = %d, want 1 (row must survive an incremental resync)", n)
+	}
+}

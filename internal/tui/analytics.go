@@ -473,34 +473,6 @@ func formatCompact(n int64) string {
 	return fmt.Sprintf("%.1fB", float64(n)/1000000000)
 }
 
-// shortenPath shortens a path for display
-func shortenPath(path string, maxLen int) string {
-	if maxLen < 4 {
-		maxLen = 4 // Minimum to show "..."
-	}
-	if len(path) <= maxLen {
-		return path
-	}
-	// Try to show the last meaningful parts
-	parts := strings.Split(path, "/")
-	result := path
-	for i := 1; i < len(parts) && len(result) > maxLen; i++ {
-		result = filepath.Join(parts[i:]...)
-	}
-	if len(result) > maxLen {
-		// Ensure we don't get negative indices
-		start := len(result) - maxLen + 3
-		if start < 0 {
-			start = 0
-		}
-		if start >= len(result) {
-			return "..."
-		}
-		return "..." + result[start:]
-	}
-	return result
-}
-
 // shortenModelName shortens a model name for display
 func shortenModelName(model string, maxLen int) string {
 	if len(model) <= maxLen {

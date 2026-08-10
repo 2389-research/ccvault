@@ -652,3 +652,117 @@ func TestGetToolNamesLike(t *testing.T) {
 		t.Errorf("expected no matches, got %v", none)
 	}
 }
+
+// TestResetAll_ClearsDataAndPreservesSchema verifies that ResetAll deletes
+// every row from every data table and the FTS index, but leaves the schema
+// (tables, triggers, FTS virtual table) intact so a subsequent full re-sync
+// can populate an empty archive without needing to re-run migrations.
+func TestResetAll_ClearsDataAndPreservesSchema(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	// Seed rows in every data table.
+	p := &models.Project{Path: "/proj/one", DisplayName: "one"}
+	if err := db.UpsertProject(p); err != nil {
+		t.Fatalf("upsert project: %v", err)
+	}
+
+	s := &models.Session{
+		ID:         "session-1",
+		ProjectID:  p.ID,
+		StartedAt:  time.Now(),
+		SourceFile: "/proj/one/session.jsonl",
+	}
+	if err := db.UpsertSession(s); err != nil {
+		t.Fatalf("upsert session: %v", err)
+	}
+
+	if err := db.InsertTurns([]models.Turn{{
+		ID:        "turn-1",
+		SessionID: s.ID,
+		Type:      "user",
+		Timestamp: time.Now(),
+		Content:   "hello world before reset",
+	}}); err != nil {
+		t.Fatalf("insert turn: %v", err)
+	}
+
+	if err := db.InsertToolUses([]models.ToolUse{{
+		TurnID:    "turn-1",
+		SessionID: s.ID,
+		ToolName:  "Bash",
+		Timestamp: time.Now(),
+	}}); err != nil {
+		t.Fatalf("insert tool_uses: %v", err)
+	}
+
+	if err := db.UpsertSourceFileMtime("/proj/one/session.jsonl", time.Now()); err != nil {
+		t.Fatalf("record mtime: %v", err)
+	}
+
+	// Sanity check: FTS index has content (populated by INSERT trigger).
+	preFTS := 0
+	if err := db.QueryRow("SELECT COUNT(*) FROM turns_fts").Scan(&preFTS); err != nil {
+		t.Fatalf("pre-reset FTS count: %v", err)
+	}
+	if preFTS == 0 {
+		t.Fatal("FTS index should have content after InsertTurns")
+	}
+
+	if err := db.ResetAll(); err != nil {
+		t.Fatalf("ResetAll: %v", err)
+	}
+
+	// Every data table is empty.
+	for _, table := range []string{"tool_uses", "turns", "sessions", "projects", "source_files"} {
+		var n int
+		if err := db.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&n); err != nil {
+			t.Fatalf("count %s: %v", table, err)
+		}
+		if n != 0 {
+			t.Errorf("%s: %d rows after ResetAll, want 0", table, n)
+		}
+	}
+
+	// FTS index cascades from turns DELETE via the AFTER DELETE trigger.
+	postFTS := 0
+	if err := db.QueryRow("SELECT COUNT(*) FROM turns_fts").Scan(&postFTS); err != nil {
+		t.Fatalf("post-reset FTS count: %v", err)
+	}
+	if postFTS != 0 {
+		t.Errorf("FTS index has %d rows after ResetAll, want 0 (turns cascade trigger)", postFTS)
+	}
+
+	// Schema still intact: turns_fts virtual table is queryable, triggers still fire.
+	// Insert a fresh row and confirm it lands in FTS.
+	p2 := &models.Project{Path: "/proj/two", DisplayName: "two"}
+	if err := db.UpsertProject(p2); err != nil {
+		t.Fatalf("post-reset upsert project: %v", err)
+	}
+	s2 := &models.Session{
+		ID:         "session-2",
+		ProjectID:  p2.ID,
+		StartedAt:  time.Now(),
+		SourceFile: "/proj/two/session.jsonl",
+	}
+	if err := db.UpsertSession(s2); err != nil {
+		t.Fatalf("post-reset upsert session: %v", err)
+	}
+	if err := db.InsertTurns([]models.Turn{{
+		ID:        "turn-fresh",
+		SessionID: s2.ID,
+		Type:      "user",
+		Timestamp: time.Now(),
+		Content:   "distinctivemarkerpostreset",
+	}}); err != nil {
+		t.Fatalf("post-reset insert turn: %v", err)
+	}
+
+	results, err := db.SearchTurns("distinctivemarkerpostreset", 10)
+	if err != nil {
+		t.Fatalf("post-reset search: %v", err)
+	}
+	if len(results) != 1 {
+		t.Errorf("post-reset search: got %d results, want 1 (FTS trigger should still fire)", len(results))
+	}
+}
