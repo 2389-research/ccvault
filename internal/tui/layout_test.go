@@ -44,32 +44,64 @@ func TestSessionsLayoutFitsWithinBudget(t *testing.T) {
 	}
 }
 
-// TestProjectsLayoutHeaderLabelsFit guards that every tier's column
-// budgets accommodate the header labels rendered into them — otherwise
-// padVisual returns the un-truncated label and the row misaligns.
+// TestProjectsLayoutHeaderLabelsFit builds the ACTUAL header string
+// used in projects.go at each tier and asserts its visible width fits
+// the terminal budget. Stronger than the previous "column ≥ label
+// length" check — a header rename (e.g. ACTIVE → LAST_ACTIVITY) would
+// silently pad through the old test but overflow this one.
 func TestProjectsLayoutHeaderLabelsFit(t *testing.T) {
 	widths := []int{40, 55, 60, 70, 80, 90, 100, 110, 150}
-	// Minimum column widths to render header labels intact:
-	// PROJECT=7, PATH=4, SOURCE=6, SESSIONS=8, TOKENS=6, ACTIVE=6.
 	for _, w := range widths {
 		l := pickProjectsLayout(w)
-		if l.Project < 7 {
-			t.Errorf("width %d: Project=%d < 7 (min for header 'PROJECT')", w, l.Project)
+
+		// Reproduce the header shape from projects.go View().
+		var header string
+		if l.Source > 0 {
+			header = padVisual("PROJECT", l.Project) + " " +
+				padVisual("PATH", l.Path) + " " +
+				padVisual("SOURCE", l.Source) + " " +
+				padVisual("SESSIONS", l.Sessions) + " " +
+				padVisual("TOKENS", l.Tokens) + " " +
+				padVisual("ACTIVE", l.LastActive)
+		} else {
+			header = padVisual("PROJECT", l.Project) + " " +
+				padVisual("PATH", l.Path) + " " +
+				padVisual("SESSIONS", l.Sessions) + " " +
+				padVisual("TOKENS", l.Tokens) + " " +
+				padVisual("ACTIVE", l.LastActive)
 		}
-		if l.Path < 4 {
-			t.Errorf("width %d: Path=%d < 4 (min for header 'PATH')", w, l.Path)
+
+		// Header + 2 chars row padding must fit terminalWidth (or the
+		// 55-col floor for the default tier).
+		total := 0
+		for range header {
+			total++
 		}
-		if l.Source > 0 && l.Source < 6 {
-			t.Errorf("width %d: Source=%d < 6 (min for header 'SOURCE')", w, l.Source)
+		total += 2 // headerStyle.Padding(0, 1)
+
+		floor := w
+		if w < 55 {
+			floor = 55
 		}
-		if l.Sessions < 8 {
-			t.Errorf("width %d: Sessions=%d < 8 (min for header 'SESSIONS')", w, l.Sessions)
+		if total > floor {
+			t.Errorf("width %d: header rendered %d cols, exceeds terminal budget %d\n  %q",
+				w, total, floor, header)
 		}
-		if l.Tokens < 6 {
-			t.Errorf("width %d: Tokens=%d < 6 (min for header 'TOKENS')", w, l.Tokens)
+
+		// Additionally: no header label should overflow its own column
+		// budget. padVisual returns the label unchanged when it's ≥ width,
+		// so this catches "header was longer than the column budget."
+		for label, colW := range map[string]int{
+			"PROJECT": l.Project, "PATH": l.Path, "SESSIONS": l.Sessions,
+			"TOKENS": l.Tokens, "ACTIVE": l.LastActive,
+		} {
+			if len(label) > colW {
+				t.Errorf("width %d: header label %q (%d chars) > column budget %d",
+					w, label, len(label), colW)
+			}
 		}
-		if l.LastActive < 6 {
-			t.Errorf("width %d: LastActive=%d < 6 (min for header 'ACTIVE')", w, l.LastActive)
+		if l.Source > 0 && len("SOURCE") > l.Source {
+			t.Errorf("width %d: header label SOURCE > column budget %d", w, l.Source)
 		}
 	}
 }

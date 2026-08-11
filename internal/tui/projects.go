@@ -175,18 +175,21 @@ func (m *ProjectsModel) View() string {
 
 		for i := m.offset; i < end; i++ {
 			p := m.projects[i]
+			selected := i == m.cursor
 			// Class A — Label for the short column, Path shown separately.
 			// Each cell is a compact.Result so the row visibly signals
-			// which columns had to be shortened at this width.
-			nameCell := cellText(compact.Truncate(projectref.Label(&p), layout.Project), layout.Project)
-			pathCell := cellText(compact.Path(p.Path, layout.Path), layout.Path)
+			// which columns had to be shortened at this width. Pass
+			// `selected` so cellText skips Faint on the highlighted row
+			// (Faint's ANSI reset would tear selectedStyle mid-row).
+			nameCell := cellText(compact.Truncate(projectref.Label(&p), layout.Project), layout.Project, selected)
+			pathCell := cellText(compact.Path(p.Path, layout.Path), layout.Path, selected)
 			sessionsCell := padVisual(fmt.Sprintf("%d", p.SessionCount), layout.Sessions)
 			tokensCell := padVisual(formatTokensPlain(p.TotalTokens), layout.Tokens)
-			lastActiveCell := cellText(compact.Date(p.LastActivityAt, layout.LastActive), layout.LastActive)
+			lastActiveCell := cellText(compact.Date(p.LastActivityAt, layout.LastActive), layout.LastActive, selected)
 
 			var line string
 			if layout.Source > 0 {
-				sourceCell := cellText(compact.Source(p.Source, layout.Source), layout.Source)
+				sourceCell := cellText(compact.Source(p.Source, layout.Source), layout.Source, selected)
 				line = fmt.Sprintf("%s %s %s %s %s %s",
 					nameCell, pathCell, sourceCell,
 					sessionsCell, tokensCell, lastActiveCell)
@@ -196,7 +199,7 @@ func (m *ProjectsModel) View() string {
 					sessionsCell, tokensCell, lastActiveCell)
 			}
 
-			if i == m.cursor {
+			if selected {
 				b.WriteString(selectedStyle.Render(line))
 			} else {
 				b.WriteString(normalStyle.Render(line))

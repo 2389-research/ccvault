@@ -151,6 +151,13 @@ func EnrichedRefsFromValues(projects []models.Project) []map[string]any {
 // of falling through to the basename when the session only knows its
 // project's path. Pass nil to skip the lookup — Label falls back to
 // filepath.Base(project_path) in that case.
+//
+// Empty-valued fields with `omitempty` JSON tags on models.Session
+// (project_path, ended_at, model, git_branch) are omitted from the
+// output map so agents relying on presence checks like `if resp.model`
+// don't see truthy on unbranded sessions. This matches what
+// json.Marshal(session) would have produced before we routed through
+// the ref helper.
 func SessionRef(s *models.Session, projectsByID map[int64]*models.Project) map[string]any {
 	if s == nil {
 		return map[string]any{}
@@ -163,15 +170,12 @@ func SessionRef(s *models.Session, projectsByID map[int64]*models.Project) map[s
 	} else {
 		projectName = Label(&models.Project{Path: s.ProjectPath})
 	}
-	return map[string]any{
+	// Fields WITHOUT omitempty on models.Session are always present.
+	out := map[string]any{
 		"id":                 s.ID,
 		"project_id":         s.ProjectID,
-		"project_path":       s.ProjectPath,
 		"project_name":       projectName,
-		"model":              s.Model,
-		"git_branch":         s.GitBranch,
 		"started_at":         s.StartedAt,
-		"ended_at":           s.EndedAt,
 		"turn_count":         s.TurnCount,
 		"input_tokens":       s.InputTokens,
 		"output_tokens":      s.OutputTokens,
@@ -182,6 +186,20 @@ func SessionRef(s *models.Session, projectsByID map[int64]*models.Project) map[s
 		"has_subagent":       s.HasSubagent,
 		"source":             s.Source,
 	}
+	// Fields WITH omitempty on models.Session — emit only when non-zero.
+	if s.ProjectPath != "" {
+		out["project_path"] = s.ProjectPath
+	}
+	if !s.EndedAt.IsZero() {
+		out["ended_at"] = s.EndedAt
+	}
+	if s.Model != "" {
+		out["model"] = s.Model
+	}
+	if s.GitBranch != "" {
+		out["git_branch"] = s.GitBranch
+	}
+	return out
 }
 
 // SessionRefsFromValues is the []Session convenience for SessionRef.

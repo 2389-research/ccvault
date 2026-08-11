@@ -202,13 +202,13 @@ func Source(source string, maxWidth int) Result {
 		if maxWidth >= 2 {
 			return shortened("cx")
 		}
-	case "hex":
-		// Already short; only truncate if width is truly tiny. Rune-based
-		// slice — "hex" is ASCII so this is trivially correct, but stay
-		// consistent so this branch survives if someone later renames it.
-		return shortened(runeSlice(source, maxWidth))
-	case "jeff":
-		return shortened(runeSlice(source, maxWidth))
+	case "hex", "jeff":
+		// Match the unknown-adapter branch — end-truncate with "…" so a
+		// silent conflation ("jef" as truncated "jeff") isn't possible.
+		if maxWidth <= 1 {
+			return shortened("…")
+		}
+		return shortened(runeSlice(source, maxWidth-1) + "…")
 	}
 
 	// Unknown adapter: end-truncate with "…" so nothing gets mapped to a
@@ -273,15 +273,12 @@ func Date(t time.Time, maxWidth int) Result {
 	if visLen(yy) <= maxWidth {
 		return shortened(yy)
 	}
-	// Impossibly narrow — fall through to end-truncate.
-	if maxWidth <= 1 {
-		return shortened("…")
-	}
-	runes := []rune(yy)
-	if len(runes) > maxWidth-1 {
-		runes = runes[:maxWidth-1]
-	}
-	return shortened(string(runes) + "…")
+	// The compact form doesn't fit either. Doctrine: never drop day or
+	// month — a partial date like "26-08…" is worse than nothing because
+	// it looks precise but silently loses the day (26-08-05 vs 26-08-15
+	// are visually identical). Return an empty visibly-shortened cell so
+	// callers pad whitespace instead of showing a misleading value.
+	return shortened("")
 }
 
 // Truncate is a small helper for cases where a caller just wants an

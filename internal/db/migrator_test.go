@@ -416,6 +416,20 @@ func TestMigrator_005_NormalizesDisplayNames(t *testing.T) {
 		t.Fatalf("second RunMigrations: %v", err)
 	}
 
+	// Rewind invariant: after DELETE + RunMigrations, schema_version
+	// must have exactly one row at version 5 (proving the migrator's
+	// applyMigration ran and re-INSERTed the version record). If a
+	// future refactor to UPSERT/ON CONFLICT DO NOTHING breaks this,
+	// the rewind trick would silently no-op and the subsequent
+	// assertions would look like a 005 regression.
+	var v5Count int
+	if err := db.QueryRow("SELECT COUNT(*) FROM schema_version WHERE version = 5").Scan(&v5Count); err != nil {
+		t.Fatalf("query schema_version 5: %v", err)
+	}
+	if v5Count != 1 {
+		t.Fatalf("schema_version version=5 count = %d after rewind+RunMigrations, want 1 (rewind mechanism broken)", v5Count)
+	}
+
 	// Claude-code fixtures normalized.
 	for _, f := range claudeCodeFixtures {
 		var got string

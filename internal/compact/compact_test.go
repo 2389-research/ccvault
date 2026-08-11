@@ -253,16 +253,28 @@ func TestDate_UsesTwoDigitYearWhenPressed(t *testing.T) {
 }
 
 func TestDate_NeverDropsMonthOrDay(t *testing.T) {
-	// Even under absurd pressure, we don't lose semantic meaning by
-	// dropping day/month — we visibly truncate instead.
+	// Under pressure below YY-MM-DD (8 chars), the doctrine is to return
+	// EMPTY rather than a partial date that looks precise but silently
+	// loses the day — "26-08…" reads as a real date and hides the fact
+	// that 26-08-05 vs 26-08-15 are now indistinguishable. Callers pad
+	// whitespace and the row visibly shows something's missing.
 	when := time.Date(2026, 2, 14, 0, 0, 0, 0, time.UTC)
 	r := Date(when, 4)
-	// Should not be just "26" or "Feb" — should be visibly truncated.
-	if r.Text == "26" || r.Text == "Feb" {
-		t.Errorf("Date at 4 dropped day/month: %q", r.Text)
+	if r.Text != "" {
+		t.Errorf("Date at 4 = %q, want empty (never emit a partial date)", r.Text)
 	}
-	if visLen(r.Text) > 4 {
-		t.Errorf("Date at 4 = %q (visLen %d), exceeds maxWidth", r.Text, visLen(r.Text))
+	if !r.Shortened {
+		t.Errorf("Date at 4 must still mark Shortened so callers can style the empty cell")
+	}
+	// The intermediate boundary: exactly 7 (YY-MM-DD is 8) — must also return empty.
+	r7 := Date(when, 7)
+	if r7.Text != "" {
+		t.Errorf("Date at 7 = %q, want empty (YY-MM-DD is 8 chars, no partial forms allowed)", r7.Text)
+	}
+	// Sanity: at exactly 8, we do get the YY-MM-DD form.
+	r8 := Date(when, 8)
+	if r8.Text != "26-02-14" {
+		t.Errorf("Date at 8 = %q, want %q", r8.Text, "26-02-14")
 	}
 }
 

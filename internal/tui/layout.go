@@ -51,8 +51,11 @@ func pickProjectsLayout(terminalWidth int) projectsLayout {
 		// 18+20+6+8+8+8=68, +5=73, +2=75 ≤ 80 ✓
 		return projectsLayout{Project: 18, Path: 20, Source: 6, Sessions: 8, Tokens: 8, LastActive: 8}
 	default:
-		// Very narrow (≤79): drop SOURCE. 14+13+8+7+6=48, +4=52, +2=54 ≤ 55.
-		return projectsLayout{Project: 14, Path: 13, Source: 0, Sessions: 8, Tokens: 7, LastActive: 6}
+		// Very narrow (≤79): drop SOURCE. LastActive stays at 8 so
+		// compact.Date can emit the YY-MM-DD form — narrower would
+		// force the "never emit partial dates" branch and leave the
+		// cell blank. 14+13+8+6+8=49, +4=53, +2=55 ≤ 55 exactly.
+		return projectsLayout{Project: 14, Path: 13, Source: 0, Sessions: 8, Tokens: 6, LastActive: 8}
 	}
 }
 
@@ -143,13 +146,19 @@ func padVisual(s string, width int) string {
 	return s + strings.Repeat(" ", width-visW)
 }
 
-// cellText returns Result.Text padded to width with visual-aware spacing,
-// and wrapped in compactStyle when the value was shortened. Pad-first-
-// then-wrap so ANSI escape codes don't confuse downstream layout width
-// arithmetic.
-func cellText(r compact.Result, width int) string {
+// cellText returns Result.Text padded to width with visual-aware spacing.
+// When shortened AND the row is not currently selected, the cell is
+// wrapped in compactStyle (Faint) so users see the compaction hint.
+//
+// When the row IS selected, we deliberately skip the Faint wrap:
+// Faint's terminating ANSI reset (`\x1b[0m`) would tear the row's
+// selectedStyle background mid-row, producing a visibly broken
+// highlight (fresh-eyes review round 3 caught this). On a selected row
+// the user is already focused on the value, so the compaction cue is
+// redundant — dropping it prevents the style-nesting collision.
+func cellText(r compact.Result, width int, inSelected bool) string {
 	padded := padVisual(r.Text, width)
-	if r.Shortened {
+	if r.Shortened && !inSelected {
 		return compactStyle.Render(padded)
 	}
 	return padded

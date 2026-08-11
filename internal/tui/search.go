@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/2389-research/ccvault/internal/compact"
 	"github.com/2389-research/ccvault/internal/db"
 	"github.com/2389-research/ccvault/internal/projectref"
 	"github.com/2389-research/ccvault/internal/search"
@@ -299,7 +300,9 @@ func (m *SearchModel) View() string {
 
 			// Load all projects once so adapter DisplayNames surface in
 			// the result rows instead of falling through to basename.
-			projectsList, _ := m.db.GetProjects("activity", 0)
+			// Best-effort — on lookup failure rows degrade to basename.
+			projectsList, projectsErr := m.db.GetProjects("activity", 0)
+			_ = projectsErr
 			byPath := projectref.ProjectsByPath(projectsList)
 
 			// Results list
@@ -328,12 +331,10 @@ func (m *SearchModel) View() string {
 
 				// Class A — short label in a compact cell. LabelFromPath
 				// surfaces adapter DisplayName instead of always
-				// synthesizing a bare Project stub (which drops
-				// jeff/hex/nanoclaw branded labels).
-				project := projectref.LabelFromPath(r.ProjectPath, byPath)
-				if len(project) > 25 {
-					project = "..." + project[len(project)-22:]
-				}
+				// synthesizing a bare Project stub. compact.Truncate
+				// handles multibyte adapter labels correctly (rune
+				// slicing, not byte slicing).
+				project := compact.Truncate(projectref.LabelFromPath(r.ProjectPath, byPath), 25).Text
 
 				model := r.Model
 				if len(model) > 20 {

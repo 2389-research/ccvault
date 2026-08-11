@@ -479,7 +479,13 @@ Supports Gmail-like query syntax:
 
 		fmt.Printf("Found %d results:\n\n", len(results))
 		// Load projects once so adapter DisplayNames surface in results.
-		allProjects, _ := database.GetProjects("activity", 0)
+		// Surface enrichment failures on stderr rather than silently
+		// falling through to basename — agents watching this output need
+		// to know why adapter branding is missing.
+		allProjects, enrichErr := database.GetProjects("activity", 0)
+		if enrichErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: project enrichment lookup failed: %v — Project labels fell back to basename\n", enrichErr)
+		}
 		byPath := projectref.ProjectsByPath(allProjects)
 		for i, r := range results {
 			fmt.Printf("%d. [%s] %s  Session: %s\n", i+1, r.Turn.Type, r.Turn.Timestamp.Format("2006-01-02 15:04"), r.Turn.SessionID)
@@ -709,7 +715,10 @@ var listSessionsCmd = &cobra.Command{
 			enc.SetIndent("", "  ")
 			// Class C — enrich with project_name so agents get the
 			// doctrine {name, path} shape on session objects.
-			allProjects, _ := database.GetProjects("activity", 0)
+			allProjects, enrichErr := database.GetProjects("activity", 0)
+			if enrichErr != nil {
+				fmt.Fprintf(os.Stderr, "warning: project enrichment lookup failed: %v\n", enrichErr)
+			}
 			return enc.Encode(projectref.SessionRefsFromValues(sessions, projectref.ProjectsByID(allProjects)))
 		}
 
@@ -725,7 +734,10 @@ var listSessionsCmd = &cobra.Command{
 		// surface in the PROJECT column.
 		var byPath map[string]*models.Project
 		if showProject {
-			allProjects, _ := database.GetProjects("activity", 0)
+			allProjects, enrichErr := database.GetProjects("activity", 0)
+			if enrichErr != nil {
+				fmt.Fprintf(os.Stderr, "warning: project enrichment lookup failed: %v — PROJECT column fell back to basename\n", enrichErr)
+			}
 			byPath = projectref.ProjectsByPath(allProjects)
 		}
 		if showProject {
@@ -743,11 +755,10 @@ var listSessionsCmd = &cobra.Command{
 			tokens := s.InputTokens + s.OutputTokens
 			if showProject {
 				// Class A — LabelFromPath surfaces adapter DisplayName
-				// instead of falling through to basename.
-				project := projectref.LabelFromPath(s.ProjectPath, byPath)
-				if len(project) > 23 {
-					project = "..." + project[len(project)-20:]
-				}
+				// instead of falling through to basename. Route through
+				// compact.Truncate so multibyte adapter labels don't get
+				// byte-sliced (e.g. Cyrillic "Иванов-project").
+				project := compact.Truncate(projectref.LabelFromPath(s.ProjectPath, byPath), 23).Text
 				fmt.Printf("%-38s %-25s %16s %6d %10s %s\n",
 					s.ID,
 					project,

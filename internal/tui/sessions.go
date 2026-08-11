@@ -185,8 +185,13 @@ func (m *SessionsModel) View() string {
 
 		// Load all projects once so adapter DisplayNames (jeff, hex,
 		// nanoclaw) surface in the PROJECT column instead of falling
-		// through to basename via a synthetic Project stub.
-		projectsList, _ := m.db.GetProjects("activity", 0)
+		// through to basename via a synthetic Project stub. On lookup
+		// failure the map is empty and rows degrade to basename — that
+		// matches best-effort TUI rendering (no ok place to raise a
+		// modal here); the failure would separately surface via the
+		// dedicated data-load message paths anyway.
+		projectsList, projectsErr := m.db.GetProjects("activity", 0)
+		_ = projectsErr // best-effort enrichment for column labels only
 		byPath := projectref.ProjectsByPath(projectsList)
 
 		// List
@@ -199,11 +204,12 @@ func (m *SessionsModel) View() string {
 		for i := m.offset; i < end; i++ {
 			s := m.sessions[i]
 			tokens := s.InputTokens + s.OutputTokens
+			selected := i == m.cursor
 
 			var parts []string
 			if layout.Project > 0 {
 				project := projectref.LabelFromPath(s.ProjectPath, byPath)
-				parts = append(parts, cellText(compact.Truncate(project, layout.Project), layout.Project))
+				parts = append(parts, cellText(compact.Truncate(project, layout.Project), layout.Project, selected))
 			}
 			// STARTED — date + time in a single cell. Renders differently
 			// based on how much space we've been given.
@@ -214,21 +220,21 @@ func (m *SessionsModel) View() string {
 			if layout.Started < utf8.RuneCountInString(startedText) {
 				// Drop the time to fit
 				startedText = compact.Date(s.StartedAt, layout.Started).Text
-				parts = append(parts, cellText(compact.Result{Text: startedText, Shortened: true}, layout.Started))
+				parts = append(parts, cellText(compact.Result{Text: startedText, Shortened: true}, layout.Started, selected))
 			} else {
 				parts = append(parts, padVisual(startedText, layout.Started))
 			}
 			if layout.Source > 0 {
-				parts = append(parts, cellText(compact.Source(s.Source, layout.Source), layout.Source))
+				parts = append(parts, cellText(compact.Source(s.Source, layout.Source), layout.Source, selected))
 			}
 			parts = append(parts,
 				padVisual(fmt.Sprintf("%d", s.TurnCount), layout.Turns),
 				padVisual(formatTokensPlain(tokens), layout.Tokens),
-				cellText(compact.Model(s.Model, layout.Model), layout.Model),
+				cellText(compact.Model(s.Model, layout.Model), layout.Model, selected),
 			)
 
 			line := strings.Join(parts, " ")
-			if i == m.cursor {
+			if selected {
 				b.WriteString(selectedStyle.Render(line))
 			} else {
 				b.WriteString(normalStyle.Render(line))

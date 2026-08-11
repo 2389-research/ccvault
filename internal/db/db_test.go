@@ -790,91 +790,92 @@ func TestResetAll_ClearsDataAndPreservesSchema(t *testing.T) {
 // rather than half-cleared with inconsistent turn_count / session_count
 // aggregates.
 //
-// We simulate the failure by dropping one of the tables ResetAll DELETEs
-// from RIGHT BEFORE calling it. The DELETE against the missing table
-// errors, and the transaction rolls back all preceding DELETEs.
+// We simulate the failure by dropping ONE of the tables ResetAll DELETEs
+// from RIGHT BEFORE calling it, then verify every OTHER table's row
+// count is unchanged (proving the tx rolled back). Parametrized across
+// every position in the reset order so a future table addition can't
+// slip past — hardcoding just the last position was the weakness
+// adversarial round 3 flagged.
 func TestResetAll_IsAtomicOnMidResetFailure(t *testing.T) {
-	db, cleanup := setupTestDB(t)
-	defer cleanup()
+	// Same order as ResetAll's `tables` slice in db.go — keep in sync.
+	resetOrder := []string{"tool_uses", "turns", "sessions", "projects", "source_files"}
 
-	p := &models.Project{Path: "/proj/atomic", DisplayName: "atomic"}
-	if err := db.UpsertProject(p); err != nil {
-		t.Fatalf("upsert project: %v", err)
-	}
-	s := &models.Session{
-		ID:         "session-atomic",
-		ProjectID:  p.ID,
-		StartedAt:  time.Now(),
-		SourceFile: "/proj/atomic/session.jsonl",
-	}
-	if err := db.UpsertSession(s); err != nil {
-		t.Fatalf("upsert session: %v", err)
-	}
-	if err := db.InsertTurns([]models.Turn{{
-		ID:        "turn-atomic",
-		SessionID: s.ID,
-		Type:      "user",
-		Timestamp: time.Now(),
-		Content:   "atomic content",
-	}}); err != nil {
-		t.Fatalf("insert turn: %v", err)
-	}
+	for _, sabotage := range resetOrder {
+		t.Run("sabotage_"+sabotage, func(t *testing.T) {
+			db, cleanup := setupTestDB(t)
+			defer cleanup()
 
-	countRows := func(table string) int {
-		var n int
-		if err := db.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&n); err != nil {
-			t.Fatalf("count %s: %v", table, err)
-		}
-		return n
-	}
-	// Seed EVERY data table with a row so we can prove atomicity from
-	// both directions — tables before AND after the sabotage point must
-	// roll back. tool_uses gets a row too (baseline was 0 in the earlier
-	// version, which made the "fail early on tool_uses = still 0" case
-	// indistinguishable from real atomicity).
-	if err := db.InsertToolUses([]models.ToolUse{{
-		TurnID:    "turn-atomic",
-		SessionID: s.ID,
-		ToolName:  "Bash",
-		Timestamp: time.Now(),
-	}}); err != nil {
-		t.Fatalf("insert tool_use: %v", err)
-	}
-	if err := db.UpsertSourceFileMtime("/proj/atomic/session.jsonl", time.Now()); err != nil {
-		t.Fatalf("record mtime: %v", err)
-	}
+			// Seed every data table with 1 row.
+			p := &models.Project{Path: "/proj/atomic-" + sabotage, DisplayName: "atomic"}
+			if err := db.UpsertProject(p); err != nil {
+				t.Fatalf("upsert project: %v", err)
+			}
+			s := &models.Session{
+				ID:         "session-atomic-" + sabotage,
+				ProjectID:  p.ID,
+				StartedAt:  time.Now(),
+				SourceFile: "/proj/atomic/session.jsonl",
+			}
+			if err := db.UpsertSession(s); err != nil {
+				t.Fatalf("upsert session: %v", err)
+			}
+			if err := db.InsertTurns([]models.Turn{{
+				ID: "turn-" + sabotage, SessionID: s.ID, Type: "user",
+				Timestamp: time.Now(), Content: "atomic content",
+			}}); err != nil {
+				t.Fatalf("insert turn: %v", err)
+			}
+			if err := db.InsertToolUses([]models.ToolUse{{
+				TurnID: "turn-" + sabotage, SessionID: s.ID,
+				ToolName: "Bash", Timestamp: time.Now(),
+			}}); err != nil {
+				t.Fatalf("insert tool_use: %v", err)
+			}
+			if err := db.UpsertSourceFileMtime("/proj/atomic/session.jsonl", time.Now()); err != nil {
+				t.Fatalf("record mtime: %v", err)
+			}
 
-	// Baseline: every table has at least 1 row.
-	baseline := map[string]int{"tool_uses": 1, "turns": 1, "sessions": 1, "projects": 1, "source_files": 1}
-	for tbl, want := range baseline {
-		if got := countRows(tbl); got != want {
-			t.Fatalf("baseline %s = %d, want %d", tbl, got, want)
-		}
-	}
+			countRows := func(table string) int {
+				var n int
+				if err := db.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&n); err != nil {
+					t.Fatalf("count %s: %v", table, err)
+				}
+				return n
+			}
 
-	// Sabotage the LAST-touched table so failure happens after every
-	// preceding DELETE has fired inside the tx. ResetAll's order is
-	// tool_uses, turns, sessions, projects, source_files — dropping
-	// source_files means DELETE from tool_uses/turns/sessions/projects
-	// all succeed, THEN the source_files DELETE errors. Without WithTx,
-	// four tables would be empty; with WithTx, they all roll back.
-	// This catches the "fail-early = pass" false positive the adversarial
-	// reviewer flagged in the earlier (drop sessions) version.
-	if _, err := db.Exec("DROP TABLE source_files"); err != nil {
-		t.Fatalf("sabotage source_files table: %v", err)
-	}
+			// Baseline check on the tables that will survive the drop.
+			for _, tbl := range resetOrder {
+				if tbl == sabotage {
+					continue
+				}
+				if got := countRows(tbl); got != 1 {
+					t.Fatalf("baseline %s = %d, want 1", tbl, got)
+				}
+			}
 
-	if err := db.ResetAll(); err == nil {
-		t.Fatal("ResetAll should fail when the source_files table has been dropped")
-	}
+			// Drop the sabotage table so ResetAll fails at that position.
+			if _, err := db.Exec("DROP TABLE " + sabotage); err != nil {
+				t.Fatalf("sabotage %s: %v", sabotage, err)
+			}
 
-	// tool_uses, turns, sessions, projects must ALL be in their
-	// pre-ResetAll state — proves the tx wrapping actually rolls back
-	// changes to tables that ResetAll had already touched successfully.
-	for tbl, want := range map[string]int{"tool_uses": 1, "turns": 1, "sessions": 1, "projects": 1} {
-		if got := countRows(tbl); got != want {
-			t.Errorf("post-failed-ResetAll %s = %d, want %d (transaction should have rolled back)", tbl, got, want)
-		}
+			if err := db.ResetAll(); err == nil {
+				t.Fatal("ResetAll should fail when the sabotage table has been dropped")
+			}
+
+			// Every OTHER table's row must be intact — the tx rolled back
+			// any DELETEs that ran before the sabotage table's DELETE
+			// errored. If ResetAll had no tx, tables reset BEFORE the
+			// sabotage point would show 0 rows here.
+			for _, tbl := range resetOrder {
+				if tbl == sabotage {
+					continue
+				}
+				if got := countRows(tbl); got != 1 {
+					t.Errorf("post-failed-ResetAll (sabotage=%s) %s = %d, want 1 (tx should have rolled back)",
+						sabotage, tbl, got)
+				}
+			}
+		})
 	}
 }
 

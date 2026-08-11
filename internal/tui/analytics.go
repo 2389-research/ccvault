@@ -400,8 +400,10 @@ func (m *AnalyticsModel) renderTopProjects() string {
 	for i, p := range m.topProjects {
 		// Class A — Label + Path go through compact so cells signal
 		// when they've been abbreviated at this width.
-		nameCell := cellText(compact.Truncate(projectref.Label(&models.Project{Path: p.ProjectPath}), nameW), nameW)
-		pathCell := cellText(compact.Path(p.ProjectPath, pathW), pathW)
+		// Analytics is scrollable-content, not row-selectable — pass false
+		// so Faint applies where needed without style-nesting concerns.
+		nameCell := cellText(compact.Truncate(projectref.Label(&models.Project{Path: p.ProjectPath}), nameW), nameW, false)
+		pathCell := cellText(compact.Path(p.ProjectPath, pathW), pathW, false)
 		bar := renderBar(p.TotalTokens, maxTokens, 10)
 		row := fmt.Sprintf("%4d %s %s %8d %12s %12s %s",
 			i+1,
@@ -439,7 +441,7 @@ func (m *AnalyticsModel) renderModelStats() string {
 	}
 
 	for _, ms := range m.modelStats {
-		nameCell := cellText(compact.Model(ms.Model, 33), 35)
+		nameCell := cellText(compact.Model(ms.Model, 35), 35, false)
 		bar := renderBar(ms.TotalTokens, maxTokens, 15)
 		row := fmt.Sprintf("%s %8d %15s %s",
 			nameCell,

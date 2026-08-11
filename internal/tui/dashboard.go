@@ -222,8 +222,9 @@ func (m *DashboardModel) View() string {
 
 		for i := range m.topProjects {
 			p := m.topProjects[i]
-			nameCell := cellText(compact.Truncate(projectref.Label(&p), nameW), nameW)
-			pathCell := cellText(compact.Path(p.Path, pathW), pathW)
+			// Dashboard is not row-selectable, so no compactStyle nesting risk.
+			nameCell := cellText(compact.Truncate(projectref.Label(&p), nameW), nameW, false)
+			pathCell := cellText(compact.Path(p.Path, pathW), pathW, false)
 			b.WriteString(normalStyle.Render(fmt.Sprintf("  %s %s %3d sessions", nameCell, pathCell, p.SessionCount)))
 			b.WriteString("\n")
 		}
@@ -292,7 +293,7 @@ func (m *DashboardModel) renderStats() string {
 		for _, mt := range sorted {
 			// compact.Model preserves semantic identity — strips "claude-"
 			// but never the trailing datestamp.
-			modelCell := cellText(compact.Model(mt.model, 20), 20)
+			modelCell := cellText(compact.Model(mt.model, 20), 20, false)
 			lines = append(lines, fmt.Sprintf("  %s %s",
 				modelCell,
 				formatTokens(mt.tokens)))

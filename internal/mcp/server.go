@@ -597,7 +597,12 @@ func (s *Server) searchConversations(args map[string]interface{}) (interface{}, 
 		results = results[:limit]
 	}
 
-	// Transform to compact results
+	// Class C — enrich each result with a project_name so agents get
+	// {name, path} doctrine shape uniformly across MCP surfaces.
+	// Best-effort — lookup failures fall back to basename.
+	allProjects, _ := s.db.GetProjects("activity", 0)
+	byPath := projectref.ProjectsByPath(allProjects)
+
 	compactResults := make([]map[string]interface{}, 0, len(results))
 	for _, r := range results {
 		// Truncate snippet to 200 chars
@@ -612,6 +617,7 @@ func (s *Server) searchConversations(args map[string]interface{}) (interface{}, 
 			"turn_type":    r.Turn.Type,
 			"timestamp":    r.Turn.Timestamp.Format(time.RFC3339),
 			"project_path": r.ProjectPath,
+			"project_name": projectref.LabelFromPath(r.ProjectPath, byPath),
 			"model":        r.Model,
 			"source":       r.Source,
 			"snippet":      snippet,
@@ -647,18 +653,27 @@ func (s *Server) searchConversations(args map[string]interface{}) (interface{}, 
 // lookupProjectPath resolves a session's project path. Failures come back
 // as warning strings so callers surface them instead of dropping them.
 func (s *Server) lookupProjectPath(projectID int64) (string, []string) {
+	path, _, warnings := s.lookupProjectPathAndName(projectID)
+	return path, warnings
+}
+
+// lookupProjectPathAndName resolves a project ID to its path AND its
+// adapter-provided label (via projectref.Label). Class C emitters use
+// this so responses carry the {name, path} doctrine shape even when the
+// caller only has a project ID (not a full session with ProjectPath).
+func (s *Server) lookupProjectPathAndName(projectID int64) (path, name string, warnings []string) {
 	if projectID <= 0 {
-		return "", nil
+		return "", "", nil
 	}
 
 	project, err := s.db.GetProject(projectID)
 	switch {
 	case err != nil:
-		return "", []string{fmt.Sprintf("project lookup failed for project %d: %v", projectID, err)}
+		return "", "", []string{fmt.Sprintf("project lookup failed for project %d: %v", projectID, err)}
 	case project == nil:
-		return "", []string{fmt.Sprintf("project %d not found — session references a missing project", projectID)}
+		return "", "", []string{fmt.Sprintf("project %d not found — session references a missing project", projectID)}
 	default:
-		return project.Path, nil
+		return project.Path, projectref.Label(project), nil
 	}
 }
 
@@ -681,8 +696,9 @@ func (s *Server) getSessionSummary(args map[string]interface{}) (interface{}, er
 		return nil, fmt.Errorf("failed to get turns: %w", err)
 	}
 
-	// Get project info
-	projectPath, warnings := s.lookupProjectPath(session.ProjectID)
+	// Get project info — pull both path AND name so the response carries
+	// the Class C {name, path} doctrine shape.
+	projectPath, projectName, warnings := s.lookupProjectPathAndName(session.ProjectID)
 
 	// Count turn types and extract tool usage
 	turnTypeCounts := make(map[string]int)
@@ -775,6 +791,7 @@ func (s *Server) getSessionSummary(args map[string]interface{}) (interface{}, er
 	result := map[string]interface{}{
 		"session_id":     session.ID,
 		"project_path":   projectPath,
+		"project_name":   projectName,
 		"source":         session.Source,
 		"model":          session.Model,
 		"started_at":     session.StartedAt.Format(time.RFC3339),
@@ -1003,13 +1020,18 @@ func (s *Server) listSessions(args map[string]interface{}) (interface{}, error) 
 		default:
 			// Ambiguous — return the candidate set so the agent can
 			// re-issue the call with a more specific (usually the full
-			// path) filter. No sessions returned; that would silently
-			// mix rows from different projects.
+			// path) filter. Keep `count` and `sessions` in the response
+			// (both empty) so existing clients that iterate
+			// `resp.sessions` don't null-deref on ambiguous input —
+			// the response is a superset of the success shape, plus
+			// the `ambiguous_project_filter` signal + candidates.
 			candidates := make([]map[string]any, len(matches))
 			for i := range matches {
 				candidates[i] = projectref.Ref(&matches[i])
 			}
 			return map[string]interface{}{
+				"count":                    0,
+				"sessions":                 []map[string]any{},
 				"ambiguous_project_filter": true,
 				"filter":                   projectFilter,
 				"matched_projects":         candidates,
@@ -1031,13 +1053,21 @@ func (s *Server) listSessions(args map[string]interface{}) (interface{}, error) 
 
 	// Class C — enrich sessions with {name, path} for each session's
 	// project so agents get the doctrine shape. Adapter-provided
-	// DisplayName is preserved via the ProjectsByID lookup.
-	allProjects, _ := s.db.GetProjects("activity", 0)
+	// DisplayName is preserved via the ProjectsByID lookup. If the
+	// lookup query fails, surface a warning rather than silently falling
+	// back to basename for every session — the agent needs to know why
+	// adapter branding is missing.
+	allProjects, enrichErr := s.db.GetProjects("activity", 0)
 	projectsByID := projectref.ProjectsByID(allProjects)
 
 	response := map[string]interface{}{
 		"count":    len(sessions),
 		"sessions": projectref.SessionRefsFromValues(sessions, projectsByID),
+	}
+	if enrichErr != nil {
+		response["warnings"] = []string{
+			fmt.Sprintf("project enrichment lookup failed: %v — session project_name values fell back to basename", enrichErr),
+		}
 	}
 	if hasMore {
 		response["has_more"] = true
