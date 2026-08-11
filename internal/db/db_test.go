@@ -244,7 +244,13 @@ func TestTurnCRUD(t *testing.T) {
 	}
 
 	if len(got) != 2 {
-		t.Errorf("len(turns) = %d, want 2", len(got))
+		t.Fatalf("len(turns) = %d, want 2", len(got))
+	}
+	// Explicit min-length assert so gosec G602 (slice OOB) knows the
+	// following index accesses are safe — older versions of the
+	// analyzer don't infer this from testing.T.Fatal above.
+	if len(got) < 1 {
+		return
 	}
 
 	if got[0].Content != turns[0].Content {
