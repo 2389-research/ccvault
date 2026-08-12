@@ -512,6 +512,8 @@ var statsCmd = &cobra.Command{
 	Use:   "stats",
 	Short: "Show archive statistics",
 	RunE: func(cmd *cobra.Command, args []string) error {
+		jsonOutput, _ := cmd.Flags().GetBool("json")
+
 		cfg, err := config.Load()
 		if err != nil {
 			return fmt.Errorf("load config: %w", err)
@@ -547,6 +549,28 @@ var statsCmd = &cobra.Command{
 		tokensByModel, err := database.GetTokensByModel()
 		if err != nil {
 			return fmt.Errorf("get tokens by model: %w", err)
+		}
+
+		if jsonOutput {
+			out := map[string]interface{}{
+				"projects":        projectCount,
+				"sessions":        sessionCount,
+				"turns":           turnCount,
+				"total_tokens":    sessionTokens,
+				"project_tokens":  projectTokens,
+				"tokens_by_model": tokensByModel,
+				"top_tools":       toolStats,
+			}
+			if !first.IsZero() && !last.IsZero() {
+				out["activity"] = map[string]interface{}{
+					"first_session": first.Format(time.RFC3339),
+					"last_session":  last.Format(time.RFC3339),
+					"days_span":     int(last.Sub(first).Hours() / 24),
+				}
+			}
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			return enc.Encode(out)
 		}
 
 		// Print statistics
@@ -1031,6 +1055,9 @@ func init() {
 
 	// Orient flags
 	orientCmd.Flags().Bool("json", false, "Output as JSON for machine parsing")
+
+	// Stats flags
+	statsCmd.Flags().Bool("json", false, "Output as JSON for machine parsing")
 
 	// Sync flags
 	syncCmd.Flags().Bool("full", false, "Force full rescan instead of incremental")
