@@ -5,6 +5,7 @@ package db
 
 import (
 	"database/sql"
+	"encoding/json"
 	"os"
 	"testing"
 	"time"
@@ -930,5 +931,90 @@ func TestGetProjects_SortStableTiebreaker(t *testing.T) {
 	if first[0].Path != "/Users/a/ccvault" || first[1].Path != "/Users/b/ccvault" {
 		t.Errorf("path-ASC tiebreaker not applied; got %q, %q",
 			first[0].Path, first[1].Path)
+	}
+}
+
+// TestGetTurns_DropsInvalidRawJSON guards the fix for `ccvault show
+// --json`'s "error calling MarshalJSON for type json.RawMessage" crash.
+// Corrupted or truncated raw_json blobs (from old syncs, before the
+// PR #12 oversized-line placeholder fix) leave non-JSON bytes in the
+// column. Downstream json.Marshal(Turn) crashes because the field is
+// declared json.RawMessage. GetTurns now validates + drops invalid
+// raw_json at scan time so consumers don't explode.
+func TestGetTurns_DropsInvalidRawJSON(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	p := &models.Project{Path: "/proj/rawjson", DisplayName: "rawjson"}
+	if err := db.UpsertProject(p); err != nil {
+		t.Fatalf("upsert project: %v", err)
+	}
+	s := &models.Session{
+		ID: "session-rawjson", ProjectID: p.ID,
+		StartedAt: time.Now(), SourceFile: "/proj/rawjson/session.jsonl",
+	}
+	if err := db.UpsertSession(s); err != nil {
+		t.Fatalf("upsert session: %v", err)
+	}
+
+	// Insert a mix of valid and invalid raw_json blobs directly into the
+	// turns table, bypassing InsertTurns so we can simulate corruption.
+	now := time.Now()
+	rows := []struct {
+		id, raw string
+	}{
+		{"turn-valid", `{"uuid":"turn-valid","type":"user"}`},
+		{"turn-invalid-trailing", `{"a":1}xyz`}, // valid JSON followed by garbage
+		{"turn-invalid-partial", `{"a":1`},      // truncated
+		{"turn-invalid-nonjson", `not json at all`},
+		{"turn-empty", ``}, // empty stored as NULL — sql.NullString.Valid=false, skipped
+	}
+	for _, r := range rows {
+		var rawJSON sql.NullString
+		if r.raw != "" {
+			rawJSON = sql.NullString{String: r.raw, Valid: true}
+		}
+		_, err := db.Exec(
+			`INSERT INTO turns (id, session_id, type, timestamp, content, raw_json)
+			 VALUES (?, ?, 'user', ?, 'placeholder', ?)`,
+			r.id, s.ID, now, rawJSON)
+		if err != nil {
+			t.Fatalf("insert %s: %v", r.id, err)
+		}
+		// Advance time to keep ORDER BY deterministic.
+		now = now.Add(time.Millisecond)
+	}
+
+	turns, err := db.GetTurns(s.ID)
+	if err != nil {
+		t.Fatalf("GetTurns: %v", err)
+	}
+	if len(turns) != len(rows) {
+		t.Fatalf("expected %d turns, got %d", len(rows), len(turns))
+	}
+	if len(turns) < len(rows) {
+		return
+	}
+
+	// The one with valid raw_json should keep its bytes.
+	if len(turns[0].RawJSON) == 0 {
+		t.Errorf("turn %q: RawJSON dropped but source was valid JSON", turns[0].ID)
+	}
+	// The three with invalid raw_json should have RawJSON dropped (nil).
+	for i := 1; i <= 3; i++ {
+		if len(turns[i].RawJSON) != 0 {
+			t.Errorf("turn %q: RawJSON = %q (%d bytes), want dropped (invalid source)",
+				turns[i].ID, string(turns[i].RawJSON), len(turns[i].RawJSON))
+		}
+	}
+	// Empty stored as NULL — RawJSON stays nil either way.
+	if len(turns[4].RawJSON) != 0 {
+		t.Errorf("turn %q: RawJSON should be nil for NULL raw_json", turns[4].ID)
+	}
+
+	// Regression assertion for the actual reported symptom: json.Marshal
+	// on the whole turn set must not crash on any of these rows.
+	if _, err := json.Marshal(turns); err != nil {
+		t.Errorf("json.Marshal(turns) crashed with invalid raw_json still in-place: %v", err)
 	}
 }
