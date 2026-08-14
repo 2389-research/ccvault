@@ -14,9 +14,11 @@ import (
 	"time"
 
 	"github.com/2389-research/ccvault/internal/analytics"
+	"github.com/2389-research/ccvault/internal/compact"
 	"github.com/2389-research/ccvault/internal/config"
 	"github.com/2389-research/ccvault/internal/db"
 	"github.com/2389-research/ccvault/internal/export"
+	"github.com/2389-research/ccvault/internal/projectref"
 	"github.com/2389-research/ccvault/internal/search"
 	"github.com/2389-research/ccvault/pkg/models"
 )
@@ -595,7 +597,12 @@ func (s *Server) searchConversations(args map[string]interface{}) (interface{}, 
 		results = results[:limit]
 	}
 
-	// Transform to compact results
+	// Class C — enrich each result with a project_name so agents get
+	// {name, path} doctrine shape uniformly across MCP surfaces.
+	// Best-effort — lookup failures fall back to basename.
+	allProjects, _ := s.db.GetProjects("activity", 0)
+	byPath := projectref.ProjectsByPath(allProjects)
+
 	compactResults := make([]map[string]interface{}, 0, len(results))
 	for _, r := range results {
 		// Truncate snippet to 200 chars
@@ -610,6 +617,7 @@ func (s *Server) searchConversations(args map[string]interface{}) (interface{}, 
 			"turn_type":    r.Turn.Type,
 			"timestamp":    r.Turn.Timestamp.Format(time.RFC3339),
 			"project_path": r.ProjectPath,
+			"project_name": projectref.LabelFromPath(r.ProjectPath, byPath),
 			"model":        r.Model,
 			"source":       r.Source,
 			"snippet":      snippet,
@@ -645,18 +653,27 @@ func (s *Server) searchConversations(args map[string]interface{}) (interface{}, 
 // lookupProjectPath resolves a session's project path. Failures come back
 // as warning strings so callers surface them instead of dropping them.
 func (s *Server) lookupProjectPath(projectID int64) (string, []string) {
+	path, _, warnings := s.lookupProjectPathAndName(projectID)
+	return path, warnings
+}
+
+// lookupProjectPathAndName resolves a project ID to its path AND its
+// adapter-provided label (via projectref.Label). Class C emitters use
+// this so responses carry the {name, path} doctrine shape even when the
+// caller only has a project ID (not a full session with ProjectPath).
+func (s *Server) lookupProjectPathAndName(projectID int64) (path, name string, warnings []string) {
 	if projectID <= 0 {
-		return "", nil
+		return "", "", nil
 	}
 
 	project, err := s.db.GetProject(projectID)
 	switch {
 	case err != nil:
-		return "", []string{fmt.Sprintf("project lookup failed for project %d: %v", projectID, err)}
+		return "", "", []string{fmt.Sprintf("project lookup failed for project %d: %v", projectID, err)}
 	case project == nil:
-		return "", []string{fmt.Sprintf("project %d not found — session references a missing project", projectID)}
+		return "", "", []string{fmt.Sprintf("project %d not found — session references a missing project", projectID)}
 	default:
-		return project.Path, nil
+		return project.Path, projectref.Label(project), nil
 	}
 }
 
@@ -679,8 +696,9 @@ func (s *Server) getSessionSummary(args map[string]interface{}) (interface{}, er
 		return nil, fmt.Errorf("failed to get turns: %w", err)
 	}
 
-	// Get project info
-	projectPath, warnings := s.lookupProjectPath(session.ProjectID)
+	// Get project info — pull both path AND name so the response carries
+	// the Class C {name, path} doctrine shape.
+	projectPath, projectName, warnings := s.lookupProjectPathAndName(session.ProjectID)
 
 	// Count turn types and extract tool usage
 	turnTypeCounts := make(map[string]int)
@@ -773,6 +791,7 @@ func (s *Server) getSessionSummary(args map[string]interface{}) (interface{}, er
 	result := map[string]interface{}{
 		"session_id":     session.ID,
 		"project_path":   projectPath,
+		"project_name":   projectName,
 		"source":         session.Source,
 		"model":          session.Model,
 		"started_at":     session.StartedAt.Format(time.RFC3339),
@@ -987,20 +1006,37 @@ func (s *Server) listSessions(args map[string]interface{}) (interface{}, error) 
 
 	var projectID int64
 	if projectFilter, ok := args["project"].(string); ok && projectFilter != "" {
-		// Find matching project
+		// Class D — return all matches, don't silently pick one.
 		projects, err := s.db.GetProjects("activity", 0)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get projects: %w", err)
 		}
-		for _, p := range projects {
-			if strings.Contains(strings.ToLower(p.Path), strings.ToLower(projectFilter)) ||
-				strings.Contains(strings.ToLower(p.DisplayName), strings.ToLower(projectFilter)) {
-				projectID = p.ID
-				break
-			}
-		}
-		if projectID == 0 {
+		matches := projectref.ResolveAll(projects, projectFilter)
+		switch len(matches) {
+		case 0:
 			return nil, fmt.Errorf("project not found: %s", projectFilter)
+		case 1:
+			projectID = matches[0].ID
+		default:
+			// Ambiguous — return the candidate set so the agent can
+			// re-issue the call with a more specific (usually the full
+			// path) filter. Keep `count` and `sessions` in the response
+			// (both empty) so existing clients that iterate
+			// `resp.sessions` don't null-deref on ambiguous input —
+			// the response is a superset of the success shape, plus
+			// the `ambiguous_project_filter` signal + candidates.
+			candidates := make([]map[string]any, len(matches))
+			for i := range matches {
+				candidates[i] = projectref.Ref(&matches[i])
+			}
+			return map[string]interface{}{
+				"count":                    0,
+				"sessions":                 []map[string]any{},
+				"ambiguous_project_filter": true,
+				"filter":                   projectFilter,
+				"matched_projects":         candidates,
+				"hint":                     "Filter matched multiple projects. Re-call list_sessions with 'project' set to one of matched_projects[].path.",
+			}, nil
 		}
 	}
 
@@ -1015,9 +1051,23 @@ func (s *Server) listSessions(args map[string]interface{}) (interface{}, error) 
 		sessions = sessions[:limit]
 	}
 
+	// Class C — enrich sessions with {name, path} for each session's
+	// project so agents get the doctrine shape. Adapter-provided
+	// DisplayName is preserved via the ProjectsByID lookup. If the
+	// lookup query fails, surface a warning rather than silently falling
+	// back to basename for every session — the agent needs to know why
+	// adapter branding is missing.
+	allProjects, enrichErr := s.db.GetProjects("activity", 0)
+	projectsByID := projectref.ProjectsByID(allProjects)
+
 	response := map[string]interface{}{
 		"count":    len(sessions),
-		"sessions": sessions,
+		"sessions": projectref.SessionRefsFromValues(sessions, projectsByID),
+	}
+	if enrichErr != nil {
+		response["warnings"] = []string{
+			fmt.Sprintf("project enrichment lookup failed: %v — session project_name values fell back to basename", enrichErr),
+		}
 	}
 	if hasMore {
 		response["has_more"] = true
@@ -1055,9 +1105,11 @@ func (s *Server) listProjects(args map[string]interface{}) (interface{}, error) 
 		projects = projects[:limit]
 	}
 
+	// Class C — emit each project with a Ref-doctrine {name, path}
+	// shape, plus the operational fields agents need.
 	response := map[string]interface{}{
 		"count":    len(projects),
-		"projects": projects,
+		"projects": projectref.EnrichedRefsFromValues(projects),
 	}
 	if hasMore {
 		response["has_more"] = true
@@ -1242,17 +1294,23 @@ func (s *Server) promptAnalyzeProject(args map[string]interface{}) (promptGetRes
 		return promptGetResult{}, err
 	}
 
-	var project *models.Project
-	for _, p := range projects {
-		if strings.Contains(strings.ToLower(p.Path), strings.ToLower(projectName)) ||
-			strings.Contains(strings.ToLower(p.DisplayName), strings.ToLower(projectName)) {
-			project = &p
-			break
-		}
-	}
-	if project == nil {
+	// Class D — never silently pick a match. A prompt is a single-analysis
+	// contract; on ambiguous input the caller must narrow.
+	matches := projectref.ResolveAll(projects, projectName)
+	if len(matches) == 0 {
 		return promptGetResult{}, fmt.Errorf("project not found: %s", projectName)
 	}
+	if len(matches) > 1 {
+		var paths []string
+		for _, m := range matches {
+			paths = append(paths, m.Path)
+		}
+		return promptGetResult{}, fmt.Errorf(
+			"filter %q matched multiple projects; re-call with an exact path:\n  %s",
+			projectName, strings.Join(paths, "\n  "),
+		)
+	}
+	project := &matches[0]
 
 	// Get sessions for this project
 	sessions, err := s.db.GetSessions(project.ID, 50)
@@ -1261,7 +1319,9 @@ func (s *Server) promptAnalyzeProject(args map[string]interface{}) (promptGetRes
 	}
 
 	var context strings.Builder
-	fmt.Fprintf(&context, "## Project Analysis: %s\n\n", project.DisplayName)
+	// Class B — combined inline form so a same-basename project doesn't
+	// produce an ambiguous prompt header.
+	fmt.Fprintf(&context, "## Project Analysis: %s\n\n", projectref.Inline(project))
 	fmt.Fprintf(&context, "- **Path**: %s\n", project.Path)
 	fmt.Fprintf(&context, "- **Sessions**: %d\n", project.SessionCount)
 	fmt.Fprintf(&context, "- **Total Tokens**: %d\n", project.TotalTokens)
@@ -1277,7 +1337,7 @@ func (s *Server) promptAnalyzeProject(args map[string]interface{}) (promptGetRes
 	}
 
 	return promptGetResult{
-		Description: fmt.Sprintf("Analysis of Claude Code usage for project: %s", project.DisplayName),
+		Description: fmt.Sprintf("Analysis of Claude Code usage for project: %s", projectref.Inline(project)),
 		Messages: []promptMessage{
 			{
 				Role: "user",
@@ -1467,15 +1527,13 @@ func (s *Server) promptToolUsageReport(args map[string]interface{}) (promptGetRe
 
 // Helper functions
 
+// shortenModel is a thin adapter around compact.Model that discards the
+// Shortened flag (MCP prompt content doesn't have styling). Preserves
+// semantic identity — NEVER strips a trailing datestamp, because
+// opus-4-5-20251101 is a genuinely different model from opus-4-5.
+// See internal/compact/compact.go for the discipline.
 func shortenModel(model string) string {
-	if len(model) <= 20 {
-		return model
-	}
-	parts := strings.Split(model, "-")
-	if len(parts) >= 2 {
-		return parts[1]
-	}
-	return model[:17] + "..."
+	return compact.Model(model, 20).Text
 }
 
 func (s *Server) sendResult(id interface{}, result interface{}) {

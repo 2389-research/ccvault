@@ -11,7 +11,10 @@ import (
 	"time"
 
 	"github.com/2389-research/ccvault/internal/analytics"
+	"github.com/2389-research/ccvault/internal/compact"
 	"github.com/2389-research/ccvault/internal/db"
+	"github.com/2389-research/ccvault/internal/projectref"
+	"github.com/2389-research/ccvault/pkg/models"
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -366,13 +369,25 @@ func (m *AnalyticsModel) renderTopProjects() string {
 		return dimStyle.Render("No project data available")
 	}
 
+	// Column budgets adapt slightly to width — analytics has a bar column
+	// that eats space, so we're conservative.
+	nameW, pathW := 22, 28
+	if m.width >= 100 {
+		nameW, pathW = 24, 30
+	} else if m.width < 80 {
+		nameW, pathW = 18, 22
+	}
+
 	var lines []string
 
 	// Header
-	header := fmt.Sprintf("%4s %-38s %8s %12s %12s",
-		"#", "Project", "Sessions", "Tokens", "Last Active")
+	header := fmt.Sprintf("%4s %s %s %8s %12s %12s",
+		"#",
+		padVisual("Project", nameW),
+		padVisual("Path", pathW),
+		"Sessions", "Tokens", "Last Active")
 	lines = append(lines, lipgloss.NewStyle().Bold(true).Render(header))
-	lines = append(lines, strings.Repeat("─", 80))
+	lines = append(lines, strings.Repeat("─", 96))
 
 	// Find max for bar
 	var maxTokens int64
@@ -383,11 +398,17 @@ func (m *AnalyticsModel) renderTopProjects() string {
 	}
 
 	for i, p := range m.topProjects {
-		name := shortenPath(p.ProjectPath, 36)
+		// Class A — Label + Path go through compact so cells signal
+		// when they've been abbreviated at this width.
+		// Analytics is scrollable-content, not row-selectable — pass false
+		// so Faint applies where needed without style-nesting concerns.
+		nameCell := cellText(compact.Truncate(projectref.Label(&models.Project{Path: p.ProjectPath}), nameW), nameW, false)
+		pathCell := cellText(compact.Path(p.ProjectPath, pathW), pathW, false)
 		bar := renderBar(p.TotalTokens, maxTokens, 10)
-		row := fmt.Sprintf("%4d %-38s %8d %12s %12s %s",
+		row := fmt.Sprintf("%4d %s %s %8d %12s %12s %s",
 			i+1,
-			name,
+			nameCell,
+			pathCell,
 			p.SessionCount,
 			formatCompact(p.TotalTokens),
 			p.LastActive.Format("Jan 02"),
@@ -420,10 +441,10 @@ func (m *AnalyticsModel) renderModelStats() string {
 	}
 
 	for _, ms := range m.modelStats {
-		name := shortenModelName(ms.Model, 33)
+		nameCell := cellText(compact.Model(ms.Model, 35), 35, false)
 		bar := renderBar(ms.TotalTokens, maxTokens, 15)
-		row := fmt.Sprintf("%-35s %8d %15s %s",
-			name,
+		row := fmt.Sprintf("%s %8d %15s %s",
+			nameCell,
 			ms.SessionCount,
 			formatCompact(ms.TotalTokens),
 			bar)
@@ -458,48 +479,4 @@ func formatCompact(n int64) string {
 		return fmt.Sprintf("%.1fM", float64(n)/1000000)
 	}
 	return fmt.Sprintf("%.1fB", float64(n)/1000000000)
-}
-
-// shortenPath shortens a path for display
-func shortenPath(path string, maxLen int) string {
-	if maxLen < 4 {
-		maxLen = 4 // Minimum to show "..."
-	}
-	if len(path) <= maxLen {
-		return path
-	}
-	// Try to show the last meaningful parts
-	parts := strings.Split(path, "/")
-	result := path
-	for i := 1; i < len(parts) && len(result) > maxLen; i++ {
-		result = filepath.Join(parts[i:]...)
-	}
-	if len(result) > maxLen {
-		// Ensure we don't get negative indices
-		start := len(result) - maxLen + 3
-		if start < 0 {
-			start = 0
-		}
-		if start >= len(result) {
-			return "..."
-		}
-		return "..." + result[start:]
-	}
-	return result
-}
-
-// shortenModelName shortens a model name for display
-func shortenModelName(model string, maxLen int) string {
-	if len(model) <= maxLen {
-		return model
-	}
-	// Extract meaningful part (e.g., "opus-4" from "claude-opus-4-...")
-	parts := strings.Split(model, "-")
-	if len(parts) >= 3 {
-		short := strings.Join(parts[1:3], "-")
-		if len(short) <= maxLen {
-			return short
-		}
-	}
-	return model[:maxLen-3] + "..."
 }

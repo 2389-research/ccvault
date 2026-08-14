@@ -5,7 +5,9 @@ package db
 
 import (
 	"database/sql"
+	"encoding/json"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -244,7 +246,13 @@ func TestTurnCRUD(t *testing.T) {
 	}
 
 	if len(got) != 2 {
-		t.Errorf("len(turns) = %d, want 2", len(got))
+		t.Fatalf("len(turns) = %d, want 2", len(got))
+	}
+	// Explicit min-length assert so gosec G602 (slice OOB) knows the
+	// following index accesses are safe — older versions of the
+	// analyzer don't infer this from testing.T.Fatal above.
+	if len(got) < 1 {
+		return
 	}
 
 	if got[0].Content != turns[0].Content {
@@ -650,5 +658,461 @@ func TestGetToolNamesLike(t *testing.T) {
 	}
 	if len(none) != 0 {
 		t.Errorf("expected no matches, got %v", none)
+	}
+}
+
+// TestResetAll_ClearsDataAndPreservesSchema verifies that ResetAll deletes
+// every row from every data table and the FTS index, but leaves the schema
+// (tables, triggers, FTS virtual table) intact so a subsequent full re-sync
+// can populate an empty archive without needing to re-run migrations.
+func TestResetAll_ClearsDataAndPreservesSchema(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	// Seed rows in every data table.
+	p := &models.Project{Path: "/proj/one", DisplayName: "one"}
+	if err := db.UpsertProject(p); err != nil {
+		t.Fatalf("upsert project: %v", err)
+	}
+
+	s := &models.Session{
+		ID:         "session-1",
+		ProjectID:  p.ID,
+		StartedAt:  time.Now(),
+		SourceFile: "/proj/one/session.jsonl",
+	}
+	if err := db.UpsertSession(s); err != nil {
+		t.Fatalf("upsert session: %v", err)
+	}
+
+	// Distinctive token that we can MATCH against turns_fts after reset.
+	// If the AFTER DELETE trigger on turns cascades to the shadow index,
+	// the token disappears from the FTS index too. Without a MATCH check,
+	// asserting `COUNT(*) FROM turns_fts == 0` is a false positive: with
+	// external-content FTS5 (content='turns'), COUNT joins to the empty
+	// turns table and returns 0 regardless of trigger behavior.
+	preResetToken := "canaryphrasepreresetsentinel"
+
+	if err := db.InsertTurns([]models.Turn{{
+		ID:        "turn-1",
+		SessionID: s.ID,
+		Type:      "user",
+		Timestamp: time.Now(),
+		Content:   "hello " + preResetToken + " world",
+	}}); err != nil {
+		t.Fatalf("insert turn: %v", err)
+	}
+
+	if err := db.InsertToolUses([]models.ToolUse{{
+		TurnID:    "turn-1",
+		SessionID: s.ID,
+		ToolName:  "Bash",
+		Timestamp: time.Now(),
+	}}); err != nil {
+		t.Fatalf("insert tool_uses: %v", err)
+	}
+
+	if err := db.UpsertSourceFileMtime("/proj/one/session.jsonl", time.Now()); err != nil {
+		t.Fatalf("record mtime: %v", err)
+	}
+
+	// Sanity check: the token IS present in the FTS index before reset.
+	// MATCH against the token — this actually queries the shadow index,
+	// unlike COUNT(*) which reads through to the source table.
+	preMatch, err := db.SearchTurns(preResetToken, 10)
+	if err != nil {
+		t.Fatalf("pre-reset FTS MATCH: %v", err)
+	}
+	if len(preMatch) == 0 {
+		t.Fatal("FTS should return a hit for the pre-reset token before ResetAll")
+	}
+
+	if err := db.ResetAll(); err != nil {
+		t.Fatalf("ResetAll: %v", err)
+	}
+
+	// Every data table is empty.
+	for _, table := range []string{"tool_uses", "turns", "sessions", "projects", "source_files"} {
+		var n int
+		if err := db.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&n); err != nil {
+			t.Fatalf("count %s: %v", table, err)
+		}
+		if n != 0 {
+			t.Errorf("%s: %d rows after ResetAll, want 0", table, n)
+		}
+	}
+
+	// The real cascade check: MATCH the shadow index DIRECTLY (not through
+	// SearchTurns which JOINs against `turns` and would silently mask
+	// stale shadow rowids because the base rows are gone). If the AFTER
+	// DELETE trigger on `turns` didn't cascade to `turns_fts`, this
+	// direct MATCH still finds the pre-reset token — proving the cascade
+	// is broken. Adversarial reviewer #4 flagged the JOIN version as a
+	// false positive of the same class the count-through-source was.
+	var directMatchCount int
+	if err := db.QueryRow("SELECT COUNT(*) FROM turns_fts WHERE turns_fts MATCH ?", preResetToken).Scan(&directMatchCount); err != nil {
+		t.Fatalf("post-reset direct FTS MATCH: %v", err)
+	}
+	if directMatchCount != 0 {
+		t.Errorf("direct FTS MATCH for pre-reset token returned %d hits after ResetAll, want 0 (cascade broken?)", directMatchCount)
+	}
+
+	// Schema still intact: turns_fts virtual table is queryable, triggers still fire.
+	// Insert a fresh row and confirm it lands in FTS.
+	p2 := &models.Project{Path: "/proj/two", DisplayName: "two"}
+	if err := db.UpsertProject(p2); err != nil {
+		t.Fatalf("post-reset upsert project: %v", err)
+	}
+	s2 := &models.Session{
+		ID:         "session-2",
+		ProjectID:  p2.ID,
+		StartedAt:  time.Now(),
+		SourceFile: "/proj/two/session.jsonl",
+	}
+	if err := db.UpsertSession(s2); err != nil {
+		t.Fatalf("post-reset upsert session: %v", err)
+	}
+	if err := db.InsertTurns([]models.Turn{{
+		ID:        "turn-fresh",
+		SessionID: s2.ID,
+		Type:      "user",
+		Timestamp: time.Now(),
+		Content:   "distinctivemarkerpostreset",
+	}}); err != nil {
+		t.Fatalf("post-reset insert turn: %v", err)
+	}
+
+	results, err := db.SearchTurns("distinctivemarkerpostreset", 10)
+	if err != nil {
+		t.Fatalf("post-reset search: %v", err)
+	}
+	if len(results) != 1 {
+		t.Errorf("post-reset search: got %d results, want 1 (FTS trigger should still fire)", len(results))
+	}
+}
+
+// TestResetAll_IsAtomicOnMidResetFailure guards the transactional guarantee
+// added as follow-up 3 of PR #22 review. If a DELETE mid-way through
+// ResetAll fails (disk full, SIGKILL, SQLITE_BUSY on a concurrent write),
+// the whole reset must roll back — leaving the DB in its pre-reset state
+// rather than half-cleared with inconsistent turn_count / session_count
+// aggregates.
+//
+// We simulate the failure by dropping ONE of the tables ResetAll DELETEs
+// from RIGHT BEFORE calling it, then verify every OTHER table's row
+// count is unchanged (proving the tx rolled back). Parametrized across
+// every position in the reset order so a future table addition can't
+// slip past — hardcoding just the last position was the weakness
+// adversarial round 3 flagged.
+func TestResetAll_IsAtomicOnMidResetFailure(t *testing.T) {
+	// Same order as ResetAll's `tables` slice in db.go — keep in sync.
+	resetOrder := []string{"tool_uses", "turns", "sessions", "projects", "source_files"}
+
+	for _, sabotage := range resetOrder {
+		t.Run("sabotage_"+sabotage, func(t *testing.T) {
+			db, cleanup := setupTestDB(t)
+			defer cleanup()
+
+			// Seed every data table with 1 row.
+			p := &models.Project{Path: "/proj/atomic-" + sabotage, DisplayName: "atomic"}
+			if err := db.UpsertProject(p); err != nil {
+				t.Fatalf("upsert project: %v", err)
+			}
+			s := &models.Session{
+				ID:         "session-atomic-" + sabotage,
+				ProjectID:  p.ID,
+				StartedAt:  time.Now(),
+				SourceFile: "/proj/atomic/session.jsonl",
+			}
+			if err := db.UpsertSession(s); err != nil {
+				t.Fatalf("upsert session: %v", err)
+			}
+			if err := db.InsertTurns([]models.Turn{{
+				ID: "turn-" + sabotage, SessionID: s.ID, Type: "user",
+				Timestamp: time.Now(), Content: "atomic content",
+			}}); err != nil {
+				t.Fatalf("insert turn: %v", err)
+			}
+			if err := db.InsertToolUses([]models.ToolUse{{
+				TurnID: "turn-" + sabotage, SessionID: s.ID,
+				ToolName: "Bash", Timestamp: time.Now(),
+			}}); err != nil {
+				t.Fatalf("insert tool_use: %v", err)
+			}
+			if err := db.UpsertSourceFileMtime("/proj/atomic/session.jsonl", time.Now()); err != nil {
+				t.Fatalf("record mtime: %v", err)
+			}
+
+			countRows := func(table string) int {
+				var n int
+				if err := db.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&n); err != nil {
+					t.Fatalf("count %s: %v", table, err)
+				}
+				return n
+			}
+
+			// Baseline check on the tables that will survive the drop.
+			for _, tbl := range resetOrder {
+				if tbl == sabotage {
+					continue
+				}
+				if got := countRows(tbl); got != 1 {
+					t.Fatalf("baseline %s = %d, want 1", tbl, got)
+				}
+			}
+
+			// Drop the sabotage table so ResetAll fails at that position.
+			if _, err := db.Exec("DROP TABLE " + sabotage); err != nil {
+				t.Fatalf("sabotage %s: %v", sabotage, err)
+			}
+
+			if err := db.ResetAll(); err == nil {
+				t.Fatal("ResetAll should fail when the sabotage table has been dropped")
+			}
+
+			// Every OTHER table's row must be intact — the tx rolled back
+			// any DELETEs that ran before the sabotage table's DELETE
+			// errored. If ResetAll had no tx, tables reset BEFORE the
+			// sabotage point would show 0 rows here.
+			for _, tbl := range resetOrder {
+				if tbl == sabotage {
+					continue
+				}
+				if got := countRows(tbl); got != 1 {
+					t.Errorf("post-failed-ResetAll (sabotage=%s) %s = %d, want 1 (tx should have rolled back)",
+						sabotage, tbl, got)
+				}
+			}
+		})
+	}
+}
+
+// TestGetProjects_SortStableTiebreaker guards the secondary path ASC sort
+// added as follow-up 7 of PR #22 review. Multiple projects sharing a
+// display_name (or activity timestamp, token count, session count) must
+// come back in a stable order across calls — otherwise agents that
+// paginate the list see rows swap positions between requests.
+func TestGetProjects_SortStableTiebreaker(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	// Two projects sharing display_name. INSERT ORDER is deliberately
+	// reversed from expected sort order so a broken implementation
+	// missing the tiebreaker would return them in insertion (== rowid)
+	// order — /Users/b first — instead of path-ASC — /Users/a first.
+	// Adversarial reviewer #4 flagged the previous test order as a
+	// false positive.
+	paths := []string{"/Users/b/ccvault", "/Users/a/ccvault"}
+	for _, path := range paths {
+		p := &models.Project{Path: path, DisplayName: "ccvault"}
+		if err := db.UpsertProject(p); err != nil {
+			t.Fatalf("upsert %s: %v", path, err)
+		}
+	}
+
+	// Query twice; results must match exactly.
+	first, err := db.GetProjects("name", 10)
+	if err != nil {
+		t.Fatalf("first GetProjects: %v", err)
+	}
+	second, err := db.GetProjects("name", 10)
+	if err != nil {
+		t.Fatalf("second GetProjects: %v", err)
+	}
+	if len(first) != 2 || len(second) != 2 {
+		t.Fatalf("expected 2 rows both times, got %d/%d", len(first), len(second))
+	}
+	for i := range first {
+		if first[i].Path != second[i].Path {
+			t.Errorf("index %d: first.path=%q second.path=%q — sort must be stable",
+				i, first[i].Path, second[i].Path)
+		}
+	}
+	// Path ASC secondary means /Users/a/ccvault comes before /Users/b/ccvault.
+	if first[0].Path != "/Users/a/ccvault" || first[1].Path != "/Users/b/ccvault" {
+		t.Errorf("path-ASC tiebreaker not applied; got %q, %q",
+			first[0].Path, first[1].Path)
+	}
+}
+
+// TestBackupTo_ProducesCompleteRestorablePortableCopy verifies that
+// BackupTo produces a file at the requested path that, when reopened
+// as an independent SQLite DB, contains the same data as the source.
+// This is the safety net for `sync --full` — a broken re-scan should
+// be recoverable by copying the backup back over the live DB.
+func TestBackupTo_ProducesCompleteRestorablePortableCopy(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	// Seed data across every table.
+	p := &models.Project{Path: "/proj/backup", DisplayName: "backup"}
+	if err := db.UpsertProject(p); err != nil {
+		t.Fatalf("upsert project: %v", err)
+	}
+	s := &models.Session{
+		ID: "session-backup", ProjectID: p.ID,
+		StartedAt: time.Now(), SourceFile: "/proj/backup/session.jsonl",
+	}
+	if err := db.UpsertSession(s); err != nil {
+		t.Fatalf("upsert session: %v", err)
+	}
+	if err := db.InsertTurns([]models.Turn{{
+		ID: "turn-backup", SessionID: s.ID, Type: "user",
+		Timestamp: time.Now(),
+		Content:   "backupcontentcanarytoken",
+	}}); err != nil {
+		t.Fatalf("insert turn: %v", err)
+	}
+
+	// Take backup to a fresh path in a temp dir.
+	backupPath := filepath.Join(t.TempDir(), "ccvault-backup.db")
+	if err := db.BackupTo(backupPath); err != nil {
+		t.Fatalf("BackupTo: %v", err)
+	}
+	if info, err := os.Stat(backupPath); err != nil {
+		t.Fatalf("backup file missing: %v", err)
+	} else if info.Size() == 0 {
+		t.Fatalf("backup file is empty")
+	}
+
+	// Open the backup as an independent DB — no shared state with source.
+	// Then wipe the source to prove the backup stands alone.
+	if err := db.ResetAll(); err != nil {
+		t.Fatalf("ResetAll to isolate backup: %v", err)
+	}
+
+	backupSQL, err := sql.Open("sqlite", backupPath)
+	if err != nil {
+		t.Fatalf("open backup: %v", err)
+	}
+	t.Cleanup(func() { _ = backupSQL.Close() })
+
+	// Every table should hold its pre-reset row count.
+	for table, want := range map[string]int{"projects": 1, "sessions": 1, "turns": 1} {
+		var n int
+		if err := backupSQL.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&n); err != nil {
+			t.Fatalf("backup count %s: %v", table, err)
+		}
+		if n != want {
+			t.Errorf("backup %s = %d rows, want %d", table, n, want)
+		}
+	}
+
+	// FTS index survived intact so a full-text query against the backup
+	// still finds the seeded turn.
+	var ftsCount int
+	if err := backupSQL.QueryRow("SELECT COUNT(*) FROM turns_fts WHERE turns_fts MATCH ?", "backupcontentcanarytoken").Scan(&ftsCount); err != nil {
+		t.Fatalf("backup FTS query: %v", err)
+	}
+	if ftsCount != 1 {
+		t.Errorf("backup FTS match count = %d, want 1", ftsCount)
+	}
+}
+
+// TestBackupTo_RefusesExistingFile guards against clobbering a previous
+// backup by accident — the caller must always pass a fresh path.
+func TestBackupTo_RefusesExistingFile(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	path := filepath.Join(t.TempDir(), "ccvault-backup.db")
+	if err := os.WriteFile(path, []byte("existing content"), 0o600); err != nil {
+		t.Fatalf("seed existing file: %v", err)
+	}
+	if err := db.BackupTo(path); err == nil {
+		t.Fatal("BackupTo to an existing file should error, got nil")
+	}
+	// Existing file must be untouched.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read existing file: %v", err)
+	}
+	if string(data) != "existing content" {
+		t.Errorf("existing file was overwritten: content = %q", string(data))
+	}
+}
+
+// TestGetTurns_DropsInvalidRawJSON guards the fix for `ccvault show
+// --json`'s "error calling MarshalJSON for type json.RawMessage" crash.
+// Corrupted or truncated raw_json blobs (from old syncs, before the
+// PR #12 oversized-line placeholder fix) leave non-JSON bytes in the
+// column. Downstream json.Marshal(Turn) crashes because the field is
+// declared json.RawMessage. GetTurns now validates + drops invalid
+// raw_json at scan time so consumers don't explode.
+func TestGetTurns_DropsInvalidRawJSON(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	p := &models.Project{Path: "/proj/rawjson", DisplayName: "rawjson"}
+	if err := db.UpsertProject(p); err != nil {
+		t.Fatalf("upsert project: %v", err)
+	}
+	s := &models.Session{
+		ID: "session-rawjson", ProjectID: p.ID,
+		StartedAt: time.Now(), SourceFile: "/proj/rawjson/session.jsonl",
+	}
+	if err := db.UpsertSession(s); err != nil {
+		t.Fatalf("upsert session: %v", err)
+	}
+
+	// Insert a mix of valid and invalid raw_json blobs directly into the
+	// turns table, bypassing InsertTurns so we can simulate corruption.
+	now := time.Now()
+	rows := []struct {
+		id, raw string
+	}{
+		{"turn-valid", `{"uuid":"turn-valid","type":"user"}`},
+		{"turn-invalid-trailing", `{"a":1}xyz`}, // valid JSON followed by garbage
+		{"turn-invalid-partial", `{"a":1`},      // truncated
+		{"turn-invalid-nonjson", `not json at all`},
+		{"turn-empty", ``}, // empty stored as NULL — sql.NullString.Valid=false, skipped
+	}
+	for _, r := range rows {
+		var rawJSON sql.NullString
+		if r.raw != "" {
+			rawJSON = sql.NullString{String: r.raw, Valid: true}
+		}
+		_, err := db.Exec(
+			`INSERT INTO turns (id, session_id, type, timestamp, content, raw_json)
+			 VALUES (?, ?, 'user', ?, 'placeholder', ?)`,
+			r.id, s.ID, now, rawJSON)
+		if err != nil {
+			t.Fatalf("insert %s: %v", r.id, err)
+		}
+		// Advance time to keep ORDER BY deterministic.
+		now = now.Add(time.Millisecond)
+	}
+
+	turns, err := db.GetTurns(s.ID)
+	if err != nil {
+		t.Fatalf("GetTurns: %v", err)
+	}
+	if len(turns) != len(rows) {
+		t.Fatalf("expected %d turns, got %d", len(rows), len(turns))
+	}
+	if len(turns) < len(rows) {
+		return
+	}
+
+	// The one with valid raw_json should keep its bytes.
+	if len(turns[0].RawJSON) == 0 {
+		t.Errorf("turn %q: RawJSON dropped but source was valid JSON", turns[0].ID)
+	}
+	// The three with invalid raw_json should have RawJSON dropped (nil).
+	for i := 1; i <= 3; i++ {
+		if len(turns[i].RawJSON) != 0 {
+			t.Errorf("turn %q: RawJSON = %q (%d bytes), want dropped (invalid source)",
+				turns[i].ID, string(turns[i].RawJSON), len(turns[i].RawJSON))
+		}
+	}
+	// Empty stored as NULL — RawJSON stays nil either way.
+	if len(turns[4].RawJSON) != 0 {
+		t.Errorf("turn %q: RawJSON should be nil for NULL raw_json", turns[4].ID)
+	}
+
+	// Regression assertion for the actual reported symptom: json.Marshal
+	// on the whole turn set must not crash on any of these rows.
+	if _, err := json.Marshal(turns); err != nil {
+		t.Errorf("json.Marshal(turns) crashed with invalid raw_json still in-place: %v", err)
 	}
 }

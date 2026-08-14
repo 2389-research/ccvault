@@ -5,7 +5,11 @@ package sync
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/2389-research/ccvault/internal/config"
@@ -36,6 +40,7 @@ type Syncer struct {
 	sources         []config.SourceConfig
 	full            bool
 	verbose         bool
+	cacheDir        string // analytics cache dir; if set, --full invalidates it
 	onProgress      func(msg string)
 	onCountProgress func(current, total int)
 }
@@ -47,6 +52,16 @@ type Option func(*Syncer)
 func WithFullSync(full bool) Option {
 	return func(s *Syncer) {
 		s.full = full
+	}
+}
+
+// WithCacheDir tells the Syncer where the analytics parquet cache lives so
+// that --full can invalidate it alongside the SQLite tables. Without this,
+// `ccvault sync --full` clears SQLite but the DuckDB analytics view (TUI +
+// MCP get_analytics) continues to read stale data from sessions.parquet.
+func WithCacheDir(dir string) Option {
+	return func(s *Syncer) {
+		s.cacheDir = dir
 	}
 }
 
@@ -89,6 +104,23 @@ func New(database *db.DB, sources []config.SourceConfig, opts ...Option) *Syncer
 func (s *Syncer) Run() (*Stats, error) {
 	start := time.Now()
 	stats := &Stats{}
+
+	// Full sync: wipe all data first so stale projects/sessions don't linger
+	if s.full {
+		s.progress("Full sync: clearing existing data...")
+		if err := s.db.ResetAll(); err != nil {
+			return nil, fmt.Errorf("reset database: %w", err)
+		}
+		// Invalidate the DuckDB analytics cache so the TUI Analytics tab
+		// and MCP get_analytics don't keep serving pre-reset numbers. The
+		// TUI auto-rebuilds when sessions.parquet is missing.
+		if s.cacheDir != "" {
+			parquetPath := filepath.Join(s.cacheDir, "sessions.parquet")
+			if err := os.Remove(parquetPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				return nil, fmt.Errorf("invalidate analytics cache: %w", err)
+			}
+		}
+	}
 
 	// Batch-load all stored mtimes in one query for fast incremental checks
 	var storedMtimes map[string]time.Time

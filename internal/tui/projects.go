@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/2389-research/ccvault/internal/compact"
 	"github.com/2389-research/ccvault/internal/db"
+	"github.com/2389-research/ccvault/internal/projectref"
 	"github.com/2389-research/ccvault/pkg/models"
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
@@ -138,8 +140,29 @@ func (m *ProjectsModel) View() string {
 		b.WriteString(normalStyle.Render("No projects found. Run 'ccvault sync' first."))
 		b.WriteString("\n")
 	} else {
-		// Header
-		header := fmt.Sprintf("%-50s %-12s %8s %10s %12s", "PROJECT", "SOURCE", "SESSIONS", "TOKENS", "LAST ACTIVE")
+		layout := pickProjectsLayout(m.width)
+
+		// Header — SOURCE column is dropped entirely when the layout
+		// tier assigns it width 0.
+		var header string
+		if layout.Source > 0 {
+			header = fmt.Sprintf("%s %s %s %s %s %s",
+				padVisual("PROJECT", layout.Project),
+				padVisual("PATH", layout.Path),
+				padVisual("SOURCE", layout.Source),
+				padVisual("SESSIONS", layout.Sessions),
+				padVisual("TOKENS", layout.Tokens),
+				padVisual("ACTIVE", layout.LastActive),
+			)
+		} else {
+			header = fmt.Sprintf("%s %s %s %s %s",
+				padVisual("PROJECT", layout.Project),
+				padVisual("PATH", layout.Path),
+				padVisual("SESSIONS", layout.Sessions),
+				padVisual("TOKENS", layout.Tokens),
+				padVisual("ACTIVE", layout.LastActive),
+			)
+		}
 		b.WriteString(headerStyle.Render(header))
 		b.WriteString("\n")
 
@@ -152,21 +175,31 @@ func (m *ProjectsModel) View() string {
 
 		for i := m.offset; i < end; i++ {
 			p := m.projects[i]
-			name := p.DisplayName
-			if len(name) > 48 {
-				name = "..." + name[len(name)-45:]
+			selected := i == m.cursor
+			// Class A — Label for the short column, Path shown separately.
+			// Each cell is a compact.Result so the row visibly signals
+			// which columns had to be shortened at this width. Pass
+			// `selected` so cellText skips Faint on the highlighted row
+			// (Faint's ANSI reset would tear selectedStyle mid-row).
+			nameCell := cellText(compact.Truncate(projectref.Label(&p), layout.Project), layout.Project, selected)
+			pathCell := cellText(compact.Path(p.Path, layout.Path), layout.Path, selected)
+			sessionsCell := padVisual(fmt.Sprintf("%d", p.SessionCount), layout.Sessions)
+			tokensCell := padVisual(formatTokensPlain(p.TotalTokens), layout.Tokens)
+			lastActiveCell := cellText(compact.Date(p.LastActivityAt, layout.LastActive), layout.LastActive, selected)
+
+			var line string
+			if layout.Source > 0 {
+				sourceCell := cellText(compact.Source(p.Source, layout.Source), layout.Source, selected)
+				line = fmt.Sprintf("%s %s %s %s %s %s",
+					nameCell, pathCell, sourceCell,
+					sessionsCell, tokensCell, lastActiveCell)
+			} else {
+				line = fmt.Sprintf("%s %s %s %s %s",
+					nameCell, pathCell,
+					sessionsCell, tokensCell, lastActiveCell)
 			}
-			lastActive := p.LastActivityAt.Format("2006-01-02")
 
-			source := p.Source
-			if len(source) > 10 {
-				source = source[:10] + ".."
-			}
-
-			line := fmt.Sprintf("%-50s %-12s %8d %10s %12s",
-				name, source, p.SessionCount, formatTokensPlain(p.TotalTokens), lastActive)
-
-			if i == m.cursor {
+			if selected {
 				b.WriteString(selectedStyle.Render(line))
 			} else {
 				b.WriteString(normalStyle.Render(line))

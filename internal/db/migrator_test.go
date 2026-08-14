@@ -34,8 +34,8 @@ func TestMigrator_FreshDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("query max version: %v", err)
 	}
-	if maxVersion != 4 {
-		t.Errorf("max version = %d, want 4", maxVersion)
+	if maxVersion != 5 {
+		t.Errorf("max version = %d, want 5", maxVersion)
 	}
 
 	// Count migration records
@@ -44,8 +44,8 @@ func TestMigrator_FreshDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("count schema_version: %v", err)
 	}
-	if count != 4 {
-		t.Errorf("schema_version count = %d, want 4", count)
+	if count != 5 {
+		t.Errorf("schema_version count = %d, want 5", count)
 	}
 
 	// Verify all core tables exist
@@ -115,14 +115,14 @@ func TestMigrator_ExistingDatabase(t *testing.T) {
 		t.Fatalf("second RunMigrations: %v", err)
 	}
 
-	// Verify exactly 4 migration records, not 8
+	// Verify exactly 5 migration records, not 10
 	var count int
 	err := db.QueryRow("SELECT COUNT(*) FROM schema_version").Scan(&count)
 	if err != nil {
 		t.Fatalf("count schema_version: %v", err)
 	}
-	if count != 4 {
-		t.Errorf("schema_version count = %d, want 4 (idempotent)", count)
+	if count != 5 {
+		t.Errorf("schema_version count = %d, want 5 (idempotent)", count)
 	}
 }
 
@@ -198,8 +198,8 @@ func TestMigrator_BootstrapExisting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("query max version: %v", err)
 	}
-	if maxVersion != 4 {
-		t.Errorf("max version = %d, want 4", maxVersion)
+	if maxVersion != 5 {
+		t.Errorf("max version = %d, want 5", maxVersion)
 	}
 
 	// Verify exactly 4 records (2 bootstrapped + 2 applied)
@@ -208,8 +208,8 @@ func TestMigrator_BootstrapExisting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("count schema_version: %v", err)
 	}
-	if count != 4 {
-		t.Errorf("schema_version count = %d, want 4", count)
+	if count != 5 {
+		t.Errorf("schema_version count = %d, want 5", count)
 	}
 }
 
@@ -255,8 +255,8 @@ func TestMigrator_BootstrapPartial(t *testing.T) {
 	if err != nil {
 		t.Fatalf("query max version: %v", err)
 	}
-	if maxVersion != 4 {
-		t.Errorf("max version = %d, want 4", maxVersion)
+	if maxVersion != 5 {
+		t.Errorf("max version = %d, want 5", maxVersion)
 	}
 
 	// Verify has_error column was added by migration 002
@@ -299,8 +299,8 @@ func TestMigrator_SourceColumns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("query max version: %v", err)
 	}
-	if maxVersion != 4 {
-		t.Errorf("max version = %d, want 4", maxVersion)
+	if maxVersion != 5 {
+		t.Errorf("max version = %d, want 5", maxVersion)
 	}
 
 	// Insert a project row and verify the source column defaults to "claude-code"
@@ -347,6 +347,143 @@ func TestMigrator_SourceColumns(t *testing.T) {
 	}
 	if source != "claude-code" {
 		t.Errorf("source_files source = %q, want %q", source, "claude-code")
+	}
+}
+
+// TestMigrator_005_NormalizesDisplayNames verifies migration 005 backfills
+// display_name to basename(path) for claude-code rows that predate PR #22.
+// The test simulates the real upgrade path: a database sitting at
+// schema_version=4 with legacy fixture rows, then RunMigrations to apply
+// 005 (rather than re-executing the SQL inline, which would silently pass
+// even if the migration file were empty).
+func TestMigrator_005_NormalizesDisplayNames(t *testing.T) {
+	db := openMemoryDB(t)
+	defer func() { _ = db.Close() }()
+
+	// Bring the DB up through migration 004 first, then roll schema_version
+	// back to 4 so RunMigrations re-applies 005 against our pre-seeded rows.
+	if err := RunMigrations(db); err != nil {
+		t.Fatalf("initial RunMigrations: %v", err)
+	}
+	if _, err := db.Exec("DELETE FROM schema_version WHERE version >= 5"); err != nil {
+		t.Fatalf("roll back schema_version to 4: %v", err)
+	}
+
+	// Fixtures simulating what the old claude-code binary would have
+	// written: multi-segment display_names.
+	claudeCodeFixtures := []struct {
+		path         string
+		staleName    string
+		wantBasename string
+	}{
+		{"/Users/harper/Public/src/2389/ccvault", "src/2389/ccvault", "ccvault"},
+		{"/Users/harper/p/canvas-jira-summarizer", "p/canvas-jira-summarizer", "canvas-jira-summarizer"},
+		{"/short/path", "/short/path", "path"},
+		{"/opt/proj/alpha", "proj/alpha", "alpha"},
+	}
+	for i, f := range claudeCodeFixtures {
+		_, err := db.Exec(`INSERT INTO projects (path, display_name, first_seen_at, last_activity_at, source)
+			VALUES (?, ?, datetime('now'), datetime('now'), 'claude-code')`,
+			f.path, f.staleName)
+		if err != nil {
+			t.Fatalf("insert claude-code fixture %d: %v", i, err)
+		}
+	}
+
+	// CRITICAL: fixtures from OTHER adapters. Their DisplayNames are
+	// intentional branded labels (e.g. nanoclaw's "reed"), NOT basenames of
+	// the path. Migration 005 must skip these.
+	otherAdapterFixtures := []struct {
+		path      string
+		source    string
+		labelKept string // must NOT be rewritten
+	}{
+		{"/adapters/nanoclaw/session/x", "nanoclaw", "reed"},
+		{"/adapters/hex/session/y", "hex", "Hex"},
+		{"/adapters/jeff/session/z", "jeff", "Jeff"},
+	}
+	for i, f := range otherAdapterFixtures {
+		_, err := db.Exec(`INSERT INTO projects (path, display_name, first_seen_at, last_activity_at, source)
+			VALUES (?, ?, datetime('now'), datetime('now'), ?)`,
+			f.path, f.labelKept, f.source)
+		if err != nil {
+			t.Fatalf("insert %s fixture %d: %v", f.source, i, err)
+		}
+	}
+
+	// Run migrations — 005 should apply to the pre-seeded rows.
+	if err := RunMigrations(db); err != nil {
+		t.Fatalf("second RunMigrations: %v", err)
+	}
+
+	// Rewind invariant: after DELETE + RunMigrations, schema_version
+	// must have exactly one row at version 5 (proving the migrator's
+	// applyMigration ran and re-INSERTed the version record). If a
+	// future refactor to UPSERT/ON CONFLICT DO NOTHING breaks this,
+	// the rewind trick would silently no-op and the subsequent
+	// assertions would look like a 005 regression.
+	var v5Count int
+	if err := db.QueryRow("SELECT COUNT(*) FROM schema_version WHERE version = 5").Scan(&v5Count); err != nil {
+		t.Fatalf("query schema_version 5: %v", err)
+	}
+	if v5Count != 1 {
+		t.Fatalf("schema_version version=5 count = %d after rewind+RunMigrations, want 1 (rewind mechanism broken)", v5Count)
+	}
+
+	// Claude-code fixtures normalized.
+	for _, f := range claudeCodeFixtures {
+		var got string
+		if err := db.QueryRow("SELECT display_name FROM projects WHERE path = ?", f.path).Scan(&got); err != nil {
+			t.Fatalf("query display_name for %s: %v", f.path, err)
+		}
+		if got != f.wantBasename {
+			t.Errorf("claude-code path=%q: display_name = %q, want %q", f.path, got, f.wantBasename)
+		}
+	}
+
+	// Other-adapter branded labels preserved — this is the regression guard
+	// the adversarial review demanded.
+	for _, f := range otherAdapterFixtures {
+		var got string
+		if err := db.QueryRow("SELECT display_name FROM projects WHERE path = ?", f.path).Scan(&got); err != nil {
+			t.Fatalf("query display_name for %s (%s): %v", f.path, f.source, err)
+		}
+		if got != f.labelKept {
+			t.Errorf("%s adapter path=%q: display_name = %q, want %q (migration must not touch non-claude-code rows)",
+				f.source, f.path, got, f.labelKept)
+		}
+	}
+
+	// Edge cases: empty path, trailing-slash path, and claude-code rows
+	// whose staleName is somehow already a basename — all deliberately
+	// skipped or no-op by the WHERE clause. Confirm the WHERE clause is
+	// working; a broken WHERE that skips too many rows would fail the
+	// claude-code assertions above, and one that includes too many rows
+	// would fail here.
+	if _, err := db.Exec(`INSERT INTO projects (path, display_name, first_seen_at, last_activity_at, source)
+		VALUES ('', 'keep-me-empty', datetime('now'), datetime('now'), 'claude-code'),
+		       ('/foo/bar/', 'keep-me-trailing', datetime('now'), datetime('now'), 'claude-code')`); err != nil {
+		t.Fatalf("insert edge fixtures: %v", err)
+	}
+	// Re-apply by rolling back version and re-migrating — proves the WHERE
+	// still holds under re-application.
+	if _, err := db.Exec("DELETE FROM schema_version WHERE version >= 5"); err != nil {
+		t.Fatalf("roll back for edge test: %v", err)
+	}
+	if err := RunMigrations(db); err != nil {
+		t.Fatalf("third RunMigrations: %v", err)
+	}
+	for _, want := range []struct{ path, name string }{
+		{"", "keep-me-empty"},
+		{"/foo/bar/", "keep-me-trailing"},
+	} {
+		var got string
+		if err := db.QueryRow("SELECT display_name FROM projects WHERE path = ?", want.path).Scan(&got); err != nil {
+			t.Fatalf("query edge %q: %v", want.path, err)
+		}
+		if got != want.name {
+			t.Errorf("edge path=%q: display_name = %q, want unchanged %q", want.path, got, want.name)
+		}
 	}
 }
 

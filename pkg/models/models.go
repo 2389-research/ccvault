@@ -10,9 +10,19 @@ import (
 
 // Project represents a Claude Code project (working directory)
 type Project struct {
-	ID             int64     `json:"id"`
-	Path           string    `json:"path"`         // Full filesystem path
-	DisplayName    string    `json:"display_name"` // Shortened name for display
+	ID   int64  `json:"id"`
+	Path string `json:"path"` // Full filesystem path; the identifier
+
+	// DisplayName is the adapter-provided label for this project. It is a
+	// label, not an identifier — two projects can share a DisplayName and
+	// still be different projects. Any display or matching code should
+	// go through internal/projectref (Label / Inline / Ref / ResolveAll)
+	// rather than reading this field directly, so the four-class rendering
+	// discipline stays consistent across CLI, TUI, and MCP surfaces. An
+	// AST allowlist test enforces this — direct reads outside the helper
+	// package will fail CI.
+	DisplayName string `json:"display_name"`
+
 	FirstSeenAt    time.Time `json:"first_seen_at"`
 	LastActivityAt time.Time `json:"last_activity_at"`
 	SessionCount   int       `json:"session_count"`

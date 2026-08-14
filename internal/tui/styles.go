@@ -57,13 +57,14 @@ var (
 			BorderForeground(mutedColor).
 			Padding(1, 2)
 
-	// Header styles
+	// Header styles. No fixed Width — the tabular views (Projects,
+	// Sessions) render at whatever their layout tier assigns, and a
+	// hard-coded 100-col width would force narrow terminals to wrap.
 	headerStyle = lipgloss.NewStyle().
 			Bold(true).
 			Foreground(lipgloss.Color("#F3F4F6")).
 			Background(lipgloss.Color("#374151")).
-			Padding(0, 1).
-			Width(100)
+			Padding(0, 1)
 
 	// Content type styles
 	userStyle = lipgloss.NewStyle().
@@ -118,6 +119,14 @@ var (
 	secondaryStyle = lipgloss.NewStyle().
 			Foreground(secondaryColor).
 			Bold(true)
+
+	// compactStyle marks a cell whose content has been shortened by
+	// internal/compact — the row is telling the user "there's more
+	// here you can't see at this width." Faint keeps the value fully
+	// legible while signaling the abbreviation without stealing space
+	// for an inline indicator character.
+	compactStyle = lipgloss.NewStyle().
+			Faint(true)
 )
 
 // formatTokens formats a token count for display

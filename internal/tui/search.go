@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/2389-research/ccvault/internal/compact"
 	"github.com/2389-research/ccvault/internal/db"
+	"github.com/2389-research/ccvault/internal/projectref"
 	"github.com/2389-research/ccvault/internal/search"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -155,13 +157,13 @@ func (m *SearchModel) Update(msg tea.Msg) tea.Cmd {
 				m.ensureVisible()
 			}
 
-		case "home", "g":
+		case "home":
 			if !m.focused && len(m.results) > 0 {
 				m.cursor = 0
 				m.offset = 0
 			}
 
-		case "end", "G":
+		case "end":
 			if !m.focused && len(m.results) > 0 {
 				m.cursor = len(m.results) - 1
 				m.ensureVisible()
@@ -172,6 +174,19 @@ func (m *SearchModel) Update(msg tea.Msg) tea.Cmd {
 				var cmd tea.Cmd
 				m.input, cmd = m.input.Update(msg)
 				return cmd
+			}
+			// vim-style navigation when not typing
+			switch msg.String() {
+			case "g":
+				if len(m.results) > 0 {
+					m.cursor = 0
+					m.offset = 0
+				}
+			case "G":
+				if len(m.results) > 0 {
+					m.cursor = len(m.results) - 1
+					m.ensureVisible()
+				}
 			}
 		}
 
@@ -283,6 +298,13 @@ func (m *SearchModel) View() string {
 			}
 			b.WriteString("\n\n")
 
+			// Load all projects once so adapter DisplayNames surface in
+			// the result rows instead of falling through to basename.
+			// Best-effort — on lookup failure rows degrade to basename.
+			projectsList, projectsErr := m.db.GetProjects("activity", 0)
+			_ = projectsErr
+			byPath := projectref.ProjectsByPath(projectsList)
+
 			// Results list
 			visibleRows := m.visibleRows()
 			end := m.offset + visibleRows
@@ -307,15 +329,12 @@ func (m *SearchModel) View() string {
 					turnType = "asst"
 				}
 
-				project := r.ProjectPath
-				// Show just the last 2 path components
-				parts := strings.Split(project, "/")
-				if len(parts) > 2 {
-					project = strings.Join(parts[len(parts)-2:], "/")
-				}
-				if len(project) > 25 {
-					project = "..." + project[len(project)-22:]
-				}
+				// Class A — short label in a compact cell. LabelFromPath
+				// surfaces adapter DisplayName instead of always
+				// synthesizing a bare Project stub. compact.Truncate
+				// handles multibyte adapter labels correctly (rune
+				// slicing, not byte slicing).
+				project := compact.Truncate(projectref.LabelFromPath(r.ProjectPath, byPath), 25).Text
 
 				model := r.Model
 				if len(model) > 20 {

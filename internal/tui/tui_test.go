@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
+
 	"github.com/2389-research/ccvault/internal/db"
 	"github.com/2389-research/ccvault/internal/search"
 	"github.com/2389-research/ccvault/pkg/models"
@@ -197,13 +199,14 @@ func TestSessionsModel_ViewShowsSourceColumn(t *testing.T) {
 	if !strings.Contains(view, "SOURCE") {
 		t.Errorf("view missing SOURCE header:\n%s", view)
 	}
-	// "claude-code" (11 chars) gets truncated to "claude-cod.." by
-	// sessions.go's 10-char cap; assert on the visible prefix so the test
-	// verifies the source column is populated correctly without pinning
-	// exact truncation behavior.
-	for _, wantPrefix := range []string{"claude-cod", "codex"} {
-		if !strings.Contains(view, wantPrefix) {
-			t.Errorf("view missing source prefix %q:\n%s", wantPrefix, view)
+	// At 120 cols the layout gives SOURCE 10-12 cols. compact.Source
+	// abbreviates "claude-code" → "claude" (well-known shorthand under
+	// pressure), codex stays as-is when it fits. Assert on presence
+	// rather than exact truncation form so future ladder tweaks don't
+	// break the test.
+	for _, wantSubstr := range []string{"claude", "codex"} {
+		if !strings.Contains(view, wantSubstr) {
+			t.Errorf("view missing source substring %q:\n%s", wantSubstr, view)
 		}
 	}
 }
@@ -240,9 +243,12 @@ func TestProjectsModel_ViewShowsSourceColumn(t *testing.T) {
 	if !strings.Contains(view, "SOURCE") {
 		t.Errorf("view missing SOURCE header:\n%s", view)
 	}
-	for _, src := range []string{"claude-code", "codex"} {
+	// compact.Source abbreviates "claude-code" → "claude" at the layout
+	// tier's SOURCE width; "codex" stays as-is when it fits. Assert on
+	// per-adapter recognizable substrings.
+	for _, src := range []string{"claude", "codex"} {
 		if !strings.Contains(view, src) {
-			t.Errorf("view missing source %q:\n%s", src, view)
+			t.Errorf("view missing source substring %q:\n%s", src, view)
 		}
 	}
 }
@@ -279,5 +285,337 @@ func TestSearchModel_ViewShowsResultsHeader(t *testing.T) {
 	// Result entries should have the project path fragment rendered.
 	if !strings.Contains(view, "tui-test") {
 		t.Errorf("view missing seeded project path 'tui-test':\n%s", view)
+	}
+}
+
+// --- PR #22: PATH column, conditional PROJECT column, vim-nav focus ---
+
+// TestProjectsModel_ViewShowsPathColumn verifies the PATH column added in
+// PR #22 renders the project's filesystem path (with ~ home substitution
+// when applicable).
+func TestProjectsModel_ViewShowsPathColumn(t *testing.T) {
+	database := openTUITestDB(t)
+	now := time.Now().UTC()
+	// A path we can be sure isn't inside $HOME, so we don't have to guess
+	// whether ~ substitution kicks in.
+	pathA := "/opt/proj/alpha"
+	pathB := "/opt/proj/beta"
+	for _, path := range []string{pathA, pathB} {
+		_, err := database.Exec(`INSERT INTO projects
+			(path, display_name, first_seen_at, last_activity_at, session_count, total_tokens, source)
+			VALUES (?, ?, ?, ?, 1, 100, 'claude-code')`,
+			path, filepath.Base(path), now, now)
+		if err != nil {
+			t.Fatalf("insert project %s: %v", path, err)
+		}
+	}
+
+	m := NewProjectsModel(database)
+	msg := m.loadProjects()
+	loaded, ok := msg.(projectsLoadedMsg)
+	if !ok {
+		t.Fatalf("expected projectsLoadedMsg, got %T", msg)
+	}
+	m.Update(loaded)
+	m.SetSize(140, 30)
+
+	view := m.View()
+
+	if !strings.Contains(view, "PATH") {
+		t.Errorf("view missing PATH header:\n%s", view)
+	}
+	// Both project paths should appear.
+	for _, want := range []string{pathA, pathB} {
+		if !strings.Contains(view, want) {
+			t.Errorf("view missing project path %q:\n%s", want, view)
+		}
+	}
+}
+
+// TestProjectsModel_HomeSubstitutionRespectsPathSeparator guards the
+// boundary bug flagged in fresh-eyes review: `HasPrefix(path, home)` alone
+// matches paths that merely SHARE A PREFIX with HOME rather than being
+// under it. e.g. HOME="/Users/dyl" would rewrite "/Users/dylan/repo" as
+// "~an/repo" — a garbage path attributed to a different user. The fix is
+// to also require an OS path separator after the HOME prefix.
+func TestProjectsModel_HomeSubstitutionRespectsPathSeparator(t *testing.T) {
+	// Force HOME to a value that is a prefix of the project path but is
+	// NOT its parent directory.
+	t.Setenv("HOME", "/Users/dyl")
+
+	database := openTUITestDB(t)
+	now := time.Now().UTC()
+	// This path starts with the HOME string but "/Users/dylan/..." is not
+	// under "/Users/dyl/..." — no substitution should happen.
+	pathA := "/Users/dylan/repo"
+	if _, err := database.Exec(`INSERT INTO projects
+		(path, display_name, first_seen_at, last_activity_at, session_count, total_tokens, source)
+		VALUES (?, 'repo', ?, ?, 1, 100, 'claude-code')`,
+		pathA, now, now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+
+	m := NewProjectsModel(database)
+	msg := m.loadProjects()
+	loaded, ok := msg.(projectsLoadedMsg)
+	if !ok {
+		t.Fatalf("expected projectsLoadedMsg, got %T", msg)
+	}
+	m.Update(loaded)
+	m.SetSize(140, 30)
+
+	view := m.View()
+
+	// The full literal path must appear — no ~ substitution.
+	if !strings.Contains(view, pathA) {
+		t.Errorf("path %q should appear verbatim (HOME=/Users/dyl is a prefix but not parent):\n%s", pathA, view)
+	}
+	// Specifically: no "~an/repo" garbled form.
+	if strings.Contains(view, "~an/repo") {
+		t.Errorf("HOME prefix incorrectly substituted mid-path segment, producing '~an/repo':\n%s", view)
+	}
+}
+
+// TestSessionsModel_ViewShowsProjectColumnWhenUnfiltered covers PR #22's
+// conditional PROJECT column: when no project filter is set, the sessions
+// list renders a PROJECT column so users know which project each session
+// belongs to. When m.project != nil (drilled into a specific project),
+// the column is suppressed since it would be redundant.
+func TestSessionsModel_ViewShowsProjectColumnWhenUnfiltered(t *testing.T) {
+	database := openTUITestDB(t)
+	_, _ = seedProjectAndSessions(t, database, []string{"claude-code"})
+
+	m := NewSessionsModel(database) // no project filter
+	msg := m.loadSessions()
+	loaded, ok := msg.(sessionsLoadedMsg)
+	if !ok {
+		t.Fatalf("expected sessionsLoadedMsg, got %T", msg)
+	}
+	m.Update(loaded)
+	m.SetSize(140, 30)
+
+	view := m.View()
+
+	if !strings.Contains(view, "PROJECT") {
+		t.Errorf("unfiltered sessions view missing PROJECT header:\n%s", view)
+	}
+	// The seeded project's basename should appear in the PROJECT column.
+	if !strings.Contains(view, "tui-test") {
+		t.Errorf("unfiltered sessions view missing project name 'tui-test':\n%s", view)
+	}
+}
+
+// TestSessionsModel_ViewOmitsProjectColumnWhenFiltered is the flip side:
+// with a project filter set, the PROJECT column disappears (it would be
+// the same value on every row).
+func TestSessionsModel_ViewOmitsProjectColumnWhenFiltered(t *testing.T) {
+	database := openTUITestDB(t)
+	projectID, _ := seedProjectAndSessions(t, database, []string{"claude-code"})
+
+	m := NewSessionsModel(database)
+	m.SetProject(projectID)
+	msg := m.loadSessions()
+	loaded, ok := msg.(sessionsLoadedMsg)
+	if !ok {
+		t.Fatalf("expected sessionsLoadedMsg, got %T", msg)
+	}
+	m.Update(loaded)
+	m.SetSize(140, 30)
+
+	view := m.View()
+
+	// Header should have STARTED first (not PROJECT). Assert on
+	// header-column ordering rather than raw absence of the word "project",
+	// since the subtitle line may still contain the word "project" as text.
+	// A line starting with "PROJECT " means the PROJECT column header row
+	// slipped through, which is exactly what SetProject should suppress.
+	lines := strings.Split(view, "\n")
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "PROJECT ") {
+			t.Errorf("filtered sessions view should suppress PROJECT column, found header: %q", trimmed)
+		}
+	}
+}
+
+// TestSearchModel_VimNavIgnoredWhileFocused guards PR #22's search-input
+// fix: g/G should NOT jump to top/bottom when the search input is focused
+// (they should be treated as literal characters instead). When the input
+// is unfocused (browsing results), g/G resume their vim-style navigation.
+func TestSearchModel_VimNavIgnoredWhileFocused(t *testing.T) {
+	database := openTUITestDB(t)
+	_, _ = seedProjectAndSessions(t, database, []string{"claude-code"})
+
+	m := NewSearchModel(database)
+
+	// Simulate a completed search so results exist and we have a cursor to move.
+	m.Update(searchResultsMsg{results: []search.Result{
+		{Turn: models.Turn{ID: "t1"}}, {Turn: models.Turn{ID: "t2"}}, {Turn: models.Turn{ID: "t3"}},
+	}})
+	m.SetSize(120, 30)
+
+	// Move cursor off the top so a mistaken "jump to top" would be observable.
+	m.cursor = 2
+
+	// Focused: sending 'G' must NOT jump cursor to last row — it should be
+	// consumed by the input widget as a literal character.
+	m.focused = true
+	m.input.Focus()
+	m.input.SetValue("") // start empty so we can detect the char was consumed
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'G'}})
+	if m.cursor != 2 {
+		t.Errorf("focused input: 'G' moved cursor from 2 to %d, want 2 (input should consume the char)", m.cursor)
+	}
+	// Positive-side assertion: guards against a broken impl that silently
+	// drops the char instead of forwarding to the input widget (a strictly
+	// worse regression than the original bug).
+	if got := m.input.Value(); got != "G" {
+		t.Errorf("focused input: expected 'G' to reach the search box, got value = %q", got)
+	}
+
+	// Unfocused: 'G' MUST jump cursor to the last row.
+	m.focused = false
+	m.input.Blur()
+	m.cursor = 0
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'G'}})
+	if m.cursor != len(m.results)-1 {
+		t.Errorf("unfocused: 'G' did not jump to last row, cursor = %d, want %d", m.cursor, len(m.results)-1)
+	}
+
+	// Unfocused: 'g' MUST jump cursor back to the top.
+	m.cursor = 2
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	if m.cursor != 0 {
+		t.Errorf("unfocused: 'g' did not jump to top, cursor = %d, want 0", m.cursor)
+	}
+}
+
+// --- Follow-up 8: narrow-terminal layout tiers ---------------------------
+
+// stripANSI removes ANSI escape sequences so we can measure visible
+// column width. Rendering fills each terminal cell; we care about how
+// many columns those cells span in the actual output, not how many
+// bytes the styled string carries.
+func stripANSI(s string) string {
+	var out strings.Builder
+	inEscape := false
+	for _, r := range s {
+		if inEscape {
+			if r == 'm' {
+				inEscape = false
+			}
+			continue
+		}
+		if r == '\x1b' {
+			inEscape = true
+			continue
+		}
+		out.WriteRune(r)
+	}
+	return out.String()
+}
+
+// widestRowVisible returns the max visible-column width of any row in
+// the rendered view, ignoring ANSI escapes.
+func widestRowVisible(view string) int {
+	max := 0
+	for _, line := range strings.Split(view, "\n") {
+		w := 0
+		for range stripANSI(line) {
+			w++
+		}
+		if w > max {
+			max = w
+		}
+	}
+	return max
+}
+
+// TestProjectsModel_ViewFitsAt80Cols guards follow-up 8: the Projects
+// list must not overflow an 80-column terminal. Before the compaction
+// discipline landed, the header alone was ~103 chars.
+func TestProjectsModel_ViewFitsAt80Cols(t *testing.T) {
+	database := openTUITestDB(t)
+	now := time.Now().UTC()
+	// A path with several segments that would blow past a naive
+	// truncation but should compress via segment initialing.
+	_, err := database.Exec(`INSERT INTO projects
+		(path, display_name, first_seen_at, last_activity_at, session_count, total_tokens, source)
+		VALUES (?, ?, ?, ?, 5, 12345, 'claude-code')`,
+		"/Users/dylan/work/2389/deep/nested/ccvault", "ccvault", now, now)
+	if err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+
+	m := NewProjectsModel(database)
+	msg := m.loadProjects()
+	loaded, ok := msg.(projectsLoadedMsg)
+	if !ok {
+		t.Fatalf("expected projectsLoadedMsg, got %T", msg)
+	}
+	m.Update(loaded)
+	m.SetSize(80, 30)
+
+	view := m.View()
+
+	if got := widestRowVisible(view); got > 80 {
+		t.Errorf("Projects view widest row = %d cols at 80-col terminal, want ≤ 80\n%s", got, view)
+	}
+	// Still should mention the project label somewhere.
+	if !strings.Contains(view, "ccvault") {
+		t.Errorf("view missing project label 'ccvault':\n%s", view)
+	}
+}
+
+// TestSessionsModel_ViewFitsAt80Cols is the sessions counterpart.
+func TestSessionsModel_ViewFitsAt80Cols(t *testing.T) {
+	database := openTUITestDB(t)
+	_, _ = seedProjectAndSessions(t, database, []string{"claude-code"})
+
+	m := NewSessionsModel(database)
+	msg := m.loadSessions()
+	loaded, ok := msg.(sessionsLoadedMsg)
+	if !ok {
+		t.Fatalf("expected sessionsLoadedMsg, got %T", msg)
+	}
+	m.Update(loaded)
+	m.SetSize(80, 30)
+
+	view := m.View()
+
+	if got := widestRowVisible(view); got > 80 {
+		t.Errorf("Sessions view widest row = %d cols at 80-col terminal, want ≤ 80\n%s", got, view)
+	}
+}
+
+// TestProjectsModel_ViewShowsFullPathWhenRoomy is the opposite side of
+// the compaction discipline — when the terminal has enough columns, we
+// must NOT prematurely compress the path. Users should see the fullest
+// form their terminal can hold.
+func TestProjectsModel_ViewShowsFullPathWhenRoomy(t *testing.T) {
+	database := openTUITestDB(t)
+	now := time.Now().UTC()
+	// A 24-char path that fits within the tier-0 PATH budget (30 cols).
+	// Realistic length for a typical user project directory.
+	longPath := "/opt/proj/team/ccvault"
+	_, err := database.Exec(`INSERT INTO projects
+		(path, display_name, first_seen_at, last_activity_at, session_count, total_tokens, source)
+		VALUES (?, ?, ?, ?, 1, 100, 'claude-code')`,
+		longPath, "ccvault", now, now)
+	if err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+
+	m := NewProjectsModel(database)
+	msg := m.loadProjects()
+	loaded, _ := msg.(projectsLoadedMsg)
+	m.Update(loaded)
+	m.SetSize(140, 30)
+
+	view := m.View()
+
+	// At 140 cols, the full path should appear (no aggressive initialing).
+	if !strings.Contains(view, longPath) {
+		t.Errorf("Projects view at 140 cols did not show full path %q:\n%s", longPath, view)
 	}
 }

@@ -5,6 +5,7 @@ package db
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -87,7 +88,23 @@ func (db *DB) GetTurns(sessionID string) ([]models.Turn, error) {
 			t.Content = content.String
 		}
 		if rawJSON.Valid {
-			t.RawJSON = []byte(rawJSON.String)
+			// Turn.RawJSON is json.RawMessage — downstream json.Marshal
+			// (e.g. `ccvault show --json`) will error with "error calling
+			// MarshalJSON for type json.RawMessage" if the stored bytes
+			// aren't valid JSON. Corrupted rows do exist in the wild —
+			// old syncs from before the oversized-line + truncation-
+			// placeholder fixes could have stored non-JSON blobs.
+			//
+			// Validate at scan time and drop invalid raw_json so consumers
+			// don't crash on `json.Marshal`. Data is preserved in the
+			// text `content` column and in `source_file` for anyone who
+			// needs the original.
+			raw := []byte(rawJSON.String)
+			if json.Valid(raw) {
+				t.RawJSON = raw
+			}
+			// else: leave t.RawJSON as nil; the JSON tag is omitempty so
+			// it'll be dropped from output rather than crashing marshal.
 		}
 		turns = append(turns, t)
 	}

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -18,14 +19,19 @@ import (
 	_ "github.com/2389-research/ccvault/pkg/adapter/jeff"
 	_ "github.com/2389-research/ccvault/pkg/adapter/nanoclaw"
 
+	"golang.org/x/term"
+
 	"github.com/2389-research/ccvault/internal/analytics"
+	"github.com/2389-research/ccvault/internal/compact"
 	"github.com/2389-research/ccvault/internal/config"
 	"github.com/2389-research/ccvault/internal/db"
 	"github.com/2389-research/ccvault/internal/export"
 	"github.com/2389-research/ccvault/internal/mcp"
+	"github.com/2389-research/ccvault/internal/projectref"
 	"github.com/2389-research/ccvault/internal/search"
 	"github.com/2389-research/ccvault/internal/sync"
 	"github.com/2389-research/ccvault/internal/tui"
+	"github.com/2389-research/ccvault/pkg/models"
 	"github.com/spf13/cobra"
 )
 
@@ -126,16 +132,16 @@ var quickstartCmd = &cobra.Command{
 
 // orientation holds the database state gathered for the orient command.
 type orientation struct {
-	ProjectCount  int
-	SessionCount  int
-	TurnCount     int
-	SessionTokens int64
-	FirstActivity time.Time
-	LastActivity  time.Time
-	ToolStats     map[string]int
-	TokensByModel map[string]int64
-	ProjectNames  []string
-	Warnings      []string
+	ProjectCount   int
+	SessionCount   int
+	TurnCount      int
+	SessionTokens  int64
+	FirstActivity  time.Time
+	LastActivity   time.Time
+	ToolStats      map[string]int
+	TokensByModel  map[string]int64
+	RecentProjects []models.Project // full rows so JSON emits {name, path} via projectref.Ref
+	Warnings       []string
 }
 
 // gatherOrientation collects database state for the orient command.
@@ -166,9 +172,7 @@ func gatherOrientation(database *db.DB) orientation {
 
 	projects, err := database.GetProjects("activity", 5)
 	warn("recent projects", err)
-	for _, p := range projects {
-		o.ProjectNames = append(o.ProjectNames, p.DisplayName)
-	}
+	o.RecentProjects = projects
 
 	return o
 }
@@ -210,7 +214,7 @@ Use --json for machine-readable output.`,
 				"last_session":  o.LastActivity.Format(time.RFC3339),
 				"days_span":     int(o.LastActivity.Sub(o.FirstActivity).Hours() / 24),
 			},
-			"recent_projects": o.ProjectNames,
+			"recent_projects": projectref.RefsFromValues(o.RecentProjects),
 			"top_tools":       o.ToolStats,
 			"models":          o.TokensByModel,
 			"commands": map[string]string{
@@ -280,10 +284,11 @@ Use --json for machine-readable output.`,
 		fmt.Printf("  Span:  %d days\n", int(o.LastActivity.Sub(o.FirstActivity).Hours()/24))
 		fmt.Println()
 
-		if len(o.ProjectNames) > 0 {
+		if len(o.RecentProjects) > 0 {
 			fmt.Println("Recent Projects:")
-			for _, name := range o.ProjectNames {
-				fmt.Printf("  - %s\n", name)
+			for i := range o.RecentProjects {
+				// Class B — human-readable inline form, with disambiguating path
+				fmt.Printf("  - %s\n", projectref.Inline(&o.RecentProjects[i]))
 			}
 			fmt.Println()
 		}
@@ -316,11 +321,32 @@ Use --json for machine-readable output.`,
 var syncCmd = &cobra.Command{
 	Use:   "sync",
 	Short: "Sync conversations from Claude Code",
-	Long:  `Scan ~/.claude and index new or updated sessions into the ccvault database.`,
+	// User-facing errors (refusal on "no", non-TTY without --yes, sync
+	// failures) shouldn't dump the whole flag table — that's noise
+	// reserved for argument-parse errors.
+	SilenceUsage: true,
+	Long: `Scan ~/.claude and index new or updated sessions into the ccvault database.
+
+By default, sync is INCREMENTAL — only files whose mtimes have changed
+are re-parsed. Sessions and projects that no longer exist upstream
+remain in the DB until a --full sync runs.
+
+--full WIPES all indexed data before re-scanning. Before wiping, it:
+  1. Shows the current row counts and prompts for confirmation.
+     Non-interactive callers (piped stdin, cron, CI) must pass --yes;
+     they will be REFUSED without it — no silent wipes.
+  2. Backs up the SQLite DB to <data_dir>/backups/ccvault-<timestamp>.db
+     via VACUUM INTO (skipped with --no-backup).
+  3. Rotates to the most recent 5 backups.
+
+If the subsequent re-scan produces bad state, restore by copying the
+backup file back over the live DB. The backup path is printed at run.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		full, _ := cmd.Flags().GetBool("full")
 		verbose, _ := cmd.Flags().GetBool("verbose")
 		sourceFilter, _ := cmd.Flags().GetString("source")
+		assumeYes, _ := cmd.Flags().GetBool("yes")
+		noBackup, _ := cmd.Flags().GetBool("no-backup")
 
 		// Load config
 		cfg, err := config.Load()
@@ -359,10 +385,24 @@ var syncCmd = &cobra.Command{
 		}
 		defer func() { _ = database.Close() }()
 
-		// Create syncer
+		// --full safety: confirm + backup BEFORE handing off to the syncer,
+		// so a user who Ctrl-Cs at the prompt hasn't lost anything, and a
+		// user who confirms has a snapshot to restore from if re-scan
+		// produces bad state.
+		var backupPath string
+		if full {
+			backupPath, err = prepareFullSync(database, cfg.DataDir, assumeYes, noBackup)
+			if err != nil {
+				return err
+			}
+		}
+
+		// Create syncer. Cache dir is plumbed through so --full can
+		// invalidate the analytics parquet alongside SQLite.
 		syncer := sync.New(database, sources,
 			sync.WithFullSync(full),
 			sync.WithVerbose(verbose),
+			sync.WithCacheDir(filepath.Join(cfg.DataDir, "analytics")),
 			sync.WithProgressCallback(func(msg string) {
 				fmt.Println(msg)
 			}),
@@ -371,6 +411,10 @@ var syncCmd = &cobra.Command{
 		// Run sync
 		stats, err := syncer.Run()
 		if err != nil {
+			if full && backupPath != "" {
+				fmt.Fprintf(os.Stderr, "\nsync failed after wiping data. Restore the pre-sync state with:\n"+
+					"  cp %q %q\n", backupPath, filepath.Join(cfg.DataDir, "ccvault.db"))
+			}
 			return fmt.Errorf("sync: %w", err)
 		}
 
@@ -474,9 +518,26 @@ Supports Gmail-like query syntax:
 		}
 
 		fmt.Printf("Found %d results:\n\n", len(results))
+		// Load projects once so adapter DisplayNames surface in results.
+		// Surface enrichment failures on stderr rather than silently
+		// falling through to basename — agents watching this output need
+		// to know why adapter branding is missing.
+		allProjects, enrichErr := database.GetProjects("activity", 0)
+		if enrichErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: project enrichment lookup failed: %v — Project labels fell back to basename\n", enrichErr)
+		}
+		byPath := projectref.ProjectsByPath(allProjects)
 		for i, r := range results {
-			fmt.Printf("%d. [%s] %s\n", i+1, r.Turn.Type, r.Turn.Timestamp.Format("2006-01-02 15:04"))
-			fmt.Printf("   Project: %s\n", r.ProjectPath)
+			fmt.Printf("%d. [%s] %s  Session: %s\n", i+1, r.Turn.Type, r.Turn.Timestamp.Format("2006-01-02 15:04"), r.Turn.SessionID)
+			// Class B — combined form so same-basename projects don't look identical.
+			// Look up the full project so adapter DisplayName is preserved.
+			var p *models.Project
+			if hit, ok := byPath[r.ProjectPath]; ok {
+				p = hit
+			} else {
+				p = &models.Project{Path: r.ProjectPath}
+			}
+			fmt.Printf("   Project: %s\n", projectref.Inline(p))
 			if r.Model != "" {
 				fmt.Printf("   Model: %s\n", r.Model)
 			}
@@ -491,6 +552,8 @@ var statsCmd = &cobra.Command{
 	Use:   "stats",
 	Short: "Show archive statistics",
 	RunE: func(cmd *cobra.Command, args []string) error {
+		jsonOutput, _ := cmd.Flags().GetBool("json")
+
 		cfg, err := config.Load()
 		if err != nil {
 			return fmt.Errorf("load config: %w", err)
@@ -526,6 +589,28 @@ var statsCmd = &cobra.Command{
 		tokensByModel, err := database.GetTokensByModel()
 		if err != nil {
 			return fmt.Errorf("get tokens by model: %w", err)
+		}
+
+		if jsonOutput {
+			out := map[string]interface{}{
+				"projects":        projectCount,
+				"sessions":        sessionCount,
+				"turns":           turnCount,
+				"total_tokens":    sessionTokens,
+				"project_tokens":  projectTokens,
+				"tokens_by_model": tokensByModel,
+				"top_tools":       toolStats,
+			}
+			if !first.IsZero() && !last.IsZero() {
+				out["activity"] = map[string]interface{}{
+					"first_session": first.Format(time.RFC3339),
+					"last_session":  last.Format(time.RFC3339),
+					"days_span":     int(last.Sub(first).Hours() / 24),
+				}
+			}
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			return enc.Encode(out)
 		}
 
 		// Print statistics
@@ -597,7 +682,8 @@ var listProjectsCmd = &cobra.Command{
 		if jsonOutput {
 			enc := json.NewEncoder(os.Stdout)
 			enc.SetIndent("", "  ")
-			return enc.Encode(projects)
+			// Class C — Ref shape via projectref so agents see {name, path}.
+			return enc.Encode(projectref.EnrichedRefsFromValues(projects))
 		}
 
 		if len(projects) == 0 {
@@ -605,15 +691,25 @@ var listProjectsCmd = &cobra.Command{
 			return nil
 		}
 
-		fmt.Printf("%-50s %8s %10s %12s\n", "PROJECT", "SESSIONS", "TOKENS", "LAST ACTIVE")
-		fmt.Println(strings.Repeat("-", 85))
-		for _, p := range projects {
-			name := p.DisplayName
-			if len(name) > 48 {
-				name = "..." + name[len(name)-45:]
-			}
-			lastActive := p.LastActivityAt.Format("2006-01-02")
-			fmt.Printf("%-50s %8d %10s %12s\n", name, p.SessionCount, formatTokens(p.TotalTokens), lastActive)
+		// Route CLI cell rendering through compact so wide paths get
+		// smart initialing (via segment initialing) rather than "..." +
+		// tail truncation. Widths chosen to fit an 80-col terminal:
+		// 20+28+8+10+10 = 76 + 4 seps = 80.
+		fmt.Printf("%s %s %8s %10s %10s\n",
+			padVisualCLI("PROJECT", 20),
+			padVisualCLI("PATH", 28),
+			"SESSIONS", "TOKENS", "ACTIVE")
+		fmt.Println(strings.Repeat("-", 80))
+		for i := range projects {
+			p := &projects[i]
+			// Class A — Label for the short column, compact.Path for the path.
+			nameText := compact.Truncate(projectref.Label(p), 20).Text
+			pathText := compact.Path(p.Path, 28).Text
+			lastActive := compact.Date(p.LastActivityAt, 10).Text
+			fmt.Printf("%s %s %8d %10s %10s\n",
+				padVisualCLI(nameText, 20),
+				padVisualCLI(pathText, 28),
+				p.SessionCount, formatTokens(p.TotalTokens), lastActive)
 		}
 
 		return nil
@@ -646,24 +742,30 @@ var listSessionsCmd = &cobra.Command{
 			if err != nil {
 				return fmt.Errorf("get project: %w", err)
 			}
-			if project == nil {
-				// Try partial match
+			if project != nil {
+				projectID = project.ID
+			} else {
+				// Fall back to partial match. Class D — return every match
+				// via projectref.ResolveAll rather than silently picking one,
+				// and refuse when ambiguous so the user picks a longer filter.
 				projects, err := database.GetProjects("activity", 0)
 				if err != nil {
 					return fmt.Errorf("get projects: %w", err)
 				}
-				for _, p := range projects {
-					if strings.Contains(strings.ToLower(p.Path), strings.ToLower(projectFilter)) ||
-						strings.Contains(strings.ToLower(p.DisplayName), strings.ToLower(projectFilter)) {
-						projectID = p.ID
-						break
-					}
-				}
-				if projectID == 0 {
+				matches := projectref.ResolveAll(projects, projectFilter)
+				switch len(matches) {
+				case 0:
 					return fmt.Errorf("project not found: %s", projectFilter)
+				case 1:
+					projectID = matches[0].ID
+				default:
+					lines := make([]string, len(matches))
+					for i, m := range matches {
+						lines[i] = "  - " + m.Path
+					}
+					return fmt.Errorf("multiple projects match %q; be more specific:\n%s",
+						projectFilter, strings.Join(lines, "\n"))
 				}
-			} else {
-				projectID = project.ID
 			}
 		}
 
@@ -675,7 +777,13 @@ var listSessionsCmd = &cobra.Command{
 		if jsonOutput {
 			enc := json.NewEncoder(os.Stdout)
 			enc.SetIndent("", "  ")
-			return enc.Encode(sessions)
+			// Class C — enrich with project_name so agents get the
+			// doctrine {name, path} shape on session objects.
+			allProjects, enrichErr := database.GetProjects("activity", 0)
+			if enrichErr != nil {
+				fmt.Fprintf(os.Stderr, "warning: project enrichment lookup failed: %v\n", enrichErr)
+			}
+			return enc.Encode(projectref.SessionRefsFromValues(sessions, projectref.ProjectsByID(allProjects)))
 		}
 
 		if len(sessions) == 0 {
@@ -683,21 +791,55 @@ var listSessionsCmd = &cobra.Command{
 			return nil
 		}
 
-		fmt.Printf("%-38s %16s %6s %10s %s\n", "SESSION ID", "STARTED", "TURNS", "TOKENS", "MODEL")
-		fmt.Println(strings.Repeat("-", 100))
+		// PROJECT column is redundant when the list is already filtered to
+		// one project — mirror the TUI's showProject := m.project == nil.
+		showProject := projectFilter == ""
+		// Load projects once so adapter DisplayNames (jeff/hex/nanoclaw)
+		// surface in the PROJECT column.
+		var byPath map[string]*models.Project
+		if showProject {
+			allProjects, enrichErr := database.GetProjects("activity", 0)
+			if enrichErr != nil {
+				fmt.Fprintf(os.Stderr, "warning: project enrichment lookup failed: %v — PROJECT column fell back to basename\n", enrichErr)
+			}
+			byPath = projectref.ProjectsByPath(allProjects)
+		}
+		if showProject {
+			fmt.Printf("%-38s %-25s %16s %6s %10s %s\n", "SESSION ID", "PROJECT", "STARTED", "TURNS", "TOKENS", "MODEL")
+			fmt.Println(strings.Repeat("-", 125))
+		} else {
+			fmt.Printf("%-38s %16s %6s %10s %s\n", "SESSION ID", "STARTED", "TURNS", "TOKENS", "MODEL")
+			fmt.Println(strings.Repeat("-", 100))
+		}
 		for _, s := range sessions {
 			model := s.Model
 			if len(model) > 25 {
 				model = model[:22] + "..."
 			}
 			tokens := s.InputTokens + s.OutputTokens
-			fmt.Printf("%-38s %16s %6d %10s %s\n",
-				s.ID,
-				s.StartedAt.Format("2006-01-02 15:04"),
-				s.TurnCount,
-				formatTokens(tokens),
-				model,
-			)
+			if showProject {
+				// Class A — LabelFromPath surfaces adapter DisplayName
+				// instead of falling through to basename. Route through
+				// compact.Truncate so multibyte adapter labels don't get
+				// byte-sliced (e.g. Cyrillic "Иванов-project").
+				project := compact.Truncate(projectref.LabelFromPath(s.ProjectPath, byPath), 23).Text
+				fmt.Printf("%-38s %-25s %16s %6d %10s %s\n",
+					s.ID,
+					project,
+					s.StartedAt.Format("2006-01-02 15:04"),
+					s.TurnCount,
+					formatTokens(tokens),
+					model,
+				)
+			} else {
+				fmt.Printf("%-38s %16s %6d %10s %s\n",
+					s.ID,
+					s.StartedAt.Format("2006-01-02 15:04"),
+					s.TurnCount,
+					formatTokens(tokens),
+					model,
+				)
+			}
 		}
 
 		return nil
@@ -954,8 +1096,13 @@ func init() {
 	// Orient flags
 	orientCmd.Flags().Bool("json", false, "Output as JSON for machine parsing")
 
+	// Stats flags
+	statsCmd.Flags().Bool("json", false, "Output as JSON for machine parsing")
+
 	// Sync flags
-	syncCmd.Flags().Bool("full", false, "Force full rescan instead of incremental")
+	syncCmd.Flags().Bool("full", false, "WIPES all indexed data then re-scans. Prompts for confirmation + takes a backup by default")
+	syncCmd.Flags().Bool("yes", false, "Skip the --full confirmation prompt (assumes 'yes')")
+	syncCmd.Flags().Bool("no-backup", false, "Skip the pre-wipe SQLite backup when running --full (dangerous)")
 	syncCmd.Flags().BoolP("verbose", "v", false, "Show verbose output")
 	syncCmd.Flags().String("source", "", "Sync only the configured source with this name (matches sources[].name from config)")
 
@@ -999,4 +1146,156 @@ func formatTokens(n int64) string {
 		return fmt.Sprintf("%.1fK", float64(n)/1_000)
 	}
 	return fmt.Sprintf("%d", n)
+}
+
+// padVisualCLI left-pads s to visual column width using rune count.
+// Mirrors internal/tui.padVisual — sprintf's %-Ns pads by bytes and
+// would misalign columns when compact.* returns strings containing "…"
+// (3 bytes / 1 col) or non-ASCII path segments.
+func padVisualCLI(s string, width int) string {
+	visW := 0
+	for range s {
+		visW++
+	}
+	if visW >= width {
+		return s
+	}
+	return s + strings.Repeat(" ", width-visW)
+}
+
+// prepareFullSync runs the safety block for `sync --full`: it shows
+// current row counts, prompts for confirmation (unless assumeYes is set
+// or stdin isn't a TTY), takes a VACUUM INTO backup to
+// <dataDir>/backups/ccvault-<timestamp>.db, and rotates to the most
+// recent 5 backups. Returns the backup path (empty when --no-backup)
+// so the caller can print a restore hint if the subsequent re-scan
+// fails. An error from any step aborts the sync before any wiping.
+func prepareFullSync(database *db.DB, dataDir string, assumeYes, noBackup bool) (string, error) {
+	// Gather counts for the user-facing confirmation.
+	projects, sessions, turns, err := fullSyncCounts(database)
+	if err != nil {
+		return "", fmt.Errorf("gather counts: %w", err)
+	}
+
+	fmt.Fprintf(os.Stderr, "\n"+
+		"⚠ --full WIPES the ccvault DB before re-scanning:\n"+
+		"    Projects: %d\n"+
+		"    Sessions: %d\n"+
+		"    Turns:    %d\n",
+		projects, sessions, turns)
+
+	if assumeYes {
+		fmt.Fprintln(os.Stderr, "  (--yes supplied — proceeding without prompt)")
+	} else if !isStdinTTY() {
+		// Piped stdin, cron, CI: no interactive prompt possible. Refuse
+		// rather than silently wipe — the caller must opt in with --yes.
+		return "", fmt.Errorf("aborted: stdin is not a TTY and --yes was not supplied; refusing to wipe data non-interactively")
+	} else {
+		fmt.Fprint(os.Stderr, "\nType 'yes' to confirm the wipe: ")
+		var answer string
+		_, _ = fmt.Fscanln(os.Stdin, &answer)
+		if answer != "yes" {
+			return "", fmt.Errorf("aborted: confirmation not received (got %q)", answer)
+		}
+	}
+
+	if noBackup {
+		fmt.Fprintln(os.Stderr, "  (--no-backup supplied — skipping backup step)")
+		return "", nil
+	}
+
+	backupDir := filepath.Join(dataDir, "backups")
+	if err := os.MkdirAll(backupDir, 0o750); err != nil {
+		return "", fmt.Errorf("create backup dir: %w", err)
+	}
+	timestamp := time.Now().UTC().Format("20060102-150405")
+	backupPath := filepath.Join(backupDir, fmt.Sprintf("ccvault-%s.db", timestamp))
+
+	fmt.Fprintf(os.Stderr, "  Backing up to %s ... ", backupPath)
+	if err := database.BackupTo(backupPath); err != nil {
+		fmt.Fprintln(os.Stderr, "FAILED")
+		return "", fmt.Errorf("backup: %w", err)
+	}
+	fmt.Fprintln(os.Stderr, "done")
+
+	if pruned, err := pruneOldBackups(backupDir, 5); err != nil {
+		fmt.Fprintf(os.Stderr, "  warning: could not rotate old backups: %v\n", err)
+	} else if pruned > 0 {
+		fmt.Fprintf(os.Stderr, "  Rotated %d older backup(s)\n", pruned)
+	}
+	fmt.Fprintln(os.Stderr)
+
+	return backupPath, nil
+}
+
+// fullSyncCounts returns the row counts shown in the confirmation prompt.
+// A stat failure doesn't abort — 0s are surfaced so the user sees they
+// couldn't be gathered but can still proceed.
+func fullSyncCounts(database *db.DB) (int, int, int, error) {
+	projects, _, err := database.GetProjectStats()
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	sessions, turns, _, err := database.GetSessionStats()
+	if err != nil {
+		return projects, 0, 0, err
+	}
+	return projects, sessions, turns, nil
+}
+
+// isStdinTTY returns true when stdin is attached to an interactive
+// terminal — used to decide whether the confirmation prompt makes
+// sense. Piped input (`echo yes | ccvault sync --full`), redirected
+// input (`< /dev/null`), and scripted invocation all return false;
+// they must pass --yes to opt in.
+//
+// term.IsTerminal issues an ioctl and is stricter than checking
+// os.ModeCharDevice — /dev/null is a character device but not a
+// terminal, and misclassifying it opens a scripted-wipe hole.
+func isStdinTTY() bool {
+	// os.Stdin.Fd() returns uintptr; on Unix it's always a small fd
+	// (0, 1, 2, low positive). The int conversion is standard for
+	// x/term.IsTerminal's signature and cannot overflow in practice.
+	return term.IsTerminal(int(os.Stdin.Fd())) //nolint:gosec // G115: fd is always a small non-negative int
+}
+
+// pruneOldBackups keeps the most recent `keep` files matching
+// ccvault-*.db in dir and deletes the older ones. Returns how many were
+// removed. Files with unparseable names are ignored (left in place).
+func pruneOldBackups(dir string, keep int) (int, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, err
+	}
+	// Collect ccvault-*.db backups.
+	type entry struct {
+		name string
+		path string
+	}
+	var backups []entry
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasPrefix(name, "ccvault-") || !strings.HasSuffix(name, ".db") {
+			continue
+		}
+		backups = append(backups, entry{name: name, path: filepath.Join(dir, name)})
+	}
+	// Timestamp is the filename between "ccvault-" and ".db", format
+	// YYYYMMDD-HHMMSS — lexicographic sort matches chronological sort.
+	// Newest first.
+	sort.Slice(backups, func(i, j int) bool { return backups[i].name > backups[j].name })
+	if len(backups) <= keep {
+		return 0, nil
+	}
+	pruned := 0
+	for _, b := range backups[keep:] {
+		if err := os.Remove(b.path); err != nil {
+			return pruned, fmt.Errorf("remove %s: %w", b.path, err)
+		}
+		pruned++
+	}
+	return pruned, nil
 }

@@ -6,8 +6,11 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
+	"github.com/2389-research/ccvault/internal/compact"
 	"github.com/2389-research/ccvault/internal/db"
+	"github.com/2389-research/ccvault/internal/projectref"
 	"github.com/2389-research/ccvault/pkg/models"
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
@@ -144,10 +147,11 @@ func (m *SessionsModel) View() string {
 
 	var b strings.Builder
 
-	// Title
+	// Title — Class B (inline), path shown so same-basename projects don't
+	// render an ambiguous title when the user drills into one of them.
 	title := "Sessions"
 	if m.project != nil {
-		title = fmt.Sprintf("Sessions: %s", m.project.DisplayName)
+		title = fmt.Sprintf("Sessions: %s", projectref.Inline(m.project))
 	}
 	b.WriteString(titleStyle.Render(title))
 	b.WriteString("\n")
@@ -158,10 +162,37 @@ func (m *SessionsModel) View() string {
 		b.WriteString(normalStyle.Render("No sessions found."))
 		b.WriteString("\n")
 	} else {
-		// Header
-		header := fmt.Sprintf("%-20s %-12s %6s %10s %-30s", "STARTED", "SOURCE", "TURNS", "TOKENS", "MODEL")
-		b.WriteString(headerStyle.Render(header))
+		showProject := m.project == nil
+		layout := pickSessionsLayout(m.width, showProject)
+
+		// Build the header from the layout — same set of cells shown in
+		// the rows, so tier decisions carry through automatically.
+		var headerParts []string
+		if layout.Project > 0 {
+			headerParts = append(headerParts, padVisual("PROJECT", layout.Project))
+		}
+		headerParts = append(headerParts, padVisual("STARTED", layout.Started))
+		if layout.Source > 0 {
+			headerParts = append(headerParts, padVisual("SOURCE", layout.Source))
+		}
+		headerParts = append(headerParts,
+			padVisual("TURNS", layout.Turns),
+			padVisual("TOKENS", layout.Tokens),
+			padVisual("MODEL", layout.Model),
+		)
+		b.WriteString(headerStyle.Render(strings.Join(headerParts, " ")))
 		b.WriteString("\n")
+
+		// Load all projects once so adapter DisplayNames (jeff, hex,
+		// nanoclaw) surface in the PROJECT column instead of falling
+		// through to basename via a synthetic Project stub. On lookup
+		// failure the map is empty and rows degrade to basename — that
+		// matches best-effort TUI rendering (no ok place to raise a
+		// modal here); the failure would separately surface via the
+		// dedicated data-load message paths anyway.
+		projectsList, projectsErr := m.db.GetProjects("activity", 0)
+		_ = projectsErr // best-effort enrichment for column labels only
+		byPath := projectref.ProjectsByPath(projectsList)
 
 		// List
 		visibleRows := m.visibleRows()
@@ -172,25 +203,38 @@ func (m *SessionsModel) View() string {
 
 		for i := m.offset; i < end; i++ {
 			s := m.sessions[i]
-			model := s.Model
-			if len(model) > 28 {
-				model = model[:25] + "..."
-			}
 			tokens := s.InputTokens + s.OutputTokens
+			selected := i == m.cursor
 
-			source := s.Source
-			if len(source) > 10 {
-				source = source[:10] + ".."
+			var parts []string
+			if layout.Project > 0 {
+				project := projectref.LabelFromPath(s.ProjectPath, byPath)
+				parts = append(parts, cellText(compact.Truncate(project, layout.Project), layout.Project, selected))
 			}
+			// STARTED — date + time in a single cell. Renders differently
+			// based on how much space we've been given.
+			startedText := s.StartedAt.Format("2006-01-02 15:04")
+			// Use rune count for consistency with the rest of the compact
+			// discipline. startedText is ASCII so bytes==runes here, but
+			// staying uniform means future format changes won't misalign.
+			if layout.Started < utf8.RuneCountInString(startedText) {
+				// Drop the time to fit
+				startedText = compact.Date(s.StartedAt, layout.Started).Text
+				parts = append(parts, cellText(compact.Result{Text: startedText, Shortened: true}, layout.Started, selected))
+			} else {
+				parts = append(parts, padVisual(startedText, layout.Started))
+			}
+			if layout.Source > 0 {
+				parts = append(parts, cellText(compact.Source(s.Source, layout.Source), layout.Source, selected))
+			}
+			parts = append(parts,
+				padVisual(fmt.Sprintf("%d", s.TurnCount), layout.Turns),
+				padVisual(formatTokensPlain(tokens), layout.Tokens),
+				cellText(compact.Model(s.Model, layout.Model), layout.Model, selected),
+			)
 
-			line := fmt.Sprintf("%-20s %-12s %6d %10s %-30s",
-				s.StartedAt.Format("2006-01-02 15:04"),
-				source,
-				s.TurnCount,
-				formatTokensPlain(tokens),
-				model)
-
-			if i == m.cursor {
+			line := strings.Join(parts, " ")
+			if selected {
 				b.WriteString(selectedStyle.Render(line))
 			} else {
 				b.WriteString(normalStyle.Render(line))

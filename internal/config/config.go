@@ -126,5 +126,5 @@ func validateSources(sources []SourceConfig) error {
 
 // EnsureDataDir creates the data directory if it doesn't exist
 func EnsureDataDir(cfg *Config) error {
-	return os.MkdirAll(cfg.DataDir, 0755)
+	return os.MkdirAll(cfg.DataDir, 0o750)
 }

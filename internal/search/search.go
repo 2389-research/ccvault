@@ -106,31 +106,33 @@ func (s *Searcher) buildQuery(q *Query, limit int) (string, []interface{}) {
 		argNum++
 	}
 
-	// Project filter
+	// Project filter — user input flows into LIKE, so escape SQLite wildcards
+	// (%, _, \) to prevent an agent passing "project:foo%bar" from matching
+	// unrelated projects via silent wildcard expansion.
 	if q.Project != "" {
-		conditions = append(conditions, fmt.Sprintf("(p.path LIKE $%d OR p.display_name LIKE $%d)", argNum, argNum+1))
-		pattern := "%" + q.Project + "%"
+		conditions = append(conditions, fmt.Sprintf("(p.path LIKE $%d ESCAPE '\\' OR p.display_name LIKE $%d ESCAPE '\\')", argNum, argNum+1))
+		pattern := "%" + escapeLike(q.Project) + "%"
 		args = append(args, pattern, pattern)
 		argNum += 2
 	}
 
-	// Model filter
+	// Model filter — same escape discipline.
 	if q.Model != "" {
-		conditions = append(conditions, fmt.Sprintf("s.model LIKE $%d", argNum))
-		args = append(args, "%"+q.Model+"%")
+		conditions = append(conditions, fmt.Sprintf("s.model LIKE $%d ESCAPE '\\'", argNum))
+		args = append(args, "%"+escapeLike(q.Model)+"%")
 		argNum++
 	}
 
-	// File filter (in tool_uses)
+	// File filter (in tool_uses) — same escape discipline as project/model.
 	if q.File != "" {
 		if q.Tool == "" {
 			// Need to add tool_uses join
 			baseQuery += ` LEFT JOIN tool_uses tu2 ON t.session_id = tu2.session_id`
-			conditions = append(conditions, fmt.Sprintf("tu2.file_path LIKE $%d", argNum))
+			conditions = append(conditions, fmt.Sprintf("tu2.file_path LIKE $%d ESCAPE '\\'", argNum))
 		} else {
-			conditions = append(conditions, fmt.Sprintf("tu.file_path LIKE $%d", argNum))
+			conditions = append(conditions, fmt.Sprintf("tu.file_path LIKE $%d ESCAPE '\\'", argNum))
 		}
-		args = append(args, "%"+q.File+"%")
+		args = append(args, "%"+escapeLike(q.File)+"%")
 		argNum++
 	}
 
@@ -255,4 +257,19 @@ func escapeFTS5Query(query string) string {
 	}
 
 	return strings.Join(result, " ")
+}
+
+// escapeLike escapes SQLite LIKE metacharacters (%, _, and the backslash
+// escape itself) so agent-supplied filter fragments can't smuggle
+// wildcards into the SQL — a project filter like "foo%bar" from an
+// untrusted agent should match the literal string "foo%bar", not any
+// project whose name contains "foo" followed by "bar" with anything
+// between. Use with `LIKE ? ESCAPE '\\'` in the query.
+func escapeLike(s string) string {
+	replacer := strings.NewReplacer(
+		`\`, `\\`,
+		`%`, `\%`,
+		`_`, `\_`,
+	)
+	return replacer.Replace(s)
 }

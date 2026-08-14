@@ -39,6 +39,27 @@ var scenarioCoverage = map[string]string{
 	"list-sessions-pagination-hint":  "internal/mcp TestListSessions_ReportsHasMore",
 	"orient-warns-on-stat-failure":   "cmd/ccvault TestGatherOrientation_CollectsWarningsOnFailure",
 	"analytics-unavailable-hint":     "internal/mcp TestGetAnalytics_ReportsUnavailableAnalytics",
+	// PR #22 (beau): --full sync fix + display improvements
+	"full-sync-clears-stale-data":             "internal/db TestResetAll_ClearsDataAndPreservesSchema + internal/sync TestSyncer_FullFlagClearsStaleData",
+	"incremental-sync-preserves-stale-rows":   "internal/sync TestSyncer_IncrementalDoesNotClear",
+	"display-name-is-basename":                "pkg/parser TestGetDisplayName",
+	"tui-projects-shows-path-column":          "internal/tui TestProjectsModel_ViewShowsPathColumn",
+	"tui-sessions-conditional-project-column": "internal/tui TestSessionsModel_ViewShowsProjectColumnWhenUnfiltered + TestSessionsModel_ViewOmitsProjectColumnWhenFiltered",
+	"tui-search-vim-nav-respects-focus":       "internal/tui TestSearchModel_VimNavIgnoredWhileFocused",
+	// PR #22 follow-ups 4-8: projectref discipline
+	"projectref-class-a-tabular":        "internal/projectref TestLabel_* + internal/tui TestProjectsModel_ViewShowsPathColumn",
+	"projectref-class-b-inline":         "internal/projectref TestInline_*",
+	"projectref-class-c-structured":     "internal/projectref TestRef_* + TestRefsFromValues_PreservesOrder",
+	"projectref-class-d-input-matching": "internal/projectref TestResolveAll_*",
+	"projectref-ast-allowlist-enforced": "test/integration TestProjectRefEnforcement",
+	"list-projects-sort-tiebreaker":     "internal/db TestGetProjects_SortStableTiebreaker",
+	// PR #22 follow-up 8: width-aware compaction
+	"compact-path-progressive-initialing":      "internal/compact TestPath_*",
+	"compact-model-never-drops-datestamp":      "internal/compact TestModel_NeverDropsTrailingDatestamp",
+	"compact-source-ladder":                    "internal/compact TestSource_*",
+	"compact-shortened-signals-tui-cell-style": "internal/compact TestPath_InitialsIntermediateSegmentsWhenTight (Shortened=true) + internal/tui TestProjectsModel_ViewFitsAt80Cols",
+	"tui-projects-fits-at-80-cols":             "internal/tui TestProjectsModel_ViewFitsAt80Cols + TestSessionsModel_ViewFitsAt80Cols",
+	"tui-shows-full-form-when-roomy":           "internal/tui TestProjectsModel_ViewShowsFullPathWhenRoomy",
 }
 
 func TestScenariosHaveCoverage(t *testing.T) {

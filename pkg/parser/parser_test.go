@@ -131,7 +131,7 @@ func TestParseTimestamp(t *testing.T) {
 
 func TestParseSessionReader(t *testing.T) {
 	input := `{"type":"file-history-snapshot","messageId":"msg1","snapshot":{}}
-{"uuid":"turn1","sessionId":"session1","type":"user","timestamp":"2026-02-02T20:00:00.000Z","message":{"role":"user","content":"Hello"}}
+{"uuid":"turn1","sessionId":"session1","type":"user","cwd":"/Users/harper/p/my-project","timestamp":"2026-02-02T20:00:00.000Z","message":{"role":"user","content":"Hello"}}
 {"uuid":"turn2","sessionId":"session1","type":"assistant","timestamp":"2026-02-02T20:01:00.000Z","message":{"model":"claude-opus-4-5-20251101","role":"assistant","content":[{"type":"text","text":"Hi there!"}],"usage":{"input_tokens":10,"output_tokens":5}}}`
 
 	turns, session, _, err := ParseSessionReader(strings.NewReader(input), "/test/session.jsonl")
@@ -161,6 +161,10 @@ func TestParseSessionReader(t *testing.T) {
 
 	if session.SourceFile != "/test/session.jsonl" {
 		t.Errorf("Expected source file /test/session.jsonl, got %s", session.SourceFile)
+	}
+
+	if session.ProjectPath != "/Users/harper/p/my-project" {
+		t.Errorf("Expected project path /Users/harper/p/my-project, got %s", session.ProjectPath)
 	}
 }
 
@@ -275,19 +279,32 @@ func TestDecodeProjectPath(t *testing.T) {
 
 func TestGetDisplayName(t *testing.T) {
 	tests := []struct {
+		name     string
 		input    string
 		expected string
 	}{
-		{"/Users/harper/Public/src/2389/ccvault", "src/2389/ccvault"},
-		{"/short/path", "/short/path"},
-		{"/a/b/c/d/e", "c/d/e"},
+		// Normal shapes.
+		{"deep-path", "/Users/harper/Public/src/2389/ccvault", "ccvault"},
+		{"typical", "/Users/harper/p/canvas-jira-summarizer", "canvas-jira-summarizer"},
+		{"short", "/short/path", "path"},
+		// Edge cases. Empty must return "" so callers can distinguish
+		// "no project" from a real path (filepath.Base("") returns ".",
+		// which would leak a bare dot into CLI/TUI/MCP output and defeat
+		// the sync-side fallback to ProjectPath).
+		{"empty", "", ""},
+		// filepath.Base("/") returns "/" — pass through, we don't want to
+		// show a bare dot for the root either.
+		{"root", "/", "/"},
+		// Trailing slash: filepath.Base strips it and returns the last
+		// non-empty component.
+		{"trailing-slash", "/Users/dylan/repo/", "repo"},
 	}
 
 	for _, tc := range tests {
-		t.Run(tc.input, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			result := GetDisplayName(tc.input)
 			if result != tc.expected {
-				t.Errorf("GetDisplayName(%s) = %s, want %s", tc.input, result, tc.expected)
+				t.Errorf("GetDisplayName(%q) = %q, want %q", tc.input, result, tc.expected)
 			}
 		})
 	}

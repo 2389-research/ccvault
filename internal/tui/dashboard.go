@@ -9,7 +9,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/2389-research/ccvault/internal/compact"
 	"github.com/2389-research/ccvault/internal/db"
+	"github.com/2389-research/ccvault/internal/projectref"
 	"github.com/2389-research/ccvault/pkg/models"
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
@@ -202,16 +204,28 @@ func (m *DashboardModel) View() string {
 	}
 	b.WriteString("\n")
 
-	// Top projects
+	// Top projects — dashboard is compact so we use tighter budgets than
+	// the full Projects list. Both cells route through compact so the
+	// row visibly signals when values have been shortened.
 	if len(m.topProjects) > 0 {
 		b.WriteString(lipgloss.NewStyle().Bold(true).Render("Recent Projects"))
 		b.WriteString("\n")
-		for _, p := range m.topProjects {
-			name := p.DisplayName
-			if len(name) > 40 {
-				name = "..." + name[len(name)-37:]
-			}
-			b.WriteString(normalStyle.Render(fmt.Sprintf("  %-42s %3d sessions", name, p.SessionCount)))
+
+		// Allocate slightly less than the full Projects list because the
+		// dashboard mixes several sections; leave breathing room.
+		nameW, pathW := 22, 32
+		if m.width >= 100 {
+			nameW, pathW = 24, 37
+		} else if m.width < 80 {
+			nameW, pathW = 18, 22
+		}
+
+		for i := range m.topProjects {
+			p := m.topProjects[i]
+			// Dashboard is not row-selectable, so no compactStyle nesting risk.
+			nameCell := cellText(compact.Truncate(projectref.Label(&p), nameW), nameW, false)
+			pathCell := cellText(compact.Path(p.Path, pathW), pathW, false)
+			b.WriteString(normalStyle.Render(fmt.Sprintf("  %s %s %3d sessions", nameCell, pathCell, p.SessionCount)))
 			b.WriteString("\n")
 		}
 		b.WriteString("\n")
@@ -277,19 +291,11 @@ func (m *DashboardModel) renderStats() string {
 		})
 
 		for _, mt := range sorted {
-			// Shorten model name for display
-			modelName := mt.model
-			if len(modelName) > 30 {
-				// Extract meaningful part (e.g., "opus-4" from "claude-opus-4-...")
-				parts := strings.Split(modelName, "-")
-				if len(parts) >= 3 {
-					modelName = strings.Join(parts[1:3], "-")
-				} else {
-					modelName = modelName[:27] + "..."
-				}
-			}
-			lines = append(lines, fmt.Sprintf("  %-20s %s",
-				modelName,
+			// compact.Model preserves semantic identity — strips "claude-"
+			// but never the trailing datestamp.
+			modelCell := cellText(compact.Model(mt.model, 20), 20, false)
+			lines = append(lines, fmt.Sprintf("  %s %s",
+				modelCell,
 				formatTokens(mt.tokens)))
 		}
 	}
