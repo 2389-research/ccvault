@@ -19,6 +19,8 @@ import (
 	_ "github.com/2389-research/ccvault/pkg/adapter/jeff"
 	_ "github.com/2389-research/ccvault/pkg/adapter/nanoclaw"
 
+	"golang.org/x/term"
+
 	"github.com/2389-research/ccvault/internal/analytics"
 	"github.com/2389-research/ccvault/internal/compact"
 	"github.com/2389-research/ccvault/internal/config"
@@ -319,6 +321,10 @@ Use --json for machine-readable output.`,
 var syncCmd = &cobra.Command{
 	Use:   "sync",
 	Short: "Sync conversations from Claude Code",
+	// User-facing errors (refusal on "no", non-TTY without --yes, sync
+	// failures) shouldn't dump the whole flag table — that's noise
+	// reserved for argument-parse errors.
+	SilenceUsage: true,
 	Long: `Scan ~/.claude and index new or updated sessions into the ccvault database.
 
 By default, sync is INCREMENTAL — only files whose mtimes have changed
@@ -1237,16 +1243,20 @@ func fullSyncCounts(database *db.DB) (int, int, int, error) {
 	return projects, sessions, turns, nil
 }
 
-// isStdinTTY returns true when stdin is attached to a terminal — used
-// to decide whether the confirmation prompt makes sense. Piped input
-// (`echo yes | ccvault sync --full`) or scripted invocation gets no
-// prompt but still respects --yes.
+// isStdinTTY returns true when stdin is attached to an interactive
+// terminal — used to decide whether the confirmation prompt makes
+// sense. Piped input (`echo yes | ccvault sync --full`), redirected
+// input (`< /dev/null`), and scripted invocation all return false;
+// they must pass --yes to opt in.
+//
+// term.IsTerminal issues an ioctl and is stricter than checking
+// os.ModeCharDevice — /dev/null is a character device but not a
+// terminal, and misclassifying it opens a scripted-wipe hole.
 func isStdinTTY() bool {
-	fi, err := os.Stdin.Stat()
-	if err != nil {
-		return false
-	}
-	return (fi.Mode() & os.ModeCharDevice) != 0
+	// os.Stdin.Fd() returns uintptr; on Unix it's always a small fd
+	// (0, 1, 2, low positive). The int conversion is standard for
+	// x/term.IsTerminal's signature and cannot overflow in practice.
+	return term.IsTerminal(int(os.Stdin.Fd())) //nolint:gosec // G115: fd is always a small non-negative int
 }
 
 // pruneOldBackups keeps the most recent `keep` files matching
