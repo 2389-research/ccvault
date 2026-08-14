@@ -74,8 +74,10 @@ linters:
         text: "G(30[126]|115)"
       # Test fixtures create files/dirs with dev-permissive modes so
       # the tests can run under any UID. Not shipping code — suppress
-      # G301/G302/G306 in _test.go across the tree.
+      # G301/G302/G306 in _test.go across the tree. G703 (taint-based
+      # path-traversal) also fires here where `dir` comes from
+      # t.TempDir() and is by definition safe.
       - path: .*_test\.go
         linters:
           - gosec
-        text: "G30[126]"
+        text: "G(30[126]|703)"

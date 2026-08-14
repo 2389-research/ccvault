@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -318,11 +319,28 @@ Use --json for machine-readable output.`,
 var syncCmd = &cobra.Command{
 	Use:   "sync",
 	Short: "Sync conversations from Claude Code",
-	Long:  `Scan ~/.claude and index new or updated sessions into the ccvault database.`,
+	Long: `Scan ~/.claude and index new or updated sessions into the ccvault database.
+
+By default, sync is INCREMENTAL — only files whose mtimes have changed
+are re-parsed. Sessions and projects that no longer exist upstream
+remain in the DB until a --full sync runs.
+
+--full WIPES all indexed data before re-scanning. Before wiping, it:
+  1. Shows the current row counts and prompts for confirmation.
+     Non-interactive callers (piped stdin, cron, CI) must pass --yes;
+     they will be REFUSED without it — no silent wipes.
+  2. Backs up the SQLite DB to <data_dir>/backups/ccvault-<timestamp>.db
+     via VACUUM INTO (skipped with --no-backup).
+  3. Rotates to the most recent 5 backups.
+
+If the subsequent re-scan produces bad state, restore by copying the
+backup file back over the live DB. The backup path is printed at run.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		full, _ := cmd.Flags().GetBool("full")
 		verbose, _ := cmd.Flags().GetBool("verbose")
 		sourceFilter, _ := cmd.Flags().GetString("source")
+		assumeYes, _ := cmd.Flags().GetBool("yes")
+		noBackup, _ := cmd.Flags().GetBool("no-backup")
 
 		// Load config
 		cfg, err := config.Load()
@@ -361,6 +379,18 @@ var syncCmd = &cobra.Command{
 		}
 		defer func() { _ = database.Close() }()
 
+		// --full safety: confirm + backup BEFORE handing off to the syncer,
+		// so a user who Ctrl-Cs at the prompt hasn't lost anything, and a
+		// user who confirms has a snapshot to restore from if re-scan
+		// produces bad state.
+		var backupPath string
+		if full {
+			backupPath, err = prepareFullSync(database, cfg.DataDir, assumeYes, noBackup)
+			if err != nil {
+				return err
+			}
+		}
+
 		// Create syncer. Cache dir is plumbed through so --full can
 		// invalidate the analytics parquet alongside SQLite.
 		syncer := sync.New(database, sources,
@@ -375,6 +405,10 @@ var syncCmd = &cobra.Command{
 		// Run sync
 		stats, err := syncer.Run()
 		if err != nil {
+			if full && backupPath != "" {
+				fmt.Fprintf(os.Stderr, "\nsync failed after wiping data. Restore the pre-sync state with:\n"+
+					"  cp %q %q\n", backupPath, filepath.Join(cfg.DataDir, "ccvault.db"))
+			}
 			return fmt.Errorf("sync: %w", err)
 		}
 
@@ -1060,7 +1094,9 @@ func init() {
 	statsCmd.Flags().Bool("json", false, "Output as JSON for machine parsing")
 
 	// Sync flags
-	syncCmd.Flags().Bool("full", false, "Force full rescan instead of incremental")
+	syncCmd.Flags().Bool("full", false, "WIPES all indexed data then re-scans. Prompts for confirmation + takes a backup by default")
+	syncCmd.Flags().Bool("yes", false, "Skip the --full confirmation prompt (assumes 'yes')")
+	syncCmd.Flags().Bool("no-backup", false, "Skip the pre-wipe SQLite backup when running --full (dangerous)")
 	syncCmd.Flags().BoolP("verbose", "v", false, "Show verbose output")
 	syncCmd.Flags().String("source", "", "Sync only the configured source with this name (matches sources[].name from config)")
 
@@ -1119,4 +1155,137 @@ func padVisualCLI(s string, width int) string {
 		return s
 	}
 	return s + strings.Repeat(" ", width-visW)
+}
+
+// prepareFullSync runs the safety block for `sync --full`: it shows
+// current row counts, prompts for confirmation (unless assumeYes is set
+// or stdin isn't a TTY), takes a VACUUM INTO backup to
+// <dataDir>/backups/ccvault-<timestamp>.db, and rotates to the most
+// recent 5 backups. Returns the backup path (empty when --no-backup)
+// so the caller can print a restore hint if the subsequent re-scan
+// fails. An error from any step aborts the sync before any wiping.
+func prepareFullSync(database *db.DB, dataDir string, assumeYes, noBackup bool) (string, error) {
+	// Gather counts for the user-facing confirmation.
+	projects, sessions, turns, err := fullSyncCounts(database)
+	if err != nil {
+		return "", fmt.Errorf("gather counts: %w", err)
+	}
+
+	fmt.Fprintf(os.Stderr, "\n"+
+		"⚠ --full WIPES the ccvault DB before re-scanning:\n"+
+		"    Projects: %d\n"+
+		"    Sessions: %d\n"+
+		"    Turns:    %d\n",
+		projects, sessions, turns)
+
+	if assumeYes {
+		fmt.Fprintln(os.Stderr, "  (--yes supplied — proceeding without prompt)")
+	} else if !isStdinTTY() {
+		// Piped stdin, cron, CI: no interactive prompt possible. Refuse
+		// rather than silently wipe — the caller must opt in with --yes.
+		return "", fmt.Errorf("aborted: stdin is not a TTY and --yes was not supplied; refusing to wipe data non-interactively")
+	} else {
+		fmt.Fprint(os.Stderr, "\nType 'yes' to confirm the wipe: ")
+		var answer string
+		_, _ = fmt.Fscanln(os.Stdin, &answer)
+		if answer != "yes" {
+			return "", fmt.Errorf("aborted: confirmation not received (got %q)", answer)
+		}
+	}
+
+	if noBackup {
+		fmt.Fprintln(os.Stderr, "  (--no-backup supplied — skipping backup step)")
+		return "", nil
+	}
+
+	backupDir := filepath.Join(dataDir, "backups")
+	if err := os.MkdirAll(backupDir, 0o750); err != nil {
+		return "", fmt.Errorf("create backup dir: %w", err)
+	}
+	timestamp := time.Now().UTC().Format("20060102-150405")
+	backupPath := filepath.Join(backupDir, fmt.Sprintf("ccvault-%s.db", timestamp))
+
+	fmt.Fprintf(os.Stderr, "  Backing up to %s ... ", backupPath)
+	if err := database.BackupTo(backupPath); err != nil {
+		fmt.Fprintln(os.Stderr, "FAILED")
+		return "", fmt.Errorf("backup: %w", err)
+	}
+	fmt.Fprintln(os.Stderr, "done")
+
+	if pruned, err := pruneOldBackups(backupDir, 5); err != nil {
+		fmt.Fprintf(os.Stderr, "  warning: could not rotate old backups: %v\n", err)
+	} else if pruned > 0 {
+		fmt.Fprintf(os.Stderr, "  Rotated %d older backup(s)\n", pruned)
+	}
+	fmt.Fprintln(os.Stderr)
+
+	return backupPath, nil
+}
+
+// fullSyncCounts returns the row counts shown in the confirmation prompt.
+// A stat failure doesn't abort — 0s are surfaced so the user sees they
+// couldn't be gathered but can still proceed.
+func fullSyncCounts(database *db.DB) (int, int, int, error) {
+	projects, _, err := database.GetProjectStats()
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	sessions, turns, _, err := database.GetSessionStats()
+	if err != nil {
+		return projects, 0, 0, err
+	}
+	return projects, sessions, turns, nil
+}
+
+// isStdinTTY returns true when stdin is attached to a terminal — used
+// to decide whether the confirmation prompt makes sense. Piped input
+// (`echo yes | ccvault sync --full`) or scripted invocation gets no
+// prompt but still respects --yes.
+func isStdinTTY() bool {
+	fi, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return (fi.Mode() & os.ModeCharDevice) != 0
+}
+
+// pruneOldBackups keeps the most recent `keep` files matching
+// ccvault-*.db in dir and deletes the older ones. Returns how many were
+// removed. Files with unparseable names are ignored (left in place).
+func pruneOldBackups(dir string, keep int) (int, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, err
+	}
+	// Collect ccvault-*.db backups.
+	type entry struct {
+		name string
+		path string
+	}
+	var backups []entry
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasPrefix(name, "ccvault-") || !strings.HasSuffix(name, ".db") {
+			continue
+		}
+		backups = append(backups, entry{name: name, path: filepath.Join(dir, name)})
+	}
+	// Timestamp is the filename between "ccvault-" and ".db", format
+	// YYYYMMDD-HHMMSS — lexicographic sort matches chronological sort.
+	// Newest first.
+	sort.Slice(backups, func(i, j int) bool { return backups[i].name > backups[j].name })
+	if len(backups) <= keep {
+		return 0, nil
+	}
+	pruned := 0
+	for _, b := range backups[keep:] {
+		if err := os.Remove(b.path); err != nil {
+			return pruned, fmt.Errorf("remove %s: %w", b.path, err)
+		}
+		pruned++
+	}
+	return pruned, nil
 }

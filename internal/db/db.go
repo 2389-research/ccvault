@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
@@ -93,6 +94,40 @@ func (db *DB) ResetAll() error {
 		}
 		return nil
 	})
+}
+
+// BackupTo writes a complete portable copy of the current SQLite state to
+// the given path. Uses `VACUUM INTO`, which works while the DB is open,
+// includes all schema + data, and produces a compacted single-file backup
+// with no WAL sidecar. Errors when the target path already exists — the
+// caller is responsible for choosing a fresh path (typically timestamp-
+// suffixed) so an accidental repeat can't clobber a good backup.
+//
+// Used by `sync --full` to snapshot the archive before ResetAll fires, so
+// even if the subsequent re-scan produces bad state, the user can restore
+// the pre-`--full` DB by copying the backup file back over the live one.
+func (db *DB) BackupTo(path string) error {
+	if _, err := os.Stat(path); err == nil {
+		return fmt.Errorf("backup path already exists: %s", path)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat backup path: %w", err)
+	}
+	// SQLite refuses paths that don't exist as directories, but our caller
+	// controls the parent — surface the error clearly if missing.
+	if dir := filepath.Dir(path); dir != "." && dir != "" {
+		if _, err := os.Stat(dir); err != nil {
+			return fmt.Errorf("backup directory unusable: %w", err)
+		}
+	}
+	// VACUUM INTO takes a string literal; embed the path with SQLite's
+	// single-quote escape (double the quote). Path is caller-controlled
+	// so we don't parameterize — sqlite3 does not accept ? bindings in
+	// VACUUM INTO anyway.
+	escaped := strings.ReplaceAll(path, "'", "''")
+	if _, err := db.Exec(fmt.Sprintf("VACUUM INTO '%s'", escaped)); err != nil {
+		return fmt.Errorf("vacuum into %s: %w", path, err)
+	}
+	return nil
 }
 
 // BeginTx starts a new transaction

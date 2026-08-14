@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -931,6 +932,103 @@ func TestGetProjects_SortStableTiebreaker(t *testing.T) {
 	if first[0].Path != "/Users/a/ccvault" || first[1].Path != "/Users/b/ccvault" {
 		t.Errorf("path-ASC tiebreaker not applied; got %q, %q",
 			first[0].Path, first[1].Path)
+	}
+}
+
+// TestBackupTo_ProducesCompleteRestorablePortableCopy verifies that
+// BackupTo produces a file at the requested path that, when reopened
+// as an independent SQLite DB, contains the same data as the source.
+// This is the safety net for `sync --full` — a broken re-scan should
+// be recoverable by copying the backup back over the live DB.
+func TestBackupTo_ProducesCompleteRestorablePortableCopy(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	// Seed data across every table.
+	p := &models.Project{Path: "/proj/backup", DisplayName: "backup"}
+	if err := db.UpsertProject(p); err != nil {
+		t.Fatalf("upsert project: %v", err)
+	}
+	s := &models.Session{
+		ID: "session-backup", ProjectID: p.ID,
+		StartedAt: time.Now(), SourceFile: "/proj/backup/session.jsonl",
+	}
+	if err := db.UpsertSession(s); err != nil {
+		t.Fatalf("upsert session: %v", err)
+	}
+	if err := db.InsertTurns([]models.Turn{{
+		ID: "turn-backup", SessionID: s.ID, Type: "user",
+		Timestamp: time.Now(),
+		Content:   "backupcontentcanarytoken",
+	}}); err != nil {
+		t.Fatalf("insert turn: %v", err)
+	}
+
+	// Take backup to a fresh path in a temp dir.
+	backupPath := filepath.Join(t.TempDir(), "ccvault-backup.db")
+	if err := db.BackupTo(backupPath); err != nil {
+		t.Fatalf("BackupTo: %v", err)
+	}
+	if info, err := os.Stat(backupPath); err != nil {
+		t.Fatalf("backup file missing: %v", err)
+	} else if info.Size() == 0 {
+		t.Fatalf("backup file is empty")
+	}
+
+	// Open the backup as an independent DB — no shared state with source.
+	// Then wipe the source to prove the backup stands alone.
+	if err := db.ResetAll(); err != nil {
+		t.Fatalf("ResetAll to isolate backup: %v", err)
+	}
+
+	backupSQL, err := sql.Open("sqlite", backupPath)
+	if err != nil {
+		t.Fatalf("open backup: %v", err)
+	}
+	t.Cleanup(func() { _ = backupSQL.Close() })
+
+	// Every table should hold its pre-reset row count.
+	for table, want := range map[string]int{"projects": 1, "sessions": 1, "turns": 1} {
+		var n int
+		if err := backupSQL.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&n); err != nil {
+			t.Fatalf("backup count %s: %v", table, err)
+		}
+		if n != want {
+			t.Errorf("backup %s = %d rows, want %d", table, n, want)
+		}
+	}
+
+	// FTS index survived intact so a full-text query against the backup
+	// still finds the seeded turn.
+	var ftsCount int
+	if err := backupSQL.QueryRow("SELECT COUNT(*) FROM turns_fts WHERE turns_fts MATCH ?", "backupcontentcanarytoken").Scan(&ftsCount); err != nil {
+		t.Fatalf("backup FTS query: %v", err)
+	}
+	if ftsCount != 1 {
+		t.Errorf("backup FTS match count = %d, want 1", ftsCount)
+	}
+}
+
+// TestBackupTo_RefusesExistingFile guards against clobbering a previous
+// backup by accident — the caller must always pass a fresh path.
+func TestBackupTo_RefusesExistingFile(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	path := filepath.Join(t.TempDir(), "ccvault-backup.db")
+	if err := os.WriteFile(path, []byte("existing content"), 0o600); err != nil {
+		t.Fatalf("seed existing file: %v", err)
+	}
+	if err := db.BackupTo(path); err == nil {
+		t.Fatal("BackupTo to an existing file should error, got nil")
+	}
+	// Existing file must be untouched.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read existing file: %v", err)
+	}
+	if string(data) != "existing content" {
+		t.Errorf("existing file was overwritten: content = %q", string(data))
 	}
 }
 
