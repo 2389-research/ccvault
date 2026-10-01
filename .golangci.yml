@@ -54,6 +54,17 @@ linters:
         linters:
           - gosec
         text: "G101"
+      # internal/db/merge.go builds its INSERT ... SELECT statements from
+      # the column names the two databases share, because the incoming
+      # archive may carry a different schema version. Table names come
+      # from the package-level mergeTables literal, and every column name
+      # goes through quoteIdent (SQLite identifier quoting) before it is
+      # interpolated — identifiers cannot be bound as parameters. All row
+      # values are either bound or copied inside SQLite. Suppress G201.
+      - path: internal/db/merge\.go
+        linters:
+          - gosec
+        text: "G201"
       # G202 in ResetAll: "DELETE FROM " + table where table comes
       # from a hardcoded []string literal, not user input.
       - path: internal/db/db\.go

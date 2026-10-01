@@ -327,22 +327,32 @@ var syncCmd = &cobra.Command{
 	SilenceUsage: true,
 	Long: `Scan ~/.claude and index new or updated sessions into the ccvault database.
 
-By default, sync is INCREMENTAL — only files whose mtimes have changed
-are re-parsed. Sessions and projects that no longer exist upstream
-remain in the DB until a --full sync runs.
+By default, sync is INCREMENTAL — only files whose mtimes have changed are
+re-parsed. Sessions whose source files have been pruned upstream stay in the
+archive; holding conversations after Claude Code deletes them is the point.
 
---full WIPES all indexed data before re-scanning. Before wiping, it:
-  1. Shows the current row counts and prompts for confirmation.
-     Non-interactive callers (piped stdin, cron, CI) must pass --yes;
-     they will be REFUSED without it — no silent wipes.
+--full re-parses EVERY discovered session file, ignoring the mtime
+skip-check. Use it after a parser change that extracts more from the same
+JSONL. It is not destructive: each file replaces its own rows as the scan
+reaches it, and rows whose source file is gone are left alone.
+
+--rebuild WIPES all indexed data, then re-scans — so the archive ends up
+holding exactly what is on disk right now. Everything the source has since
+pruned is DESTROYED. Before wiping, it:
+  1. Shows the current row counts, including how many sessions have no
+     source file on disk and therefore cannot be re-created, and prompts
+     for confirmation. Non-interactive callers (piped stdin, cron, CI) must
+     pass --yes; they will be REFUSED without it — no silent wipes.
   2. Backs up the SQLite DB to <data_dir>/backups/ccvault-<timestamp>.db
      via VACUUM INTO (skipped with --no-backup).
   3. Rotates to the most recent 5 backups.
 
-If the subsequent re-scan produces bad state, restore by copying the
-backup file back over the live DB. The backup path is printed at run.`,
+If a rebuild produces bad state, restore by copying the backup file back
+over the live DB (the path is printed at run), or merge it back in with
+"ccvault import <backup>".`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		full, _ := cmd.Flags().GetBool("full")
+		rebuild, _ := cmd.Flags().GetBool("rebuild")
 		verbose, _ := cmd.Flags().GetBool("verbose")
 		sourceFilter, _ := cmd.Flags().GetString("source")
 		assumeYes, _ := cmd.Flags().GetBool("yes")
@@ -385,22 +395,29 @@ backup file back over the live DB. The backup path is printed at run.`,
 		}
 		defer func() { _ = database.Close() }()
 
-		// --full safety: confirm + backup BEFORE handing off to the syncer,
-		// so a user who Ctrl-Cs at the prompt hasn't lost anything, and a
-		// user who confirms has a snapshot to restore from if re-scan
-		// produces bad state.
+		// --rebuild safety: confirm + backup BEFORE handing off to the
+		// syncer, so a user who Ctrl-Cs at the prompt hasn't lost anything,
+		// and a user who confirms has a snapshot to restore from. --full
+		// doesn't need either — it destroys nothing.
 		var backupPath string
-		if full {
-			backupPath, err = prepareFullSync(database, cfg.DataDir, assumeYes, noBackup)
+		if rebuild {
+			backupPath, err = prepareRebuild(database, cfg.DataDir, assumeYes, noBackup)
 			if err != nil {
 				return err
 			}
+		} else if assumeYes || noBackup {
+			// These two only gate the wipe. A cron job carried over from when
+			// --full was destructive will still pass them; say they're inert
+			// rather than letting the user assume they did something.
+			fmt.Fprintln(os.Stderr,
+				"note: --yes and --no-backup only apply to --rebuild; this sync destroys nothing and takes no backup")
 		}
 
-		// Create syncer. Cache dir is plumbed through so --full can
+		// Create syncer. Cache dir is plumbed through so a re-parse can
 		// invalidate the analytics parquet alongside SQLite.
 		syncer := sync.New(database, sources,
 			sync.WithFullSync(full),
+			sync.WithRebuild(rebuild),
 			sync.WithVerbose(verbose),
 			sync.WithCacheDir(filepath.Join(cfg.DataDir, "analytics")),
 			sync.WithProgressCallback(func(msg string) {
@@ -411,7 +428,7 @@ backup file back over the live DB. The backup path is printed at run.`,
 		// Run sync
 		stats, err := syncer.Run()
 		if err != nil {
-			if full && backupPath != "" {
+			if rebuild && backupPath != "" {
 				fmt.Fprintf(os.Stderr, "\nsync failed after wiping data. Restore the pre-sync state with:\n"+
 					"  cp %q %q\n", backupPath, filepath.Join(cfg.DataDir, "ccvault.db"))
 			}
@@ -1077,6 +1094,74 @@ var buildCacheCmd = &cobra.Command{
 	},
 }
 
+var importCmd = &cobra.Command{
+	Use:     "import <database-path>",
+	Aliases: []string{"merge"},
+	Short:   "Merge another ccvault database into this archive",
+	Long: `Merge the sessions, turns, tool uses, and projects of another ccvault
+database into this one.
+
+Import only ever ADDS. A session absent here is inserted along with its turns
+and tool uses. A session present in both is left alone unless the incoming
+copy ended later, in which case the incoming copy replaces it wholesale.
+Nothing already in this archive is deleted, and the source database is only
+read, never modified.
+
+The whole merge runs in one transaction, so a failure leaves this archive
+exactly as it was.
+
+Use it to recover from a destructive rebuild:
+
+  ccvault import ~/.ccvault/backups/ccvault-20260905-140418.db
+
+or to consolidate the archives of two machines into one.`,
+	Args:         cobra.ExactArgs(1),
+	SilenceUsage: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		asJSON, _ := cmd.Flags().GetBool("json")
+
+		cfg, err := config.Load()
+		if err != nil {
+			return fmt.Errorf("load config: %w", err)
+		}
+		if err := config.EnsureDataDir(cfg); err != nil {
+			return fmt.Errorf("create data dir: %w", err)
+		}
+
+		database, err := db.Open(cfg.DataDir)
+		if err != nil {
+			return fmt.Errorf("open database: %w", err)
+		}
+		defer func() { _ = database.Close() }()
+
+		stats, err := database.MergeFrom(args[0])
+		if err != nil {
+			return fmt.Errorf("import: %w", err)
+		}
+
+		if asJSON {
+			out, err := json.MarshalIndent(stats, "", "  ")
+			if err != nil {
+				return fmt.Errorf("marshal stats: %w", err)
+			}
+			fmt.Println(string(out))
+			return nil
+		}
+
+		fmt.Printf("Imported from %s\n", args[0])
+		fmt.Printf("  Projects:  %d added\n", stats.ProjectsInserted)
+		fmt.Printf("  Sessions:  %d added, %d replaced with newer copies, %d already current\n",
+			stats.SessionsInserted, stats.SessionsReplaced, stats.SessionsSkipped)
+		fmt.Printf("  Turns:     %d\n", stats.TurnsInserted)
+		fmt.Printf("  Tool uses: %d\n", stats.ToolUsesInserted)
+		if stats.SessionsInserted+stats.SessionsReplaced > 0 {
+			fmt.Println("\nRebuild the analytics cache to pick up the imported rows:")
+			fmt.Println("  ccvault build-cache")
+		}
+		return nil
+	},
+}
+
 func init() {
 	// Add commands
 	rootCmd.AddCommand(versionCmd)
@@ -1092,6 +1177,7 @@ func init() {
 	rootCmd.AddCommand(exportCmd)
 	rootCmd.AddCommand(mcpCmd)
 	rootCmd.AddCommand(buildCacheCmd)
+	rootCmd.AddCommand(importCmd)
 
 	// Orient flags
 	orientCmd.Flags().Bool("json", false, "Output as JSON for machine parsing")
@@ -1100,11 +1186,15 @@ func init() {
 	statsCmd.Flags().Bool("json", false, "Output as JSON for machine parsing")
 
 	// Sync flags
-	syncCmd.Flags().Bool("full", false, "WIPES all indexed data then re-scans. Prompts for confirmation + takes a backup by default")
-	syncCmd.Flags().Bool("yes", false, "Skip the --full confirmation prompt (assumes 'yes')")
-	syncCmd.Flags().Bool("no-backup", false, "Skip the pre-wipe SQLite backup when running --full (dangerous)")
+	syncCmd.Flags().Bool("full", false, "Re-parse every session file, ignoring mtimes. Not destructive — rows whose source file is gone are kept")
+	syncCmd.Flags().Bool("rebuild", false, "WIPES all indexed data then re-scans, DESTROYING anything the source has pruned. Prompts for confirmation + takes a backup by default")
+	syncCmd.Flags().Bool("yes", false, "Skip the --rebuild confirmation prompt (assumes 'yes')")
+	syncCmd.Flags().Bool("no-backup", false, "Skip the pre-wipe SQLite backup when running --rebuild (dangerous)")
 	syncCmd.Flags().BoolP("verbose", "v", false, "Show verbose output")
 	syncCmd.Flags().String("source", "", "Sync only the configured source with this name (matches sources[].name from config)")
+
+	// Import flags
+	importCmd.Flags().Bool("json", false, "Output merge counts as JSON")
 
 	// Search flags
 	searchCmd.Flags().Bool("json", false, "Output results as JSON")
@@ -1163,26 +1253,38 @@ func padVisualCLI(s string, width int) string {
 	return s + strings.Repeat(" ", width-visW)
 }
 
-// prepareFullSync runs the safety block for `sync --full`: it shows
+// prepareRebuild runs the safety block for `sync --rebuild`: it shows
 // current row counts, prompts for confirmation (unless assumeYes is set
 // or stdin isn't a TTY), takes a VACUUM INTO backup to
 // <dataDir>/backups/ccvault-<timestamp>.db, and rotates to the most
 // recent 5 backups. Returns the backup path (empty when --no-backup)
 // so the caller can print a restore hint if the subsequent re-scan
 // fails. An error from any step aborts the sync before any wiping.
-func prepareFullSync(database *db.DB, dataDir string, assumeYes, noBackup bool) (string, error) {
+func prepareRebuild(database *db.DB, dataDir string, assumeYes, noBackup bool) (string, error) {
 	// Gather counts for the user-facing confirmation.
-	projects, sessions, turns, err := fullSyncCounts(database)
+	projects, sessions, turns, err := rebuildCounts(database)
 	if err != nil {
 		return "", fmt.Errorf("gather counts: %w", err)
 	}
 
 	fmt.Fprintf(os.Stderr, "\n"+
-		"⚠ --full WIPES the ccvault DB before re-scanning:\n"+
+		"⚠ --rebuild WIPES the ccvault DB before re-scanning:\n"+
 		"    Projects: %d\n"+
 		"    Sessions: %d\n"+
 		"    Turns:    %d\n",
 		projects, sessions, turns)
+
+	// The rows worth shouting about are the ones the re-scan cannot bring
+	// back, because their source file no longer exists upstream.
+	if orphans, err := sessionsWithoutSourceFiles(database); err != nil {
+		fmt.Fprintf(os.Stderr, "  warning: could not check which sessions still have source files: %v\n", err)
+	} else if orphans > 0 {
+		fmt.Fprintf(os.Stderr,
+			"\n  %d of those sessions have NO source file on disk any more.\n"+
+				"  The re-scan CANNOT re-create them — they exist only here.\n"+
+				"  If you want to re-parse everything without losing them, use --full instead.\n",
+			orphans)
+	}
 
 	if assumeYes {
 		fmt.Fprintln(os.Stderr, "  (--yes supplied — proceeding without prompt)")
@@ -1228,10 +1330,36 @@ func prepareFullSync(database *db.DB, dataDir string, assumeYes, noBackup bool) 
 	return backupPath, nil
 }
 
-// fullSyncCounts returns the row counts shown in the confirmation prompt.
+// sessionsWithoutSourceFiles counts archived sessions whose source_file no
+// longer exists on disk. Those are the rows a rebuild destroys for good: the
+// re-scan can only re-create what it can still read.
+func sessionsWithoutSourceFiles(database *db.DB) (int, error) {
+	// Grouped so each path is stat'd once even when several sessions share it.
+	rows, err := database.Query(
+		"SELECT source_file, COUNT(*) FROM sessions WHERE source_file != '' GROUP BY source_file")
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	missing := 0
+	for rows.Next() {
+		var path string
+		var sessions int
+		if err := rows.Scan(&path, &sessions); err != nil {
+			return 0, err
+		}
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			missing += sessions
+		}
+	}
+	return missing, rows.Err()
+}
+
+// rebuildCounts returns the row counts shown in the confirmation prompt.
 // A stat failure doesn't abort — 0s are surfaced so the user sees they
 // couldn't be gathered but can still proceed.
-func fullSyncCounts(database *db.DB) (int, int, int, error) {
+func rebuildCounts(database *db.DB) (int, int, int, error) {
 	projects, _, err := database.GetProjectStats()
 	if err != nil {
 		return 0, 0, 0, err

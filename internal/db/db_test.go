@@ -146,6 +146,72 @@ func TestProjectUpsertAccumulates(t *testing.T) {
 	}
 }
 
+// TestReconcileProjectAggregates recomputes the counters UpsertProject
+// accumulates. Without it, re-parsing an already-indexed session file adds to
+// session_count and total_tokens a second time.
+func TestReconcileProjectAggregates(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	project := &models.Project{
+		Path:           "/Users/test/reconcile",
+		DisplayName:    "reconcile",
+		FirstSeenAt:    time.Now(),
+		LastActivityAt: time.Now(),
+		SessionCount:   7,     // inflated by repeated upserts
+		TotalTokens:    99999, // likewise
+	}
+	if err := db.UpsertProject(project); err != nil {
+		t.Fatalf("upsert project: %v", err)
+	}
+
+	session := &models.Session{
+		ID:               "reconcile-session",
+		ProjectID:        project.ID,
+		StartedAt:        time.Now(),
+		EndedAt:          time.Now(),
+		InputTokens:      100,
+		OutputTokens:     20,
+		CacheReadTokens:  3,
+		CacheWriteTokens: 1,
+		SourceFile:       "/fake/reconcile.jsonl",
+	}
+	if err := db.UpsertSession(session); err != nil {
+		t.Fatalf("upsert session: %v", err)
+	}
+
+	// Targeted at one path.
+	if err := db.ReconcileProjectAggregates([]string{project.Path}); err != nil {
+		t.Fatalf("reconcile by path: %v", err)
+	}
+	got, err := db.GetProjectByPath(project.Path)
+	if err != nil {
+		t.Fatalf("read project: %v", err)
+	}
+	if got.SessionCount != 1 {
+		t.Errorf("session_count = %d, want 1", got.SessionCount)
+	}
+	if got.TotalTokens != 124 {
+		t.Errorf("total_tokens = %d, want 124", got.TotalTokens)
+	}
+
+	// An empty path list reconciles every project.
+	if _, err := db.Exec("UPDATE projects SET session_count = 42, total_tokens = 42"); err != nil {
+		t.Fatalf("re-inflate counters: %v", err)
+	}
+	if err := db.ReconcileProjectAggregates(nil); err != nil {
+		t.Fatalf("reconcile all: %v", err)
+	}
+	got, err = db.GetProjectByPath(project.Path)
+	if err != nil {
+		t.Fatalf("read project: %v", err)
+	}
+	if got.SessionCount != 1 || got.TotalTokens != 124 {
+		t.Errorf("after reconcile-all: session_count=%d total_tokens=%d, want 1/124",
+			got.SessionCount, got.TotalTokens)
+	}
+}
+
 func TestSessionCRUD(t *testing.T) {
 	db, cleanup := setupTestDB(t)
 	defer cleanup()

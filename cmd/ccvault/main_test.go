@@ -1,5 +1,5 @@
 // ABOUTME: Tests for CLI helpers in package main
-// ABOUTME: Verifies orient/prepareFullSync gather DB state, report failures, and apply --full safety.
+// ABOUTME: Verifies orient/prepareRebuild gather DB state, report failures, and apply --rebuild safety.
 
 package main
 
@@ -38,11 +38,55 @@ func TestGatherOrientation_CollectsWarningsOnFailure(t *testing.T) {
 	}
 }
 
-// TestPrepareFullSync_WritesBackupBeforeSubsequentWipe verifies the full
-// end-to-end contract: with --yes + backup enabled, prepareFullSync
+// TestSessionsWithoutSourceFiles counts the rows a rebuild would destroy for
+// good — the ones whose source file the upstream tool has already pruned.
+// That number is what makes the --rebuild prompt honest.
+func TestSessionsWithoutSourceFiles(t *testing.T) {
+	dir := t.TempDir()
+	database, err := db.Open(dir)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+
+	present := filepath.Join(dir, "still-here.jsonl")
+	if err := os.WriteFile(present, []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("write present file: %v", err)
+	}
+	gone := filepath.Join(dir, "pruned-upstream.jsonl")
+
+	// Two sessions share the pruned file; both are unrecoverable.
+	rows := []struct {
+		id   string
+		file string
+	}{
+		{"session-present", present},
+		{"session-gone-1", gone},
+		{"session-gone-2", gone},
+	}
+	for _, r := range rows {
+		_, err := database.Exec(
+			`INSERT INTO sessions (id, started_at, source_file, source) VALUES (?, datetime('now'), ?, 'claude-code')`,
+			r.id, r.file)
+		if err != nil {
+			t.Fatalf("seed session %s: %v", r.id, err)
+		}
+	}
+
+	missing, err := sessionsWithoutSourceFiles(database)
+	if err != nil {
+		t.Fatalf("sessionsWithoutSourceFiles: %v", err)
+	}
+	if missing != 2 {
+		t.Errorf("missing = %d, want 2", missing)
+	}
+}
+
+// TestPrepareRebuild_WritesBackupBeforeSubsequentWipe verifies the full
+// end-to-end contract: with --yes + backup enabled, prepareRebuild
 // returns a backup path pointing at a real SQLite file that survives a
 // downstream ResetAll — this is the whole point of the safety block.
-func TestPrepareFullSync_WritesBackupBeforeSubsequentWipe(t *testing.T) {
+func TestPrepareRebuild_WritesBackupBeforeSubsequentWipe(t *testing.T) {
 	dir := t.TempDir()
 	database, err := db.Open(dir)
 	if err != nil {
@@ -57,9 +101,9 @@ func TestPrepareFullSync_WritesBackupBeforeSubsequentWipe(t *testing.T) {
 		t.Fatalf("seed project: %v", err)
 	}
 
-	backupPath, err := prepareFullSync(database, dir, true /*assumeYes*/, false /*noBackup*/)
+	backupPath, err := prepareRebuild(database, dir, true /*assumeYes*/, false /*noBackup*/)
 	if err != nil {
-		t.Fatalf("prepareFullSync: %v", err)
+		t.Fatalf("prepareRebuild: %v", err)
 	}
 	if backupPath == "" {
 		t.Fatal("expected non-empty backupPath when noBackup=false")
@@ -108,9 +152,9 @@ func TestPrepareFullSync_WritesBackupBeforeSubsequentWipe(t *testing.T) {
 	}
 }
 
-// TestPrepareFullSync_NoBackupSkipsBackup asserts the escape hatch:
+// TestPrepareRebuild_NoBackupSkipsBackup asserts the escape hatch:
 // --no-backup returns an empty path and creates no files.
-func TestPrepareFullSync_NoBackupSkipsBackup(t *testing.T) {
+func TestPrepareRebuild_NoBackupSkipsBackup(t *testing.T) {
 	dir := t.TempDir()
 	database, err := db.Open(dir)
 	if err != nil {
@@ -118,9 +162,9 @@ func TestPrepareFullSync_NoBackupSkipsBackup(t *testing.T) {
 	}
 	defer func() { _ = database.Close() }()
 
-	backupPath, err := prepareFullSync(database, dir, true /*assumeYes*/, true /*noBackup*/)
+	backupPath, err := prepareRebuild(database, dir, true /*assumeYes*/, true /*noBackup*/)
 	if err != nil {
-		t.Fatalf("prepareFullSync: %v", err)
+		t.Fatalf("prepareRebuild: %v", err)
 	}
 	if backupPath != "" {
 		t.Errorf("expected empty backupPath with --no-backup, got %q", backupPath)
@@ -193,12 +237,12 @@ func TestPruneOldBackups_KeepsMostRecentN(t *testing.T) {
 	}
 }
 
-// TestPrepareFullSync_NonInteractiveWithoutYesRefuses asserts the
+// TestPrepareRebuild_NonInteractiveWithoutYesRefuses asserts the
 // primary safety property: on a scripted/CI/cron surface (stdin is a
-// pipe, not a TTY), --full without --yes must REFUSE rather than
+// pipe, not a TTY), --rebuild without --yes must REFUSE rather than
 // silently wipe. Swap os.Stdin for a pipe so the test reflects the
 // non-interactive case even when go test is launched from a terminal.
-func TestPrepareFullSync_NonInteractiveWithoutYesRefuses(t *testing.T) {
+func TestPrepareRebuild_NonInteractiveWithoutYesRefuses(t *testing.T) {
 	dir := t.TempDir()
 	database, err := db.Open(dir)
 	if err != nil {
@@ -216,7 +260,7 @@ func TestPrepareFullSync_NonInteractiveWithoutYesRefuses(t *testing.T) {
 	os.Stdin = r
 	defer func() { os.Stdin = origStdin }()
 
-	backupPath, err := prepareFullSync(database, dir, false /*assumeYes*/, false /*noBackup*/)
+	backupPath, err := prepareRebuild(database, dir, false /*assumeYes*/, false /*noBackup*/)
 	if err == nil {
 		t.Fatal("expected refusal error, got nil")
 	}

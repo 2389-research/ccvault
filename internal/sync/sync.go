@@ -39,8 +39,9 @@ type Syncer struct {
 	db              *db.DB
 	sources         []config.SourceConfig
 	full            bool
+	rebuild         bool
 	verbose         bool
-	cacheDir        string // analytics cache dir; if set, --full invalidates it
+	cacheDir        string // analytics cache dir; full/rebuild invalidate it
 	onProgress      func(msg string)
 	onCountProgress func(current, total int)
 }
@@ -48,17 +49,31 @@ type Syncer struct {
 // Option configures a Syncer
 type Option func(*Syncer)
 
-// WithFullSync forces a complete rescan
+// WithFullSync re-parses every discovered session file, ignoring the mtime
+// skip-check. It is NOT destructive: rows whose source file has since been
+// pruned upstream stay in the archive. Each re-parsed file replaces its own
+// rows as the scan reaches it.
 func WithFullSync(full bool) Option {
 	return func(s *Syncer) {
 		s.full = full
 	}
 }
 
+// WithRebuild clears every table before re-scanning, so the archive ends up
+// holding exactly what is on disk right now. Destructive by design, and the
+// only mode that is: anything the source has pruned is gone afterwards.
+// Implies a full re-parse.
+func WithRebuild(rebuild bool) Option {
+	return func(s *Syncer) {
+		s.rebuild = rebuild
+	}
+}
+
 // WithCacheDir tells the Syncer where the analytics parquet cache lives so
-// that --full can invalidate it alongside the SQLite tables. Without this,
-// `ccvault sync --full` clears SQLite but the DuckDB analytics view (TUI +
-// MCP get_analytics) continues to read stale data from sessions.parquet.
+// that a re-parse can invalidate it alongside the SQLite tables. Without
+// this, `ccvault sync --full` or `--rebuild` rewrites SQLite but the DuckDB
+// analytics view (TUI + MCP get_analytics) keeps reading stale numbers out
+// of sessions.parquet.
 func WithCacheDir(dir string) Option {
 	return func(s *Syncer) {
 		s.cacheDir = dir
@@ -105,27 +120,40 @@ func (s *Syncer) Run() (*Stats, error) {
 	start := time.Now()
 	stats := &Stats{}
 
-	// Full sync: wipe all data first so stale projects/sessions don't linger
-	if s.full {
-		s.progress("Full sync: clearing existing data...")
+	// Both --full and --rebuild re-parse everything, so numbers in the
+	// DuckDB analytics cache can change either way; invalidate it so the
+	// TUI Analytics tab and MCP get_analytics don't serve pre-sync figures.
+	// The TUI auto-rebuilds when sessions.parquet is missing.
+	//
+	// This runs BEFORE the --rebuild wipe on purpose (#25): if removing the
+	// parquet fails (read-only cache dir, EROFS, quota) we abort with the
+	// archive still intact, rather than leaving SQLite empty behind a stale
+	// cache that nothing warns the user about.
+	if s.reparseAll() && s.cacheDir != "" {
+		parquetPath := filepath.Join(s.cacheDir, "sessions.parquet")
+		if err := os.Remove(parquetPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return nil, fmt.Errorf("invalidate analytics cache: %w", err)
+		}
+	}
+
+	// --rebuild makes the archive a mirror of what's on disk right now, so
+	// everything the source has pruned is discarded. --full never does this:
+	// an archive that drops what the source no longer keeps isn't an archive.
+	if s.rebuild {
+		s.progress("Rebuild: clearing existing data...")
 		if err := s.db.ResetAll(); err != nil {
 			return nil, fmt.Errorf("reset database: %w", err)
 		}
-		// Invalidate the DuckDB analytics cache so the TUI Analytics tab
-		// and MCP get_analytics don't keep serving pre-reset numbers. The
-		// TUI auto-rebuilds when sessions.parquet is missing.
-		if s.cacheDir != "" {
-			parquetPath := filepath.Join(s.cacheDir, "sessions.parquet")
-			if err := os.Remove(parquetPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
-				return nil, fmt.Errorf("invalidate analytics cache: %w", err)
-			}
-		}
+	} else if s.full {
+		// Said out loud because --full used to wipe the archive. Anyone whose
+		// script or cron job still passes it should see what it does now.
+		s.progress("Full sync: re-parsing every session file. Sessions whose source file is gone are preserved (use --rebuild to discard them).")
 	}
 
 	// Batch-load all stored mtimes in one query for fast incremental checks
 	var storedMtimes map[string]time.Time
 	var err error
-	if !s.full {
+	if !s.reparseAll() {
 		storedMtimes, err = s.db.GetAllSourceMtimes()
 		if err != nil {
 			// Non-fatal: fall back to syncing everything
@@ -135,8 +163,11 @@ func (s *Syncer) Run() (*Stats, error) {
 		s.progress("Loaded %d stored mtimes", len(storedMtimes))
 	}
 
-	// Track unique projects
+	// Track unique projects. projectsSeen counts everything discovered (for
+	// stats); projectsTouched records only the projects we actually wrote a
+	// session into, which is the set whose aggregates need reconciling below.
 	projectsSeen := make(map[string]bool)
+	projectsTouched := make(map[string]bool)
 
 	// Collect all session files across all sources
 	type sourceSession struct {
@@ -182,7 +213,7 @@ func (s *Syncer) Run() (*Stats, error) {
 	// Process each session
 	total := len(allSessions)
 	for i, ss := range allSessions {
-		if err := s.processSession(ss.file, ss.adapter, ss.sourceName, stats, storedMtimes, projectsSeen); err != nil {
+		if err := s.processSession(ss.file, ss.adapter, ss.sourceName, stats, storedMtimes, projectsSeen, projectsTouched); err != nil {
 			stats.Errors = append(stats.Errors, fmt.Errorf("session %s: %w", ss.file.Path, err))
 			if s.verbose {
 				s.progress("Error processing %s: %v", ss.file.Path, err)
@@ -193,6 +224,25 @@ func (s *Syncer) Run() (*Stats, error) {
 
 		if (i+1)%100 == 0 || i == len(allSessions)-1 {
 			s.progress("Processed %d/%d sessions", i+1, total)
+		}
+	}
+
+	// Reconcile the project aggregate columns against the sessions table.
+	// UpsertProject writes session_count / total_tokens as "existing +
+	// incoming", so every re-parse of an already-indexed session adds to
+	// them again. The old destructive --full hid that by emptying the table
+	// first; now that re-parsing preserves rows, the counters have to be
+	// recomputed from the rows that actually exist.
+	if len(projectsTouched) > 0 {
+		paths := make([]string, 0, len(projectsTouched))
+		for p := range projectsTouched {
+			paths = append(paths, p)
+		}
+		if err := s.db.ReconcileProjectAggregates(paths); err != nil {
+			// Non-fatal: the session/turn rows are already committed, which
+			// is the data that matters. Only the display counters are off.
+			stats.Errors = append(stats.Errors, fmt.Errorf("reconcile project aggregates: %w", err))
+			s.progress("Warning: could not reconcile project counts: %v", err)
 		}
 	}
 
@@ -214,9 +264,9 @@ func (s *Syncer) Run() (*Stats, error) {
 }
 
 // processSession handles a single session file using the given adapter
-func (s *Syncer) processSession(sf adapter.SessionFile, adpt adapter.SourceAdapter, sourceName string, stats *Stats, storedMtimes map[string]time.Time, projectsSeen map[string]bool) error {
+func (s *Syncer) processSession(sf adapter.SessionFile, adpt adapter.SourceAdapter, sourceName string, stats *Stats, storedMtimes map[string]time.Time, projectsSeen, projectsTouched map[string]bool) error {
 	// Check if we need to process this file
-	if !s.full {
+	if !s.reparseAll() {
 		if !s.needsSync(sf, storedMtimes) {
 			stats.SessionsSkipped++
 			// For skipped sessions, use scanner's path as best-effort approximation
@@ -271,6 +321,7 @@ func (s *Syncer) processSession(sf adapter.SessionFile, adpt adapter.SourceAdapt
 	}
 
 	projectsSeen[parsed.ProjectPath] = true
+	projectsTouched[parsed.ProjectPath] = true
 
 	// Build models from parsed data
 	session := &models.Session{
@@ -400,6 +451,13 @@ func (s *Syncer) processSession(sf adapter.SessionFile, adpt adapter.SourceAdapt
 	stats.ToolUsesIndexed += len(toolUses)
 
 	return nil
+}
+
+// reparseAll reports whether this run must re-parse every discovered file
+// instead of consulting stored mtimes. Both --full and --rebuild do; they
+// differ only in whether existing rows are wiped first.
+func (s *Syncer) reparseAll() bool {
+	return s.full || s.rebuild
 }
 
 // needsSync checks if a session file needs to be synced using the pre-loaded mtime map
