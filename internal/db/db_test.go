@@ -979,9 +979,11 @@ func TestGetProjectsPage_WalksEveryRowWithoutGapsOrRepeats(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetProjectsPage unlimited: %v", err)
 	}
-	if len(rest) != 2 || rest[0].Path != "/p/d" {
-		t.Errorf("unlimited page from offset 3 = %d rows starting %q, want 2 starting /p/d",
-			len(rest), rest[0].Path)
+	if len(rest) != 2 {
+		t.Fatalf("unlimited page from offset 3 = %d rows, want 2", len(rest))
+	}
+	if rest[0].Path != "/p/d" {
+		t.Errorf("unlimited page from offset 3 starts at %q, want /p/d", rest[0].Path)
 	}
 }
 

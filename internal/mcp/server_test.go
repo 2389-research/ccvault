@@ -177,8 +177,11 @@ func TestListSessions_PaginatesWithOffset(t *testing.T) {
 	if m1["offset"] != 0 || m1["limit"] != 2 {
 		t.Errorf("page 1: offset/limit = %v/%v, want 0/2", m1["offset"], m1["limit"])
 	}
+	// Fatal, not just an error: page 2 is fetched with this value, so
+	// continuing past a missing next_offset would panic on the type
+	// assertion below instead of reporting what went wrong.
 	if m1["next_offset"] != 2 {
-		t.Errorf("page 1: next_offset = %v, want 2", m1["next_offset"])
+		t.Fatalf("page 1: next_offset = %v, want 2", m1["next_offset"])
 	}
 	if hint, _ := m1["hint"].(string); !strings.Contains(hint, "offset") {
 		t.Errorf("page 1 hint should point at offset paging, got %q", hint)
@@ -241,8 +244,10 @@ func TestListProjects_PaginatesWithOffset(t *testing.T) {
 	if m1["offset"] != 0 || m1["limit"] != 2 {
 		t.Errorf("page 1: offset/limit = %v/%v, want 0/2", m1["offset"], m1["limit"])
 	}
+	// Fatal for the same reason as in TestListSessions_PaginatesWithOffset:
+	// the value is used to fetch page 2.
 	if m1["next_offset"] != 2 {
-		t.Errorf("page 1: next_offset = %v, want 2", m1["next_offset"])
+		t.Fatalf("page 1: next_offset = %v, want 2", m1["next_offset"])
 	}
 	if hint, _ := m1["hint"].(string); !strings.Contains(hint, "offset") {
 		t.Errorf("page 1 hint should point at offset paging, got %q", hint)
