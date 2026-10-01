@@ -226,6 +226,57 @@ func (db *DB) UpdateProjectStats(projectID int64) error {
 	return nil
 }
 
+// ReconcileProjectAggregates recomputes session_count and total_tokens from
+// the sessions table for the given project paths. Pass no paths to reconcile
+// every project.
+//
+// Those two columns are maintained additively by UpsertProject ("existing +
+// incoming"), so re-parsing a session file that is already indexed inflates
+// them. Recomputing from the rows that actually exist is the only way to get
+// them back in step, and it is cheap: sessions are indexed by project_id.
+func (db *DB) ReconcileProjectAggregates(paths []string) error {
+	// first_seen_at and last_activity_at are deliberately left alone: the
+	// former is write-once at insert, the latter is already updated with a
+	// max() comparison, so neither drifts on re-parse.
+	const recompute = `
+		UPDATE projects SET
+			session_count = (
+				SELECT COUNT(*) FROM sessions WHERE sessions.project_id = projects.id
+			),
+			total_tokens = (
+				SELECT COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens), 0)
+				FROM sessions WHERE sessions.project_id = projects.id
+			)`
+
+	if len(paths) == 0 {
+		if _, err := db.Exec(recompute); err != nil {
+			return fmt.Errorf("reconcile project aggregates: %w", err)
+		}
+		return nil
+	}
+
+	// Chunked so a sync touching thousands of projects can't exceed SQLite's
+	// bound-parameter ceiling.
+	const chunk = 500
+	for start := 0; start < len(paths); start += chunk {
+		end := min(start+chunk, len(paths))
+		batch := paths[start:end]
+
+		placeholders := make([]string, len(batch))
+		args := make([]interface{}, len(batch))
+		for i, p := range batch {
+			placeholders[i] = "?"
+			args[i] = p
+		}
+
+		query := recompute + " WHERE path IN (" + strings.Join(placeholders, ", ") + ")"
+		if _, err := db.Exec(query, args...); err != nil {
+			return fmt.Errorf("reconcile project aggregates: %w", err)
+		}
+	}
+	return nil
+}
+
 // GetFirstAndLastActivity returns the date range of all activity
 func (db *DB) GetFirstAndLastActivity() (first, last time.Time, err error) {
 	query := `SELECT MIN(first_seen_at), MAX(last_activity_at) FROM projects`

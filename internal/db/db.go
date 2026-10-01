@@ -72,7 +72,9 @@ func (db *DB) Close() error {
 	return db.DB.Close()
 }
 
-// ResetAll deletes all data from all tables for a clean full resync.
+// ResetAll deletes all data from all tables so `sync --rebuild` can repopulate
+// from a clean slate. It is the archive's only destructive operation; ordinary
+// and `--full` syncs never call it.
 // Schema (tables, triggers, FTS index) is left in place — migrations own
 // its lifecycle. Deleting turns cascades to turns_fts via the AFTER DELETE
 // trigger, so no FTS drop is needed here.
@@ -103,9 +105,10 @@ func (db *DB) ResetAll() error {
 // caller is responsible for choosing a fresh path (typically timestamp-
 // suffixed) so an accidental repeat can't clobber a good backup.
 //
-// Used by `sync --full` to snapshot the archive before ResetAll fires, so
-// even if the subsequent re-scan produces bad state, the user can restore
-// the pre-`--full` DB by copying the backup file back over the live one.
+// Used by `sync --rebuild` to snapshot the archive before ResetAll fires, so
+// even if the subsequent re-scan produces bad state, the user can restore the
+// pre-rebuild DB by copying the backup file back over the live one — or merge
+// it back in with `ccvault import`.
 func (db *DB) BackupTo(path string) error {
 	if _, err := os.Stat(path); err == nil {
 		return fmt.Errorf("backup path already exists: %s", path)

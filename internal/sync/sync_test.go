@@ -49,8 +49,14 @@ func writeTestSession(t *testing.T, dir, sessionID, projectDir string) string {
 	now := time.Now().UTC().Truncate(time.Millisecond)
 
 	// Write a minimal JSONL file with a user message and an assistant response
+	// Turn UUIDs are globally unique in real Claude Code data, so derive them
+	// from the session ID — shared turn IDs across fixtures would let one
+	// session's INSERT OR REPLACE steal another's turns.
+	userTurnID := sessionID + "-turn-1"
+	assistantTurnID := sessionID + "-turn-2"
+
 	userMsg := map[string]any{
-		"uuid":      "turn-1",
+		"uuid":      userTurnID,
 		"sessionId": sessionID,
 		"type":      "human",
 		"timestamp": now.Format(time.RFC3339Nano),
@@ -60,8 +66,8 @@ func writeTestSession(t *testing.T, dir, sessionID, projectDir string) string {
 		},
 	}
 	assistantMsg := map[string]any{
-		"uuid":       "turn-2",
-		"parentUuid": "turn-1",
+		"uuid":       assistantTurnID,
+		"parentUuid": userTurnID,
 		"sessionId":  sessionID,
 		"type":       "assistant",
 		"timestamp":  now.Add(time.Second).Format(time.RFC3339Nano),
@@ -346,12 +352,11 @@ func TestOptionsApply(t *testing.T) {
 	}
 }
 
-// TestSyncer_FullFlagClearsStaleData is the integration test for the --full
-// bug fix from PR #22. Without ResetAll(), running --full against a source
-// where files have been renamed or removed leaves the old rows behind and
-// the DB drifts from the source of truth. With ResetAll(), --full wipes
-// the archive so re-scanning produces a clean state.
-func TestSyncer_FullFlagClearsStaleData(t *testing.T) {
+// TestSyncer_FullSyncPreservesPrunedSessions is the regression test for #30.
+// `--full` means "re-parse every discovered file", NOT "destroy the archive".
+// Claude Code prunes its own session files, so the archive is the only place
+// older sessions still exist — a --full sync must leave those rows alone.
+func TestSyncer_FullSyncPreservesPrunedSessions(t *testing.T) {
 	database, cleanup := setupTestDB(t)
 	defer cleanup()
 
@@ -361,8 +366,7 @@ func TestSyncer_FullFlagClearsStaleData(t *testing.T) {
 	}
 	defer func() { _ = os.RemoveAll(claudeHome) }()
 
-	// First sync: one session that we'll later "delete" from disk to simulate
-	// a rename/removal upstream.
+	// First sync: one session whose file upstream later prunes.
 	writeTestSession(t, claudeHome, "aaaaaaaa-1111-2222-3333-444444444444", "-Users-test-old-project")
 	sources := []config.SourceConfig{
 		{Name: "claude-code", Type: "claude-code", Path: claudeHome},
@@ -377,25 +381,12 @@ func TestSyncer_FullFlagClearsStaleData(t *testing.T) {
 		t.Fatalf("first sync: SessionsIndexed = %d, want 1", stats1.SessionsIndexed)
 	}
 
-	var beforeSessions, beforeProjects int
-	if err := database.QueryRow("SELECT COUNT(*) FROM sessions").Scan(&beforeSessions); err != nil {
-		t.Fatalf("count sessions before: %v", err)
-	}
-	if err := database.QueryRow("SELECT COUNT(*) FROM projects").Scan(&beforeProjects); err != nil {
-		t.Fatalf("count projects before: %v", err)
-	}
-	if beforeSessions != 1 || beforeProjects != 1 {
-		t.Fatalf("pre-condition: sessions=%d projects=%d, want 1/1", beforeSessions, beforeProjects)
-	}
-
-	// Simulate the upstream state changing: the old project directory is
-	// removed and a new one takes its place.
+	// Upstream prunes the old project directory; a new session appears.
 	if err := os.RemoveAll(filepath.Join(claudeHome, "projects", "-Users-test-old-project")); err != nil {
 		t.Fatalf("remove old project dir: %v", err)
 	}
 	writeTestSession(t, claudeHome, "bbbbbbbb-5555-6666-7777-888888888888", "-Users-test-new-project")
 
-	// Full sync: should wipe the old session/project and index the new one.
 	full := New(database, sources, WithFullSync(true))
 	stats2, err := full.Run()
 	if err != nil {
@@ -412,21 +403,223 @@ func TestSyncer_FullFlagClearsStaleData(t *testing.T) {
 	if err := database.QueryRow("SELECT COUNT(*) FROM projects").Scan(&afterProjects); err != nil {
 		t.Fatalf("count projects after: %v", err)
 	}
-	// Must be exactly 1 of each — the old rows are gone, only the new session survives.
-	if afterSessions != 1 {
-		t.Errorf("sessions after full sync = %d, want 1 (old row should be gone)", afterSessions)
+	if afterSessions != 2 {
+		t.Errorf("sessions after full sync = %d, want 2 (pruned-upstream row must survive)", afterSessions)
 	}
-	if afterProjects != 1 {
-		t.Errorf("projects after full sync = %d, want 1 (old row should be gone)", afterProjects)
+	if afterProjects != 2 {
+		t.Errorf("projects after full sync = %d, want 2 (pruned-upstream project must survive)", afterProjects)
 	}
 
-	// The one surviving session must be the new one, not the old one.
+	var stillThere int
+	if err := database.QueryRow("SELECT COUNT(*) FROM sessions WHERE id = ?",
+		"aaaaaaaa-1111-2222-3333-444444444444").Scan(&stillThere); err != nil {
+		t.Fatalf("look up pruned session: %v", err)
+	}
+	if stillThere != 1 {
+		t.Error("the session whose source file was pruned upstream was destroyed by --full")
+	}
+
+	// Its turns must survive too — a session row with no turns is just as lost.
+	var prunedTurns int
+	if err := database.QueryRow("SELECT COUNT(*) FROM turns WHERE session_id = ?",
+		"aaaaaaaa-1111-2222-3333-444444444444").Scan(&prunedTurns); err != nil {
+		t.Fatalf("count pruned turns: %v", err)
+	}
+	if prunedTurns == 0 {
+		t.Error("turns for the pruned session were destroyed by --full")
+	}
+}
+
+// TestSyncer_FullSyncReparsesUnchangedFiles proves --full still does the job
+// it exists for: re-parsing files the mtime check would otherwise skip (e.g.
+// after a parser change that extracts more from the same JSONL).
+func TestSyncer_FullSyncReparsesUnchangedFiles(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	claudeHome, err := os.MkdirTemp("", "claude-home-reparse-*")
+	if err != nil {
+		t.Fatalf("create claude home: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(claudeHome) }()
+
+	writeTestSession(t, claudeHome, "11111111-2222-3333-4444-555555555555", "-Users-test-reparse")
+	sources := []config.SourceConfig{
+		{Name: "claude-code", Type: "claude-code", Path: claudeHome},
+	}
+
+	if _, err := New(database, sources).Run(); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+
+	// Nothing on disk changed, so an incremental sync would skip the file.
+	full := New(database, sources, WithFullSync(true))
+	stats, err := full.Run()
+	if err != nil {
+		t.Fatalf("full sync: %v", err)
+	}
+	if stats.SessionsIndexed != 1 {
+		t.Errorf("full sync SessionsIndexed = %d, want 1 (--full must ignore the mtime skip-check)", stats.SessionsIndexed)
+	}
+	if stats.SessionsSkipped != 0 {
+		t.Errorf("full sync SessionsSkipped = %d, want 0", stats.SessionsSkipped)
+	}
+}
+
+// TestSyncer_RepeatedSyncDoesNotInflateProjectCounts guards the aggregate
+// columns. projects.session_count and total_tokens are written with
+// `existing + incoming`, which double-counts every re-parsed session. The
+// old --full hid this by wiping the table first; now that it doesn't, sync
+// has to reconcile the aggregates against the sessions table.
+func TestSyncer_RepeatedSyncDoesNotInflateProjectCounts(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	claudeHome, err := os.MkdirTemp("", "claude-home-counts-*")
+	if err != nil {
+		t.Fatalf("create claude home: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(claudeHome) }()
+
+	writeTestSession(t, claudeHome, "22222222-3333-4444-5555-666666666666", "-Users-test-counts")
+	writeTestSession(t, claudeHome, "33333333-4444-5555-6666-777777777777", "-Users-test-counts")
+	sources := []config.SourceConfig{
+		{Name: "claude-code", Type: "claude-code", Path: claudeHome},
+	}
+
+	if _, err := New(database, sources).Run(); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	// Three more full syncs over the same two files.
+	for i := 0; i < 3; i++ {
+		if _, err := New(database, sources, WithFullSync(true)).Run(); err != nil {
+			t.Fatalf("full sync %d: %v", i, err)
+		}
+	}
+
+	var sessionCount int
+	var totalTokens int64
+	if err := database.QueryRow("SELECT session_count, total_tokens FROM projects").Scan(&sessionCount, &totalTokens); err != nil {
+		t.Fatalf("read project aggregates: %v", err)
+	}
+	if sessionCount != 2 {
+		t.Errorf("projects.session_count = %d, want 2 (one row per real session, not per sync)", sessionCount)
+	}
+	// Each test session carries 10 input + 5 output tokens.
+	if totalTokens != 30 {
+		t.Errorf("projects.total_tokens = %d, want 30", totalTokens)
+	}
+}
+
+// TestSyncer_RebuildWipesArchive covers the flag that now owns destruction.
+// --rebuild is the only mode that clears the archive before re-scanning.
+func TestSyncer_RebuildWipesArchive(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	claudeHome, err := os.MkdirTemp("", "claude-home-rebuild-*")
+	if err != nil {
+		t.Fatalf("create claude home: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(claudeHome) }()
+
+	writeTestSession(t, claudeHome, "aaaaaaaa-1111-2222-3333-444444444444", "-Users-test-old-project")
+	sources := []config.SourceConfig{
+		{Name: "claude-code", Type: "claude-code", Path: claudeHome},
+	}
+
+	if _, err := New(database, sources).Run(); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+
+	if err := os.RemoveAll(filepath.Join(claudeHome, "projects", "-Users-test-old-project")); err != nil {
+		t.Fatalf("remove old project dir: %v", err)
+	}
+	writeTestSession(t, claudeHome, "bbbbbbbb-5555-6666-7777-888888888888", "-Users-test-new-project")
+
+	rebuild := New(database, sources, WithRebuild(true))
+	if _, err := rebuild.Run(); err != nil {
+		t.Fatalf("rebuild sync: %v", err)
+	}
+
+	var afterSessions, afterProjects int
+	if err := database.QueryRow("SELECT COUNT(*) FROM sessions").Scan(&afterSessions); err != nil {
+		t.Fatalf("count sessions after: %v", err)
+	}
+	if err := database.QueryRow("SELECT COUNT(*) FROM projects").Scan(&afterProjects); err != nil {
+		t.Fatalf("count projects after: %v", err)
+	}
+	if afterSessions != 1 {
+		t.Errorf("sessions after rebuild = %d, want 1 (old row should be gone)", afterSessions)
+	}
+	if afterProjects != 1 {
+		t.Errorf("projects after rebuild = %d, want 1 (old row should be gone)", afterProjects)
+	}
+
 	var surviving string
 	if err := database.QueryRow("SELECT id FROM sessions").Scan(&surviving); err != nil {
 		t.Fatalf("read surviving session: %v", err)
 	}
 	if surviving != "bbbbbbbb-5555-6666-7777-888888888888" {
 		t.Errorf("surviving session = %q, want bbbbbbbb-... (old session should have been wiped)", surviving)
+	}
+}
+
+// TestSyncer_RebuildAbortsBeforeWipeWhenParquetRemoveFails covers #25: the
+// analytics parquet must be removed BEFORE the SQLite wipe, so a parquet
+// removal that fails (read-only dir, EROFS, quota) leaves the archive intact
+// instead of empty-with-a-stale-cache.
+func TestSyncer_RebuildAbortsBeforeWipeWhenParquetRemoveFails(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory write permissions, so the remove can't be made to fail")
+	}
+
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	claudeHome, err := os.MkdirTemp("", "claude-home-parquet-*")
+	if err != nil {
+		t.Fatalf("create claude home: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(claudeHome) }()
+
+	writeTestSession(t, claudeHome, "44444444-5555-6666-7777-888888888888", "-Users-test-parquet")
+	sources := []config.SourceConfig{
+		{Name: "claude-code", Type: "claude-code", Path: claudeHome},
+	}
+	if _, err := New(database, sources).Run(); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+
+	cacheDir, err := os.MkdirTemp("", "ccvault-cache-ro-*")
+	if err != nil {
+		t.Fatalf("create cache dir: %v", err)
+	}
+	defer func() {
+		_ = os.Chmod(cacheDir, 0o700)
+		_ = os.RemoveAll(cacheDir)
+	}()
+	parquetPath := filepath.Join(cacheDir, "sessions.parquet")
+	if err := os.WriteFile(parquetPath, []byte("stale content"), 0o644); err != nil {
+		t.Fatalf("seed stale parquet: %v", err)
+	}
+	// Unlinking requires write permission on the directory, not the file.
+	if err := os.Chmod(cacheDir, 0o500); err != nil {
+		t.Fatalf("chmod cache dir: %v", err)
+	}
+
+	rebuild := New(database, sources, WithRebuild(true), WithCacheDir(cacheDir))
+	if _, err := rebuild.Run(); err == nil {
+		t.Fatal("rebuild should fail when the parquet cache can't be invalidated")
+	}
+
+	// The archive must be untouched — the wipe never ran.
+	var sessions int
+	if err := database.QueryRow("SELECT COUNT(*) FROM sessions").Scan(&sessions); err != nil {
+		t.Fatalf("count sessions: %v", err)
+	}
+	if sessions != 1 {
+		t.Errorf("sessions after aborted rebuild = %d, want 1 (SQLite must not be wiped when the cache remove fails)", sessions)
 	}
 }
 

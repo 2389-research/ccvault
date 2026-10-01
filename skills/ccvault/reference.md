@@ -97,6 +97,32 @@ tool:Edit project:myapp after:month
 | Full session markdown | 50,000 chars |
 | Tools list in summary | Top 10 |
 
-## 7. Staleness Note
+## 7. Reading While a Sync Is Running
+
+The MCP server reads the same SQLite file `ccvault sync` writes, in WAL mode,
+with no cross-process lock. What a concurrent reader can observe depends on
+which sync mode is running.
+
+| Mode | What a reader sees mid-sync |
+|------|-----------------------------|
+| `ccvault sync` (incremental) | Rows for changed files appear as the scan reaches them. Counts grow; nothing disappears. |
+| `ccvault sync --full` | Every file is re-parsed, each in its own transaction. A session's turns are deleted and re-inserted inside one transaction, so a session never appears empty. Counts shift slightly as re-parses land; nothing disappears. |
+| `ccvault sync --rebuild` | **The archive is emptied first.** `list_sessions`, `get_stats`, and `search_conversations` return zero rows immediately after the wipe commits, then climb back as the re-scan proceeds. |
+
+Practical guidance:
+
+- Zero results from `get_stats` or `list_sessions` on an archive that had data a
+  moment ago means a `--rebuild` is in flight, not an empty archive. Retry
+  rather than concluding there is no history.
+- Don't treat counts as stable across two calls during any sync — pagination
+  (`offset` / `next_offset`) can skip or repeat rows if the row set changed in
+  between. Re-run the first page if totals move.
+- `--rebuild` is the only destructive mode and the only one that can briefly
+  present an empty archive. `--full` re-parses without wiping, so it is the
+  safe mode to run on a schedule.
+- `ccvault import <db>` is additive and runs in a single transaction: readers
+  see the archive before or after the merge, never partway through.
+
+## 8. Staleness Note
 
 This reference reflects the ccvault MCP server as of its creation. If a query or tool call fails unexpectedly, check the actual MCP server tool descriptions (via the `tools/list` method) which are the authoritative source of truth.

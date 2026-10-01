@@ -70,7 +70,8 @@ ccvault stats
 |---------|-------------|
 | `quickstart` | Interactive setup guide for new users |
 | `orient` | Database state summary for AI agents (use `--json`) |
-| `sync` | Sync conversations from Claude Code |
+| `sync` | Sync conversations from Claude Code (see [Sync modes](#sync-modes)) |
+| `import [db-path]` | Merge another ccvault database into this archive |
 | `tui` | Launch interactive terminal UI |
 | `search [query]` | Full-text search across conversations |
 | `stats` | Show archive statistics |
@@ -81,6 +82,50 @@ ccvault stats
 | `build-cache` | Build Parquet analytics cache |
 | `mcp` | Start MCP server for AI integration |
 | `version` | Print the version number |
+
+## Sync modes
+
+ccvault is an archive, not a cache of what Claude Code currently has on disk.
+Claude Code prunes its own session files, so the archive is usually the only
+place older conversations still exist. The sync modes differ in whether they
+respect that.
+
+| Mode | What it does | Destroys pruned history? |
+|------|--------------|--------------------------|
+| `ccvault sync` | Re-parses only files whose mtime changed | No |
+| `ccvault sync --full` | Re-parses every discovered file, ignoring mtimes. Each file replaces its own rows; rows whose source file is gone are left alone | No |
+| `ccvault sync --rebuild` | Wipes every table, then re-scans, so the archive holds exactly what is on disk now | **Yes** |
+
+Reach for `--full` after a parser change that extracts more from the same
+JSONL. Reach for `--rebuild` only when you actually want the archive reduced
+to current disk state; it prompts for confirmation, reports how many sessions
+have no source file left (those are gone for good), and takes a `VACUUM INTO`
+backup to `~/.ccvault/backups/` first.
+
+To recover from a rebuild — or to consolidate two machines' archives — merge a
+database back in:
+
+```bash
+ccvault import ~/.ccvault/backups/ccvault-20260905-140418.db
+```
+
+`import` only adds. Sessions absent locally are inserted with their turns and
+tool uses; a session present in both is kept as-is unless the incoming copy
+ended later. The source database is only read, and the whole merge is one
+transaction.
+
+### One-time counter correction
+
+`projects.session_count` and `total_tokens` were maintained additively, so
+every re-parse of an already-indexed session added to them again. Sync now
+recomputes both from the `sessions` rows that actually exist.
+
+The first sync after upgrading therefore **corrects these two numbers
+downward**, sometimes by a lot — an archive synced many times may show project
+token counts an order of magnitude above the real figure. Nothing is deleted
+and no session, turn, or tool use is affected; only the two display counters
+on `projects` change, and they change to the truth. `first_seen_at` and
+`last_activity_at` are left alone.
 
 ## Search Syntax
 
