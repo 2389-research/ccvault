@@ -659,6 +659,58 @@ func TestGetToolNamesLike(t *testing.T) {
 	if len(none) != 0 {
 		t.Errorf("expected no matches, got %v", none)
 	}
+
+	// "__" is a literal double underscore, not two single-character wildcards,
+	// so it matches the two mcp__ tools and not Bash.
+	underscores, err := db.GetToolNamesLike("__", 5)
+	if err != nil {
+		t.Fatalf("GetToolNamesLike underscores: %v", err)
+	}
+	if len(underscores) != 2 {
+		t.Errorf("fragment %q = %v, want the two mcp__ tools", "__", underscores)
+	}
+}
+
+// TestGetToolNamesLike_MetacharactersAreLiteral verifies the fragment is matched
+// as a literal substring: SQLite LIKE metacharacters must not be interpreted.
+func TestGetToolNamesLike_MetacharactersAreLiteral(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	p := &models.Project{Path: "/test", DisplayName: "test"}
+	_ = db.UpsertProject(p)
+	s := &models.Session{ID: "session-1", ProjectID: p.ID, StartedAt: time.Now(), SourceFile: "/test.jsonl"}
+	_ = db.UpsertSession(s)
+
+	toolUses := []models.ToolUse{
+		{TurnID: "turn-1", SessionID: s.ID, ToolName: "toolX", Timestamp: time.Now()},
+		{TurnID: "turn-2", SessionID: s.ID, ToolName: "toolY", Timestamp: time.Now()},
+		{TurnID: "turn-3", SessionID: s.ID, ToolName: "toolZ", Timestamp: time.Now()},
+	}
+	if err := db.InsertToolUses(toolUses); err != nil {
+		t.Fatalf("insert tool uses: %v", err)
+	}
+
+	for _, fragment := range []string{"_", "%", `\`, "t_olX", "tool%"} {
+		names, err := db.GetToolNamesLike(fragment, 5)
+		if err != nil {
+			t.Fatalf("GetToolNamesLike(%q): %v", fragment, err)
+		}
+		if len(names) != 0 {
+			t.Errorf("fragment %q matched %v, want no matches (metacharacters must be literal)", fragment, names)
+		}
+	}
+
+	// A plain substring still matches, case-insensitively.
+	for _, fragment := range []string{"oolX", "OOLX"} {
+		names, err := db.GetToolNamesLike(fragment, 5)
+		if err != nil {
+			t.Fatalf("GetToolNamesLike(%q): %v", fragment, err)
+		}
+		if len(names) != 1 || names[0] != "toolX" {
+			t.Errorf("fragment %q = %v, want [toolX]", fragment, names)
+		}
+	}
 }
 
 // TestResetAll_ClearsDataAndPreservesSchema verifies that ResetAll deletes
