@@ -334,6 +334,10 @@ func (db *DB) GetToolUsageStats(limit int) (map[string]int, error) {
 // GetToolNamesLike returns distinct tool names containing fragment
 // (case-insensitive), ordered by name. Used for "did you mean" hints
 // when a tool: search matches nothing.
+//
+// The fragment is matched with INSTR rather than LIKE so that '%' and '_' in a
+// caller-supplied fragment are literal characters instead of wildcards. LOWER on
+// both sides keeps the ASCII case-insensitivity that LIKE provided by default.
 func (db *DB) GetToolNamesLike(fragment string, limit int) ([]string, error) {
 	if limit <= 0 {
 		limit = 10
@@ -342,7 +346,7 @@ func (db *DB) GetToolNamesLike(fragment string, limit int) ([]string, error) {
 	rows, err := db.Query(`
 		SELECT DISTINCT tool_name
 		FROM tool_uses
-		WHERE tool_name LIKE '%' || ? || '%'
+		WHERE INSTR(LOWER(tool_name), LOWER(?)) > 0
 		ORDER BY tool_name
 		LIMIT ?`, fragment, limit)
 	if err != nil {

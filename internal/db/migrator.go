@@ -141,8 +141,8 @@ func loadMigrations() ([]migration, error) {
 		}
 
 		// Parse version from filename (e.g., "001_initial_schema.sql" -> 1)
-		var version int
-		if _, err := fmt.Sscanf(entry.Name(), "%03d_", &version); err != nil {
+		version, ok := parseMigrationVersion(entry.Name())
+		if !ok {
 			continue // Skip files that don't match the naming convention
 		}
 
@@ -158,11 +158,55 @@ func loadMigrations() ([]migration, error) {
 		})
 	}
 
+	// Check uniqueness before sorting: ReadDir order is lexical, so the error
+	// names the colliding files in a stable order.
+	if err := checkUniqueVersions(migrations); err != nil {
+		return nil, err
+	}
+
 	sort.Slice(migrations, func(i, j int) bool {
 		return migrations[i].version < migrations[j].version
 	})
 
 	return migrations, nil
+}
+
+// parseMigrationVersion extracts the version number from a migration filename
+// (e.g., "001_initial_schema.sql" -> 1). It reports false for filenames that
+// don't follow the NNN_name.sql convention.
+func parseMigrationVersion(filename string) (int, bool) {
+	var version int
+	if _, err := fmt.Sscanf(filename, "%03d_", &version); err != nil {
+		return 0, false
+	}
+	return version, true
+}
+
+// checkUniqueVersions returns an error if two migration files claim the same
+// version number. applyMigration gates on the version number alone, so only one
+// of them would ever run and the other would be silently skipped on every
+// database. Gaps in the sequence are legitimate (numbers get reserved by
+// in-flight branches); only duplicates are an error.
+func checkUniqueVersions(migrations []migration) error {
+	highest := 0
+	for _, m := range migrations {
+		if m.version > highest {
+			highest = m.version
+		}
+	}
+
+	seen := make(map[int]string, len(migrations))
+	for _, m := range migrations {
+		if first, dup := seen[m.version]; dup {
+			return fmt.Errorf(
+				"duplicate migration version %d: %q and %q both claim it, so only one would ever run "+
+					"and the other would be silently skipped. Renumber one of them (usually the one "+
+					"arriving from the other branch) to an unused version above %03d",
+				m.version, first, m.filename, highest)
+		}
+		seen[m.version] = m.filename
+	}
+	return nil
 }
 
 // applyMigration executes a single migration within a transaction and records it.

@@ -5,6 +5,8 @@ package db
 
 import (
 	"database/sql"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -513,6 +515,105 @@ CREATE INDEX idx_foo ON foo(id);`
 
 	if stmts[2] != "CREATE INDEX idx_foo ON foo(id);" {
 		t.Errorf("stmt[2] = %q", stmts[2])
+	}
+}
+
+// TestMigrationFilesHaveUniqueVersions walks the migrations directory on disk and
+// fails if two files claim the same version number. This is the CI guard: a
+// collision between branches (two files numbered 005_) is caught here instead of
+// silently skipping one migration on a user's database.
+func TestMigrationFilesHaveUniqueVersions(t *testing.T) {
+	entries, err := os.ReadDir("migrations")
+	if err != nil {
+		t.Fatalf("read migrations dir: %v", err)
+	}
+
+	var migrations []migration
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".sql" {
+			continue
+		}
+		version, ok := parseMigrationVersion(entry.Name())
+		if !ok {
+			t.Errorf("migration file %q does not match the NNN_name.sql convention", entry.Name())
+			continue
+		}
+		migrations = append(migrations, migration{version: version, filename: entry.Name()})
+	}
+
+	if len(migrations) == 0 {
+		t.Fatal("no migration files found on disk")
+	}
+
+	if err := checkUniqueVersions(migrations); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestCheckUniqueVersions(t *testing.T) {
+	// Gaps are legitimate: version numbers get reserved by in-flight branches.
+	gapped := []migration{
+		{version: 1, filename: "001_initial_schema.sql"},
+		{version: 5, filename: "005_normalize_display_names.sql"},
+		{version: 13, filename: "013_something_later.sql"},
+	}
+	if err := checkUniqueVersions(gapped); err != nil {
+		t.Errorf("non-contiguous versions should be accepted, got: %v", err)
+	}
+
+	// Two files claiming 005 is the collision this guard exists for.
+	collided := []migration{
+		{version: 1, filename: "001_initial_schema.sql"},
+		{version: 5, filename: "005_normalize_display_names.sql"},
+		{version: 5, filename: "005_remote_push_state.sql"},
+	}
+	err := checkUniqueVersions(collided)
+	if err == nil {
+		t.Fatal("duplicate versions should be rejected, got nil error")
+	}
+	if !containsAll(err.Error(), "005_normalize_display_names.sql", "005_remote_push_state.sql", "Renumber") {
+		t.Errorf("error should name both files and say how to fix it, got: %v", err)
+	}
+}
+
+// TestLoadMigrations_StrictlyAscending verifies the embedded migration set loads
+// cleanly and yields one migration per version in ascending order.
+func TestLoadMigrations_StrictlyAscending(t *testing.T) {
+	migrations, err := loadMigrations()
+	if err != nil {
+		t.Fatalf("loadMigrations: %v", err)
+	}
+	if len(migrations) == 0 {
+		t.Fatal("loadMigrations returned no migrations")
+	}
+	for i := 1; i < len(migrations); i++ {
+		if migrations[i].version <= migrations[i-1].version {
+			t.Errorf("migrations not strictly ascending: %q then %q",
+				migrations[i-1].filename, migrations[i].filename)
+		}
+	}
+}
+
+func TestParseMigrationVersion(t *testing.T) {
+	cases := []struct {
+		filename string
+		version  int
+		ok       bool
+	}{
+		{"001_initial_schema.sql", 1, true},
+		{"005_normalize_display_names.sql", 5, true},
+		{"012_reserved.sql", 12, true},
+		{"schema.sql", 0, false},
+		{"README.md", 0, false},
+		{"_leading_underscore.sql", 0, false},
+	}
+
+	for _, c := range cases {
+		version, ok := parseMigrationVersion(c.filename)
+		if ok != c.ok || version != c.version {
+			t.Errorf("parseMigrationVersion(%q) = %d, %v; want %d, %v",
+				c.filename, version, ok, c.version, c.ok)
+		}
 	}
 }
 
