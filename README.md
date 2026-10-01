@@ -114,6 +114,19 @@ tool uses; a session present in both is kept as-is unless the incoming copy
 ended later. The source database is only read, and the whole merge is one
 transaction.
 
+### One-time counter correction
+
+`projects.session_count` and `total_tokens` were maintained additively, so
+every re-parse of an already-indexed session added to them again. Sync now
+recomputes both from the `sessions` rows that actually exist.
+
+The first sync after upgrading therefore **corrects these two numbers
+downward**, sometimes by a lot — an archive synced many times may show project
+token counts an order of magnitude above the real figure. Nothing is deleted
+and no session, turn, or tool use is affected; only the two display counters
+on `projects` change, and they change to the truth. `first_seen_at` and
+`last_activity_at` are left alone.
+
 ## Search Syntax
 
 ccvault supports Gmail-like query syntax:
