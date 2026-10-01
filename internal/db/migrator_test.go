@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -22,6 +23,71 @@ func openMemoryDB(t *testing.T) *sql.DB {
 	return db
 }
 
+// shippedMigrations reports how many migration files ship and the highest version
+// among them. It reads the directory from disk and parses the version prefix
+// itself rather than calling loadMigrations, so the numbers come from a source
+// independent of the loader RunMigrations uses. A loader that silently skipped a
+// file would move the database side without moving this side, and the comparison
+// would fail instead of agreeing with itself.
+func shippedMigrations(t *testing.T) (count, maxVersion int) {
+	t.Helper()
+
+	entries, err := os.ReadDir("migrations")
+	if err != nil {
+		t.Fatalf("read migrations dir: %v", err)
+	}
+
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || filepath.Ext(name) != ".sql" {
+			continue
+		}
+		if len(name) < 4 || name[3] != '_' {
+			t.Fatalf("migration file %q does not match the NNN_name.sql convention", name)
+		}
+		version, err := strconv.Atoi(name[:3])
+		if err != nil {
+			t.Fatalf("migration file %q has a non-numeric version prefix: %v", name, err)
+		}
+		count++
+		if version > maxVersion {
+			maxVersion = version
+		}
+	}
+
+	if count == 0 {
+		t.Fatal("no migration files found on disk")
+	}
+	return count, maxVersion
+}
+
+// assertFullyMigrated verifies the database recorded one applied version per
+// migration file that ships, reaching the highest version on disk. This is the
+// invariant that matters — RunMigrations applied everything that ships — rather
+// than a snapshot of how many migrations exist today, so adding a migration needs
+// no edits here. A migration that silently never ran still fails the count check.
+func assertFullyMigrated(t *testing.T, db *sql.DB) {
+	t.Helper()
+
+	wantCount, wantMax := shippedMigrations(t)
+
+	var gotMax int
+	if err := db.QueryRow("SELECT MAX(version) FROM schema_version").Scan(&gotMax); err != nil {
+		t.Fatalf("query max version: %v", err)
+	}
+	if gotMax != wantMax {
+		t.Errorf("max applied version = %d, want %d (highest version in migrations/)", gotMax, wantMax)
+	}
+
+	var gotCount int
+	if err := db.QueryRow("SELECT COUNT(*) FROM schema_version").Scan(&gotCount); err != nil {
+		t.Fatalf("count schema_version: %v", err)
+	}
+	if gotCount != wantCount {
+		t.Errorf("applied migration count = %d, want %d (one row per file in migrations/)", gotCount, wantCount)
+	}
+}
+
 func TestMigrator_FreshDatabase(t *testing.T) {
 	db := openMemoryDB(t)
 	defer func() { _ = db.Close() }()
@@ -30,25 +96,8 @@ func TestMigrator_FreshDatabase(t *testing.T) {
 		t.Fatalf("RunMigrations: %v", err)
 	}
 
-	// Verify schema_version has correct version
-	var maxVersion int
-	err := db.QueryRow("SELECT MAX(version) FROM schema_version").Scan(&maxVersion)
-	if err != nil {
-		t.Fatalf("query max version: %v", err)
-	}
-	if maxVersion != 5 {
-		t.Errorf("max version = %d, want 5", maxVersion)
-	}
-
-	// Count migration records
-	var count int
-	err = db.QueryRow("SELECT COUNT(*) FROM schema_version").Scan(&count)
-	if err != nil {
-		t.Fatalf("count schema_version: %v", err)
-	}
-	if count != 5 {
-		t.Errorf("schema_version count = %d, want 5", count)
-	}
+	// Every migration that ships should be recorded as applied
+	assertFullyMigrated(t, db)
 
 	// Verify all core tables exist
 	tables := []string{"projects", "sessions", "turns", "tool_uses", "turns_fts", "sync_state", "source_files"}
@@ -117,15 +166,8 @@ func TestMigrator_ExistingDatabase(t *testing.T) {
 		t.Fatalf("second RunMigrations: %v", err)
 	}
 
-	// Verify exactly 5 migration records, not 10
-	var count int
-	err := db.QueryRow("SELECT COUNT(*) FROM schema_version").Scan(&count)
-	if err != nil {
-		t.Fatalf("count schema_version: %v", err)
-	}
-	if count != 5 {
-		t.Errorf("schema_version count = %d, want 5 (idempotent)", count)
-	}
+	// One record per migration file, not two: the second run must be a no-op
+	assertFullyMigrated(t, db)
 }
 
 func TestMigrator_BootstrapExisting(t *testing.T) {
@@ -194,25 +236,9 @@ func TestMigrator_BootstrapExisting(t *testing.T) {
 		t.Fatalf("RunMigrations on pre-existing db: %v", err)
 	}
 
-	// Verify it bootstrapped to version 2 then applied migrations 003 and 004
-	var maxVersion int
-	err := db.QueryRow("SELECT MAX(version) FROM schema_version").Scan(&maxVersion)
-	if err != nil {
-		t.Fatalf("query max version: %v", err)
-	}
-	if maxVersion != 5 {
-		t.Errorf("max version = %d, want 5", maxVersion)
-	}
-
-	// Verify exactly 4 records (2 bootstrapped + 2 applied)
-	var count int
-	err = db.QueryRow("SELECT COUNT(*) FROM schema_version").Scan(&count)
-	if err != nil {
-		t.Fatalf("count schema_version: %v", err)
-	}
-	if count != 5 {
-		t.Errorf("schema_version count = %d, want 5", count)
-	}
+	// Bootstrapped to version 2, then applied every later migration: the records
+	// cover one version per migration file either way
+	assertFullyMigrated(t, db)
 }
 
 func TestMigrator_BootstrapPartial(t *testing.T) {
@@ -251,15 +277,8 @@ func TestMigrator_BootstrapPartial(t *testing.T) {
 		t.Fatalf("RunMigrations: %v", err)
 	}
 
-	// Verify version is now 4 (bootstrapped to 1, applied 002, 003, and 004)
-	var maxVersion int
-	err := db.QueryRow("SELECT MAX(version) FROM schema_version").Scan(&maxVersion)
-	if err != nil {
-		t.Fatalf("query max version: %v", err)
-	}
-	if maxVersion != 5 {
-		t.Errorf("max version = %d, want 5", maxVersion)
-	}
+	// Bootstrapped to version 1, then applied every later migration
+	assertFullyMigrated(t, db)
 
 	// Verify has_error column was added by migration 002
 	rows, err := db.Query("PRAGMA table_info(sessions)")
@@ -295,18 +314,10 @@ func TestMigrator_SourceColumns(t *testing.T) {
 		t.Fatalf("RunMigrations: %v", err)
 	}
 
-	// Verify version is 3
-	var maxVersion int
-	err := db.QueryRow("SELECT MAX(version) FROM schema_version").Scan(&maxVersion)
-	if err != nil {
-		t.Fatalf("query max version: %v", err)
-	}
-	if maxVersion != 5 {
-		t.Errorf("max version = %d, want 5", maxVersion)
-	}
+	assertFullyMigrated(t, db)
 
 	// Insert a project row and verify the source column defaults to "claude-code"
-	_, err = db.Exec(`INSERT INTO projects (path, display_name, first_seen_at, last_activity_at)
+	_, err := db.Exec(`INSERT INTO projects (path, display_name, first_seen_at, last_activity_at)
 		VALUES ('/tmp/test', 'test-project', datetime('now'), datetime('now'))`)
 	if err != nil {
 		t.Fatalf("insert project: %v", err)
