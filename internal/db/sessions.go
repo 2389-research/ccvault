@@ -146,8 +146,15 @@ func (db *DB) GetSession(id string) (*models.Session, error) {
 	return s, nil
 }
 
-// GetSessions retrieves sessions with optional filters
+// GetSessions retrieves sessions from the start of the sorted set,
+// optionally filtered to one project.
 func (db *DB) GetSessions(projectID int64, limit int) ([]models.Session, error) {
+	return db.GetSessionsPage(projectID, limit, 0)
+}
+
+// GetSessionsPage retrieves one page of sessions: up to limit rows
+// (0 means unlimited) starting at offset in the sorted set.
+func (db *DB) GetSessionsPage(projectID int64, limit, offset int) ([]models.Session, error) {
 	query := `
 		SELECT s.id, s.project_id, s.started_at, s.ended_at, s.model, s.git_branch,
 			s.turn_count, s.input_tokens, s.output_tokens, s.cache_read_tokens, s.cache_write_tokens,
@@ -161,11 +168,11 @@ func (db *DB) GetSessions(projectID int64, limit int) ([]models.Session, error) 
 		args = append(args, projectID)
 	}
 
-	query += " ORDER BY s.started_at DESC"
-
-	if limit > 0 {
-		query += fmt.Sprintf(" LIMIT %d", limit)
-	}
+	// `s.id ASC` is a tiebreaker, not a preference: sessions that share a
+	// started_at would otherwise swap positions between calls and offset
+	// pagination would skip or repeat rows.
+	query += " ORDER BY s.started_at DESC, s.id ASC"
+	query += limitOffsetClause(limit, offset)
 
 	rows, err := db.Query(query, args...)
 	if err != nil {

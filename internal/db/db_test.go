@@ -6,6 +6,7 @@ package db
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -932,6 +933,104 @@ func TestGetProjects_SortStableTiebreaker(t *testing.T) {
 	if first[0].Path != "/Users/a/ccvault" || first[1].Path != "/Users/b/ccvault" {
 		t.Errorf("path-ASC tiebreaker not applied; got %q, %q",
 			first[0].Path, first[1].Path)
+	}
+}
+
+// TestGetProjectsPage_WalksEveryRowWithoutGapsOrRepeats covers the offset
+// pagination the MCP list_projects tool is built on: consecutive pages must
+// tile the full sorted result set exactly once.
+func TestGetProjectsPage_WalksEveryRowWithoutGapsOrRepeats(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	for _, path := range []string{"/p/a", "/p/b", "/p/c", "/p/d", "/p/e"} {
+		p := &models.Project{Path: path, DisplayName: path}
+		if err := db.UpsertProject(p); err != nil {
+			t.Fatalf("upsert %s: %v", path, err)
+		}
+	}
+
+	var walked []string
+	for offset := 0; ; offset += 2 {
+		page, err := db.GetProjectsPage("name", 2, offset)
+		if err != nil {
+			t.Fatalf("GetProjectsPage offset %d: %v", offset, err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		for _, p := range page {
+			walked = append(walked, p.Path)
+		}
+	}
+
+	want := []string{"/p/a", "/p/b", "/p/c", "/p/d", "/p/e"}
+	if len(walked) != len(want) {
+		t.Fatalf("walked %v, want %v", walked, want)
+	}
+	for i := range want {
+		if walked[i] != want[i] {
+			t.Errorf("page walk index %d = %q, want %q", i, walked[i], want[i])
+		}
+	}
+
+	// An offset with no limit must still skip, not silently return everything.
+	rest, err := db.GetProjectsPage("name", 0, 3)
+	if err != nil {
+		t.Fatalf("GetProjectsPage unlimited: %v", err)
+	}
+	if len(rest) != 2 || rest[0].Path != "/p/d" {
+		t.Errorf("unlimited page from offset 3 = %d rows starting %q, want 2 starting /p/d",
+			len(rest), rest[0].Path)
+	}
+}
+
+// TestGetSessionsPage_WalksEveryRowWithoutGapsOrRepeats is the sessions
+// counterpart — MCP list_sessions pages through this.
+func TestGetSessionsPage_WalksEveryRowWithoutGapsOrRepeats(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	p := &models.Project{Path: "/p/paged", DisplayName: "paged"}
+	if err := db.UpsertProject(p); err != nil {
+		t.Fatalf("upsert project: %v", err)
+	}
+	// Descending started_at means session-1 (newest) sorts first.
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	for i := 1; i <= 5; i++ {
+		s := &models.Session{
+			ID:         fmt.Sprintf("session-%d", i),
+			ProjectID:  p.ID,
+			StartedAt:  base.Add(time.Duration(-i) * time.Hour),
+			SourceFile: fmt.Sprintf("/p/paged/%d.jsonl", i),
+		}
+		if err := db.UpsertSession(s); err != nil {
+			t.Fatalf("upsert session %d: %v", i, err)
+		}
+	}
+
+	var walked []string
+	for offset := 0; ; offset += 2 {
+		page, err := db.GetSessionsPage(p.ID, 2, offset)
+		if err != nil {
+			t.Fatalf("GetSessionsPage offset %d: %v", offset, err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		for _, s := range page {
+			walked = append(walked, s.ID)
+		}
+	}
+
+	want := []string{"session-1", "session-2", "session-3", "session-4", "session-5"}
+	if len(walked) != len(want) {
+		t.Fatalf("walked %v, want %v", walked, want)
+	}
+	for i := range want {
+		if walked[i] != want[i] {
+			t.Errorf("page walk index %d = %q, want %q", i, walked[i], want[i])
+		}
 	}
 }
 

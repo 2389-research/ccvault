@@ -347,7 +347,7 @@ func (s *Server) handleToolsList(req *jsonRPCRequest) {
 		},
 		{
 			Name:        "list_sessions",
-			Description: "List recent sessions, optionally filtered by project.",
+			Description: "List recent sessions, optionally filtered by project. Use offset for pagination.",
 			InputSchema: inputSchema{
 				Type: "object",
 				Properties: map[string]property{
@@ -357,14 +357,18 @@ func (s *Server) handleToolsList(req *jsonRPCRequest) {
 					},
 					"limit": {
 						Type:        "number",
-						Description: "Maximum sessions to return (default 20, max 100)",
+						Description: "Sessions per page (default 20, max 100)",
+					},
+					"offset": {
+						Type:        "number",
+						Description: "Skip first N sessions for pagination. Use next_offset from response.",
 					},
 				},
 			},
 		},
 		{
 			Name:        "list_projects",
-			Description: "List all indexed projects with session counts and token usage.",
+			Description: "List all indexed projects with session counts and token usage. Use offset for pagination.",
 			InputSchema: inputSchema{
 				Type: "object",
 				Properties: map[string]property{
@@ -375,7 +379,11 @@ func (s *Server) handleToolsList(req *jsonRPCRequest) {
 					},
 					"limit": {
 						Type:        "number",
-						Description: "Maximum projects to return (default 50, max 100)",
+						Description: "Projects per page (default 50, max 100)",
+					},
+					"offset": {
+						Type:        "number",
+						Description: "Skip first N projects for pagination. Use next_offset from response.",
 					},
 				},
 			},
@@ -1004,6 +1012,11 @@ func (s *Server) listSessions(args map[string]interface{}) (interface{}, error) 
 		limit = 20
 	}
 
+	offset := 0
+	if o, ok := args["offset"].(float64); ok && o > 0 {
+		offset = int(o)
+	}
+
 	var projectID int64
 	if projectFilter, ok := args["project"].(string); ok && projectFilter != "" {
 		// Class D — return all matches, don't silently pick one.
@@ -1041,7 +1054,7 @@ func (s *Server) listSessions(args map[string]interface{}) (interface{}, error) 
 	}
 
 	// Fetch one extra row to detect whether more sessions exist
-	sessions, err := s.db.GetSessions(projectID, limit+1)
+	sessions, err := s.db.GetSessionsPage(projectID, limit+1, offset)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get sessions: %w", err)
 	}
@@ -1062,16 +1075,19 @@ func (s *Server) listSessions(args map[string]interface{}) (interface{}, error) 
 
 	response := map[string]interface{}{
 		"count":    len(sessions),
+		"offset":   offset,
+		"limit":    limit,
 		"sessions": projectref.SessionRefsFromValues(sessions, projectsByID),
 	}
 	if enrichErr != nil {
 		response["warnings"] = []string{
-			fmt.Sprintf("project enrichment lookup failed: %v — session project_name values fell back to basename", enrichErr),
+			fmt.Sprintf("project enrichment unavailable: %v (session project_name values fell back to basename)", enrichErr),
 		}
 	}
 	if hasMore {
 		response["has_more"] = true
-		response["hint"] = "More sessions exist. Raise limit (max 100) or narrow with the project filter."
+		response["next_offset"] = offset + limit
+		response["hint"] = fmt.Sprintf("More sessions exist. Fetch next page with offset=%d, or narrow with the project filter.", offset+limit)
 	}
 
 	return response, nil
@@ -1094,8 +1110,13 @@ func (s *Server) listProjects(args map[string]interface{}) (interface{}, error) 
 		limit = 50
 	}
 
+	offset := 0
+	if o, ok := args["offset"].(float64); ok && o > 0 {
+		offset = int(o)
+	}
+
 	// Fetch one extra row to detect whether more projects exist
-	projects, err := s.db.GetProjects(sortBy, limit+1)
+	projects, err := s.db.GetProjectsPage(sortBy, limit+1, offset)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get projects: %w", err)
 	}
@@ -1109,11 +1130,14 @@ func (s *Server) listProjects(args map[string]interface{}) (interface{}, error) 
 	// shape, plus the operational fields agents need.
 	response := map[string]interface{}{
 		"count":    len(projects),
+		"offset":   offset,
+		"limit":    limit,
 		"projects": projectref.EnrichedRefsFromValues(projects),
 	}
 	if hasMore {
 		response["has_more"] = true
-		response["hint"] = "More projects exist. Raise limit (max 100) or use sort to surface the relevant ones."
+		response["next_offset"] = offset + limit
+		response["hint"] = fmt.Sprintf("More projects exist. Fetch next page with offset=%d, or use sort to surface the relevant ones.", offset+limit)
 	}
 
 	return response, nil

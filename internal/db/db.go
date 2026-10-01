@@ -130,6 +130,28 @@ func (db *DB) BackupTo(path string) error {
 	return nil
 }
 
+// limitOffsetClause renders the trailing LIMIT/OFFSET for a paginated
+// query. A limit of 0 means "no limit", but SQLite only honours OFFSET
+// when a LIMIT is present, so an unlimited page with an offset gets the
+// `LIMIT -1` spelling for "all remaining rows". Negative inputs are
+// treated as zero rather than passed through to SQL.
+func limitOffsetClause(limit, offset int) string {
+	if offset < 0 {
+		offset = 0
+	}
+	switch {
+	case limit > 0:
+		if offset > 0 {
+			return fmt.Sprintf(" LIMIT %d OFFSET %d", limit, offset)
+		}
+		return fmt.Sprintf(" LIMIT %d", limit)
+	case offset > 0:
+		return fmt.Sprintf(" LIMIT -1 OFFSET %d", offset)
+	default:
+		return ""
+	}
+}
+
 // BeginTx starts a new transaction
 func (db *DB) BeginTx() (*sql.Tx, error) {
 	return db.Begin()
