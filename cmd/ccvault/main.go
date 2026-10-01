@@ -141,6 +141,7 @@ type orientation struct {
 	ToolStats      map[string]int
 	TokensByModel  map[string]int64
 	RecentProjects []models.Project // full rows so JSON emits {name, path} via projectref.Ref
+	Storage        db.StorageStats
 	Warnings       []string
 }
 
@@ -174,7 +175,54 @@ func gatherOrientation(database *db.DB) orientation {
 	warn("recent projects", err)
 	o.RecentProjects = projects
 
+	o.Storage, err = database.StorageStats()
+	warn("storage stats", err)
+
 	return o
+}
+
+// storageJSON renders page accounting for --json consumers. Dead space in
+// the database file is invisible otherwise: the file grows every sync and
+// nothing in the archive's row counts explains why.
+func storageJSON(s db.StorageStats) map[string]interface{} {
+	return map[string]interface{}{
+		"file_bytes":        s.FileBytes,
+		"page_size":         s.PageSize,
+		"page_count":        s.PageCount,
+		"freelist_count":    s.FreelistCount,
+		"live_bytes":        s.LiveBytes(),
+		"reclaimable_bytes": s.ReclaimableBytes(),
+		"freelist_ratio":    s.FreelistRatio(),
+		"worth_reclaiming":  s.WorthReclaiming(),
+	}
+}
+
+// reclaimHint returns a one-line nudge when the file holds enough dead
+// space to be worth acting on, and an empty string otherwise. Compaction is
+// never automatic — it rewrites the whole file — so this hint is how the
+// user finds out the condition exists.
+func reclaimHint(s db.StorageStats) string {
+	if !s.WorthReclaiming() {
+		return ""
+	}
+	return fmt.Sprintf("%s of the %s database file is dead space (%.0f%%); reclaim it with 'ccvault vacuum'",
+		formatBytes(s.ReclaimableBytes()), formatBytes(s.FileBytes), s.FreelistRatio()*100)
+}
+
+// printStorageSection writes the human-readable storage block shared by
+// stats and orient.
+func printStorageSection(s db.StorageStats) {
+	if s.PageCount <= 0 {
+		return
+	}
+	fmt.Println("Storage:")
+	fmt.Printf("  Database file: %s\n", formatBytes(s.FileBytes))
+	fmt.Printf("  Reclaimable:   %s (%.0f%% of the file)\n",
+		formatBytes(s.ReclaimableBytes()), s.FreelistRatio()*100)
+	if s.WorthReclaiming() {
+		fmt.Println("  Reclaim it with 'ccvault vacuum'.")
+	}
+	fmt.Println()
 }
 
 var orientCmd = &cobra.Command{
@@ -217,6 +265,7 @@ Use --json for machine-readable output.`,
 			"recent_projects": projectref.RefsFromValues(o.RecentProjects),
 			"top_tools":       o.ToolStats,
 			"models":          o.TokensByModel,
+			"storage":         storageJSON(o.Storage),
 			"commands": map[string]string{
 				"search <query>":      "Full-text search across conversations",
 				"list-sessions":       "List recent sessions",
@@ -225,6 +274,7 @@ Use --json for machine-readable output.`,
 				"export <session-id>": "Export session to markdown",
 				"stats":               "Show detailed statistics",
 				"sync":                "Update with latest conversations",
+				"vacuum":              "Reclaim dead space in the database file",
 				"tui":                 "Launch interactive browser",
 				"mcp":                 "Start MCP server",
 			},
@@ -283,6 +333,8 @@ Use --json for machine-readable output.`,
 		fmt.Printf("  Last:  %s\n", o.LastActivity.Format("2006-01-02"))
 		fmt.Printf("  Span:  %d days\n", int(o.LastActivity.Sub(o.FirstActivity).Hours()/24))
 		fmt.Println()
+
+		printStorageSection(o.Storage)
 
 		if len(o.RecentProjects) > 0 {
 			fmt.Println("Recent Projects:")
@@ -460,6 +512,16 @@ over the live DB (the path is printed at run), or merge it back in with
 			}
 		}
 
+		// Every sync leaves freed pages behind, so sync is where the user
+		// finds out the file has drifted away from the data in it. Reporting
+		// only: compaction rewrites the whole file and takes the database
+		// exclusively, which is no business of a sync run.
+		if storage, err := database.StorageStats(); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: storage stats unavailable: %v\n", err)
+		} else if hint := reclaimHint(storage); hint != "" {
+			fmt.Fprintf(os.Stderr, "\nnote: %s\n", hint)
+		}
+
 		return nil
 	},
 }
@@ -608,6 +670,11 @@ var statsCmd = &cobra.Command{
 			return fmt.Errorf("get tokens by model: %w", err)
 		}
 
+		storage, err := database.StorageStats()
+		if err != nil {
+			return fmt.Errorf("get storage stats: %w", err)
+		}
+
 		if jsonOutput {
 			out := map[string]interface{}{
 				"projects":        projectCount,
@@ -617,6 +684,7 @@ var statsCmd = &cobra.Command{
 				"project_tokens":  projectTokens,
 				"tokens_by_model": tokensByModel,
 				"top_tools":       toolStats,
+				"storage":         storageJSON(storage),
 			}
 			if !first.IsZero() && !last.IsZero() {
 				out["activity"] = map[string]interface{}{
@@ -646,6 +714,8 @@ var statsCmd = &cobra.Command{
 			fmt.Println()
 		}
 
+		printStorageSection(storage)
+
 		if len(tokensByModel) > 0 {
 			fmt.Println("Tokens by Model:")
 			for model, tokens := range tokensByModel {
@@ -668,6 +738,81 @@ var statsCmd = &cobra.Command{
 		// Also print _ tokens from project stats if different (shouldn't be, but just in case)
 		_ = projectTokens
 
+		return nil
+	},
+}
+
+var vacuumCmd = &cobra.Command{
+	Use:   "vacuum",
+	Short: "Reclaim dead space in the database file",
+	// A refusal (busy database, not enough disk) is a plain message, not a
+	// reason to dump the flag table.
+	SilenceUsage: true,
+	Long: `Shrink the ccvault database file by discarding its freelist — pages SQLite
+freed internally but never returned to the filesystem.
+
+Incremental sync replaces the rows of every changed session file, so the file
+grows relative to the data it holds. A long-lived archive can be more dead
+space than data.
+
+How it works: a compacted copy is written beside the live database with
+VACUUM INTO, checked with integrity_check and a row count per table, then
+renamed over the original in one atomic step. The original is never modified,
+so any failure before the swap leaves it exactly as it was.
+
+Requirements and caveats:
+  - Free disk space for the compacted copy (roughly the size of the live
+    data, not the whole file). It refuses up front if the space isn't there.
+  - Exclusive access. Close the TUI, MCP server, and any running sync first;
+    it refuses rather than compacting a database someone else is writing to.
+  - Whole-file rewrite. On a multi-gigabyte archive, expect tens of seconds.
+
+Run 'ccvault stats' to see how much there is to reclaim before committing.
+Use --json for machine-readable output.`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		jsonOutput, _ := cmd.Flags().GetBool("json")
+
+		cfg, err := config.Load()
+		if err != nil {
+			return fmt.Errorf("load config: %w", err)
+		}
+
+		// Deliberately does not open the database: compaction takes the file
+		// for itself, and a handle held here would be the thing blocking it.
+		progress := func(msg string) { fmt.Println("  " + msg) }
+		if jsonOutput {
+			// Keep stdout parseable; progress still goes somewhere, because a
+			// multi-gigabyte compaction is a long silence otherwise.
+			progress = func(msg string) { fmt.Fprintln(os.Stderr, msg) }
+		} else {
+			fmt.Printf("Compacting %s\n", filepath.Join(cfg.DataDir, "ccvault.db"))
+		}
+
+		result, err := db.Compact(cfg.DataDir, db.WithCompactProgress(progress))
+		if err != nil {
+			return err
+		}
+
+		if jsonOutput {
+			out := map[string]interface{}{
+				"database":        result.Path,
+				"before":          storageJSON(result.Before),
+				"after":           storageJSON(result.After),
+				"bytes_reclaimed": result.BytesReclaimed(),
+				"duration_ms":     result.Duration.Milliseconds(),
+			}
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			return enc.Encode(out)
+		}
+
+		fmt.Println()
+		fmt.Printf("Reclaimed %s in %s\n",
+			formatBytes(result.BytesReclaimed()), result.Duration.Round(time.Millisecond))
+		fmt.Printf("  Before: %s (%d pages, %d free)\n",
+			formatBytes(result.Before.FileBytes), result.Before.PageCount, result.Before.FreelistCount)
+		fmt.Printf("  After:  %s (%d pages, %d free)\n",
+			formatBytes(result.After.FileBytes), result.After.PageCount, result.After.FreelistCount)
 		return nil
 	},
 }
@@ -1171,6 +1316,7 @@ func init() {
 	rootCmd.AddCommand(tuiCmd)
 	rootCmd.AddCommand(searchCmd)
 	rootCmd.AddCommand(statsCmd)
+	rootCmd.AddCommand(vacuumCmd)
 	rootCmd.AddCommand(listProjectsCmd)
 	rootCmd.AddCommand(listSessionsCmd)
 	rootCmd.AddCommand(showCmd)
@@ -1184,6 +1330,9 @@ func init() {
 
 	// Stats flags
 	statsCmd.Flags().Bool("json", false, "Output as JSON for machine parsing")
+
+	// Vacuum flags
+	vacuumCmd.Flags().Bool("json", false, "Output as JSON for machine parsing")
 
 	// Sync flags
 	syncCmd.Flags().Bool("full", false, "Re-parse every session file, ignoring mtimes. Not destructive — rows whose source file is gone are kept")
@@ -1236,6 +1385,23 @@ func formatTokens(n int64) string {
 		return fmt.Sprintf("%.1fK", float64(n)/1_000)
 	}
 	return fmt.Sprintf("%d", n)
+}
+
+// formatBytes formats a byte count for display. Binary units, because the
+// numbers it describes are page counts times a power-of-two page size.
+func formatBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	value := float64(n)
+	for _, suffix := range []string{"KB", "MB", "GB", "TB"} {
+		value /= unit
+		if value < unit {
+			return fmt.Sprintf("%.1f %s", value, suffix)
+		}
+	}
+	return fmt.Sprintf("%.1f PB", value/unit)
 }
 
 // padVisualCLI left-pads s to visual column width using rune count.

@@ -33,8 +33,8 @@ func TestGatherOrientation_CollectsWarningsOnFailure(t *testing.T) {
 	_ = database.Close() // force every stats query to fail
 
 	o := gatherOrientation(database)
-	if len(o.Warnings) != 6 {
-		t.Errorf("closed db should produce 6 warnings (one per query), got %d: %v", len(o.Warnings), o.Warnings)
+	if len(o.Warnings) != 7 {
+		t.Errorf("closed db should produce 7 warnings (one per query), got %d: %v", len(o.Warnings), o.Warnings)
 	}
 }
 
@@ -290,5 +290,115 @@ func TestPruneOldBackups_UnderKeepThresholdIsNoop(t *testing.T) {
 	}
 	if pruned != 0 {
 		t.Errorf("expected 0 pruned, got %d", pruned)
+	}
+}
+
+// TestGatherOrientation_IncludesStorage covers the reason storage landed in
+// orient at all: an agent reading the JSON should be able to see that the
+// file is mostly dead space without being told to look.
+func TestGatherOrientation_IncludesStorage(t *testing.T) {
+	database, err := db.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+
+	o := gatherOrientation(database)
+	if o.Storage.PageCount <= 0 {
+		t.Errorf("storage page count = %d, want > 0", o.Storage.PageCount)
+	}
+	if o.Storage.FileBytes <= 0 {
+		t.Errorf("storage file bytes = %d, want > 0", o.Storage.FileBytes)
+	}
+}
+
+func TestStorageJSON_ReportsPageAccountingAndVerdict(t *testing.T) {
+	// The real archive's numbers as measured: 4.6 GB holding 1.9 GB.
+	stats := db.StorageStats{
+		FileBytes:     4904400896,
+		PageSize:      4096,
+		PageCount:     1197217,
+		FreelistCount: 713257,
+	}
+
+	out := storageJSON(stats)
+
+	wantInt := map[string]int64{
+		"file_bytes":        4904400896,
+		"page_size":         4096,
+		"page_count":        1197217,
+		"freelist_count":    713257,
+		"live_bytes":        1982300160,
+		"reclaimable_bytes": 2921500672,
+	}
+	for key, want := range wantInt {
+		got, ok := out[key].(int64)
+		if !ok {
+			t.Errorf("%s = %#v, want an int64", key, out[key])
+			continue
+		}
+		if got != want {
+			t.Errorf("%s = %d, want %d", key, got, want)
+		}
+	}
+	if ratio, ok := out["freelist_ratio"].(float64); !ok || ratio < 0.59 || ratio > 0.60 {
+		t.Errorf("freelist_ratio = %#v, want ~0.596", out["freelist_ratio"])
+	}
+	if worth, ok := out["worth_reclaiming"].(bool); !ok || !worth {
+		t.Errorf("worth_reclaiming = %#v, want true", out["worth_reclaiming"])
+	}
+}
+
+func TestReclaimHint(t *testing.T) {
+	tests := []struct {
+		name     string
+		stats    db.StorageStats
+		wantHint bool
+	}{
+		{
+			name:     "a mostly dead archive names the command that fixes it",
+			stats:    db.StorageStats{FileBytes: 4904400896, PageSize: 4096, PageCount: 1197217, FreelistCount: 713257},
+			wantHint: true,
+		},
+		{
+			name:     "a healthy archive stays quiet",
+			stats:    db.StorageStats{FileBytes: 2000000000, PageSize: 4096, PageCount: 488281, FreelistCount: 100},
+			wantHint: false,
+		},
+		{
+			name:     "a tiny archive stays quiet even when mostly empty",
+			stats:    db.StorageStats{FileBytes: 409600, PageSize: 4096, PageCount: 100, FreelistCount: 90},
+			wantHint: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hint := reclaimHint(tt.stats)
+			if tt.wantHint == (hint == "") {
+				t.Fatalf("reclaimHint() = %q, wantHint = %v", hint, tt.wantHint)
+			}
+			if tt.wantHint && !strings.Contains(hint, "ccvault vacuum") {
+				t.Errorf("hint %q does not name 'ccvault vacuum'", hint)
+			}
+		})
+	}
+}
+
+func TestFormatBytes(t *testing.T) {
+	tests := []struct {
+		bytes int64
+		want  string
+	}{
+		{0, "0 B"},
+		{512, "512 B"},
+		{4096, "4.0 KB"},
+		{2921500672, "2.7 GB"},
+		{4904400896, "4.6 GB"},
+	}
+	for _, tt := range tests {
+		if got := formatBytes(tt.bytes); got != tt.want {
+			t.Errorf("formatBytes(%d) = %q, want %q", tt.bytes, got, tt.want)
+		}
 	}
 }

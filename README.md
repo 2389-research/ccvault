@@ -74,7 +74,8 @@ ccvault stats
 | `import [db-path]` | Merge another ccvault database into this archive |
 | `tui` | Launch interactive terminal UI |
 | `search [query]` | Full-text search across conversations |
-| `stats` | Show archive statistics |
+| `stats` | Show archive statistics, including reclaimable space |
+| `vacuum` | Reclaim dead space in the database file (see [Storage reclaim](#storage-reclaim)) |
 | `list-projects` | List all indexed projects |
 | `list-sessions` | List sessions (optionally filtered by project) |
 | `show [session-id]` | Display a specific session |
@@ -126,6 +127,47 @@ token counts an order of magnitude above the real figure. Nothing is deleted
 and no session, turn, or tool use is affected; only the two display counters
 on `projects` change, and they change to the truth. `first_seen_at` and
 `last_activity_at` are left alone.
+
+## Storage reclaim
+
+Incremental sync replaces the rows of every changed session file. SQLite keeps
+the pages it frees on an internal freelist instead of returning them to the
+filesystem, so the database file grows away from the data it holds. A
+long-running archive can end up majority dead space — one real archive measured
+4.6 GB on disk holding 1.9 GB of data.
+
+`ccvault stats` and `ccvault orient --json` report the condition:
+
+```
+Storage:
+  Database file: 4.6 GB
+  Reclaimable:   2.9 GB (60% of the file)
+  Reclaim it with 'ccvault vacuum'.
+```
+
+`sync` prints the same one-line note when the waste crosses 25% of the file and
+32 MB. Nothing is reclaimed automatically — compaction rewrites the whole file
+and needs the database to itself, which is no business of a sync run.
+
+`ccvault vacuum` reclaims it:
+
+```bash
+ccvault vacuum          # human-readable progress and before/after figures
+ccvault vacuum --json   # same numbers for machine consumption
+```
+
+It writes a compacted copy beside the live database with `VACUUM INTO`, checks
+the copy with `integrity_check` and a row count per table, and renames it over
+the original in one atomic step. The original is never modified, so any failure
+leaves it exactly as it was. Consequences worth knowing:
+
+- It needs free disk space for the compacted copy — roughly the size of the
+  live data, not of the whole file. It refuses up front if the space isn't
+  there, rather than failing partway through a multi-gigabyte write.
+- It takes the database exclusively. Close the TUI, MCP server, and any running
+  sync first; it refuses rather than compacting a file someone else is writing.
+- It rewrites the whole file. Expect tens of seconds on a multi-gigabyte
+  archive (4.6 GB compacted to 1.9 GB in about 21 seconds).
 
 ## Search Syntax
 
