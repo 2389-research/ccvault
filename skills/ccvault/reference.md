@@ -15,7 +15,7 @@
 
 Degraded-query warnings are uniform: each one reads `<what> unavailable: <why>` and arrives in a top-level `warnings[]` array. A warning means the field it names is **absent** from the response, not empty — so check presence rather than trusting a zero value.
 
-Pagination is uniform across `search_conversations`, `get_turns`, `list_sessions`, and `list_projects`: every response echoes `offset` and the `limit` actually applied (an over-max `limit` is clamped, so read it back rather than assuming), and a truncated response adds `has_more: true` plus `next_offset`. Page by re-calling with `offset: next_offset` — not by raising `limit`.
+Pagination is uniform across `search_conversations`, `get_turns`, `list_sessions`, and `list_projects`: a paginated response echoes `offset` and the `limit` actually applied (an over-max `limit` is clamped, so read it back rather than assuming), and a truncated one adds `has_more: true` plus `next_offset`. Page by re-calling with `offset: next_offset` — not by raising `limit`. One response is not paginated: when `list_sessions` receives a `project` filter matching several projects it returns `ambiguous_project_filter` with `matched_projects[]` and none of the pagination fields.
 
 ## 2. Search Query Syntax
 
