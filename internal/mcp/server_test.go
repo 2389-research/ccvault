@@ -273,7 +273,7 @@ func TestGetAnalytics_ReportsUnavailableAnalytics(t *testing.T) {
 	}
 }
 
-func TestGetAnalytics_PropagatesSummaryWarnings(t *testing.T) {
+func TestGetAnalytics_LiftsStatsWarningsToTopLevel(t *testing.T) {
 	s, database := newTestServer(t)
 
 	// Break only an enrichment query so getStats degrades (warns) instead of
@@ -289,16 +289,20 @@ func TestGetAnalytics_PropagatesSummaryWarnings(t *testing.T) {
 	}
 
 	m := result.(map[string]interface{})
+	warnings, ok := m["warnings"].([]string)
+	if !ok || len(warnings) == 0 {
+		t.Fatalf("result[warnings] should be a non-empty []string, got %#v", m["warnings"])
+	}
+	if !strings.Contains(warnings[0], "tool") {
+		t.Errorf("warning should mention tool stats, got %q", warnings[0])
+	}
+
 	summary, ok := m["summary"].(map[string]interface{})
 	if !ok {
 		t.Fatalf("result[summary] is not a map, got %#v", m["summary"])
 	}
-	warnings, ok := summary["warnings"].([]string)
-	if !ok || len(warnings) == 0 {
-		t.Fatalf("summary[warnings] should be a non-empty []string, got %#v", summary["warnings"])
-	}
-	if !strings.Contains(warnings[0], "tool") {
-		t.Errorf("warning should mention tool stats, got %q", warnings[0])
+	if _, present := summary["warnings"]; present {
+		t.Errorf("summary should not carry its own warnings, got %#v", summary["warnings"])
 	}
 }
 

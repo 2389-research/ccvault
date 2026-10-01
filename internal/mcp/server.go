@@ -1180,17 +1180,26 @@ func (s *Server) getAnalytics(args map[string]interface{}) (interface{}, error) 
 
 	result := make(map[string]interface{})
 
+	// Warnings live in exactly one place on this response: top-level
+	// `warnings`. Degraded stats queries and degraded DuckDB queries both
+	// land here, so an agent has a single list to check.
+	var warnings []string
+
 	// Get basic stats
 	stats, err := s.getStats(nil)
 	if err != nil {
 		return nil, err
 	}
+	if summary, ok := stats.(map[string]interface{}); ok {
+		if statsWarnings, ok := summary["warnings"].([]string); ok {
+			warnings = append(warnings, statsWarnings...)
+			delete(summary, "warnings")
+		}
+	}
 	result["summary"] = stats
 
 	// DuckDB analytics: report failures instead of silently omitting sections
 	if s.analyzer != nil {
-		var warnings []string
-
 		dailyTokens, err := s.analyzer.GetTokensByDay(days)
 		if err != nil {
 			warnings = append(warnings, fmt.Sprintf("tokens_by_day unavailable: %v", err))
@@ -1211,10 +1220,6 @@ func (s *Server) getAnalytics(args map[string]interface{}) (interface{}, error) 
 		} else {
 			result["model_breakdown"] = modelStats
 		}
-
-		if len(warnings) > 0 {
-			result["warnings"] = warnings
-		}
 	} else {
 		reason := "analytics cache not initialized"
 		if s.analyzerErr != nil {
@@ -1225,6 +1230,10 @@ func (s *Server) getAnalytics(args map[string]interface{}) (interface{}, error) 
 			"reason":    reason,
 			"hint":      "Run 'ccvault build-cache' to enable DuckDB analytics",
 		}
+	}
+
+	if len(warnings) > 0 {
+		result["warnings"] = warnings
 	}
 
 	return result, nil
