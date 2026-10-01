@@ -81,6 +81,43 @@ func bloatDB(t *testing.T, turns, keep int) string {
 	return dataDir
 }
 
+// switchToWAL puts the database into WAL mode, which is where it will be
+// once the ignored-DSN bug (#47) is fixed. journal_mode is persisted in the
+// file header, so this survives close and reopen.
+func switchToWAL(t *testing.T, dataDir string) {
+	t.Helper()
+
+	database, err := Open(dataDir)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+
+	var mode string
+	if err := database.QueryRow("PRAGMA journal_mode=WAL").Scan(&mode); err != nil {
+		t.Fatalf("set wal: %v", err)
+	}
+	if !strings.EqualFold(mode, "wal") {
+		t.Fatalf("journal_mode = %q after asking for WAL", mode)
+	}
+}
+
+func mustJournalMode(t *testing.T, dataDir string) string {
+	t.Helper()
+
+	pool, err := sql.Open("sqlite", "file:"+filepath.Join(dataDir, "ccvault.db")+"?mode=ro")
+	if err != nil {
+		t.Fatalf("open read-only: %v", err)
+	}
+	defer func() { _ = pool.Close() }()
+
+	var mode string
+	if err := pool.QueryRow("PRAGMA journal_mode").Scan(&mode); err != nil {
+		t.Fatalf("read journal_mode: %v", err)
+	}
+	return mode
+}
+
 func mustStorageStats(t *testing.T, dataDir string) StorageStats {
 	t.Helper()
 	database, err := Open(dataDir)
@@ -539,6 +576,266 @@ func TestCompact_ReportsProgressAndDuration(t *testing.T) {
 	}
 	if result.Duration > time.Minute {
 		t.Errorf("duration = %s, implausible for a test database", result.Duration)
+	}
+}
+
+// TestCheckpointIfWAL_RefusesWhenFramesStayInTheWAL is the guard on the one
+// step of compaction that can destroy data. Compact deletes the -wal right
+// after checkpointing, so a checkpoint that only partly folded the WAL into
+// the main file would take committed transactions with it. A reader holding
+// an older snapshot produces exactly that: SQLite reports busy with fewer
+// frames checkpointed than the WAL holds.
+func TestCheckpointIfWAL_RefusesWhenFramesStayInTheWAL(t *testing.T) {
+	dataDir := bloatDB(t, 60, 5)
+	switchToWAL(t, dataDir)
+	dbPath := filepath.Join(dataDir, "ccvault.db")
+	ctx := context.Background()
+
+	writer, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=busy_timeout(200)")
+	if err != nil {
+		t.Fatalf("open writer: %v", err)
+	}
+	defer func() { _ = writer.Close() }()
+	writer.SetMaxOpenConns(1)
+
+	addFrames := func(from, to int) {
+		t.Helper()
+		for i := from; i < to; i++ {
+			_, err := writer.ExecContext(ctx,
+				`INSERT INTO sync_state (key, value) VALUES (?, 'frame')`, fmt.Sprint(i))
+			if err != nil {
+				t.Fatalf("write frame %d: %v", i, err)
+			}
+		}
+	}
+	addFrames(0, 50)
+
+	// A reader pinned to this snapshot — what an open TUI or MCP server is.
+	reader, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=busy_timeout(200)")
+	if err != nil {
+		t.Fatalf("open reader: %v", err)
+	}
+	defer func() { _ = reader.Close() }()
+	rtx, err := reader.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("begin read tx: %v", err)
+	}
+	var seen int
+	if err := rtx.QueryRow(`SELECT COUNT(*) FROM sync_state`).Scan(&seen); err != nil {
+		t.Fatalf("read in tx: %v", err)
+	}
+
+	// Frames committed after the reader's snapshot cannot be backfilled
+	// while it holds on.
+	addFrames(100, 150)
+
+	err = checkpointIfWAL(ctx, writer)
+	if err == nil {
+		t.Fatal("checkpoint reported success while frames were still in the WAL")
+	}
+	if !errors.Is(err, ErrDatabaseBusy) {
+		t.Fatalf("checkpoint error = %v, want ErrDatabaseBusy", err)
+	}
+	// The numbers are the evidence; a bare "busy" would not show that frames
+	// were left behind.
+	for _, want := range []string{"log=", "checkpointed="} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not report %s", err, want)
+		}
+	}
+
+	if err := rtx.Rollback(); err != nil {
+		t.Fatalf("rollback reader: %v", err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatalf("close reader: %v", err)
+	}
+
+	// With the reader gone the WAL folds completely and the guard passes.
+	if err := checkpointIfWAL(ctx, writer); err != nil {
+		t.Errorf("checkpoint after reader released: %v", err)
+	}
+}
+
+// TestCheckpointIfWAL_NoOpOutsideWAL covers why the mode check has to come
+// first: outside WAL, SQLite answers the checkpoint pragma with (0, -1, -1),
+// which is not a real result to validate.
+func TestCheckpointIfWAL_NoOpOutsideWAL(t *testing.T) {
+	dataDir := bloatDB(t, 60, 5)
+	dbPath := filepath.Join(dataDir, "ccvault.db")
+
+	if mode := mustJournalMode(t, dataDir); strings.EqualFold(mode, "wal") {
+		t.Fatalf("fixture is in WAL mode (%q); this test needs a rollback-journal database", mode)
+	}
+
+	pool, err := sql.Open("sqlite", "file:"+dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer func() { _ = pool.Close() }()
+
+	if err := checkpointIfWAL(context.Background(), pool); err != nil {
+		t.Errorf("checkpoint on a rollback-journal database: %v", err)
+	}
+}
+
+// TestCompact_PreservesWALJournalMode: VACUUM INTO always writes a
+// rollback-journal database, so compacting a WAL archive would quietly
+// downgrade it — undoing the WAL fix every time someone reclaimed space.
+func TestCompact_PreservesWALJournalMode(t *testing.T) {
+	dataDir := bloatDB(t, 60, 5)
+	switchToWAL(t, dataDir)
+
+	result, err := Compact(dataDir)
+	if err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	if result.After.FreelistCount != 0 {
+		t.Errorf("freelist after = %d, want 0", result.After.FreelistCount)
+	}
+
+	if mode := mustJournalMode(t, dataDir); !strings.EqualFold(mode, "wal") {
+		t.Errorf("journal_mode after compaction = %q, want wal", mode)
+	}
+
+	// Data intact, and no sidecar left pointing at the file we replaced.
+	database, err := Open(dataDir)
+	if err != nil {
+		t.Fatalf("reopen after compaction: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+	var turnCount int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM turns`).Scan(&turnCount); err != nil {
+		t.Fatalf("count turns: %v", err)
+	}
+	if turnCount != 5 {
+		t.Errorf("turns after compaction = %d, want 5", turnCount)
+	}
+}
+
+// TestCompact_RefusesWhileAnotherReaderHoldsAWALDatabase is the WAL twin of
+// the rollback-journal refusal. With frames already in the WAL, the lock
+// attempt fails on its first read rather than on its write — and that has to
+// reach the user as "something else has the database", not as a raw SQLite
+// string from whichever statement happened to trip first.
+func TestCompact_RefusesWhileAnotherReaderHoldsAWALDatabase(t *testing.T) {
+	dataDir := bloatDB(t, 60, 5)
+	switchToWAL(t, dataDir)
+	dbPath := filepath.Join(dataDir, "ccvault.db")
+	ctx := context.Background()
+
+	// Put frames in the WAL, so the reader's snapshot depends on it.
+	writer, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=busy_timeout(200)")
+	if err != nil {
+		t.Fatalf("open writer: %v", err)
+	}
+	for i := 0; i < 50; i++ {
+		_, err := writer.ExecContext(ctx,
+			`INSERT INTO sync_state (key, value) VALUES (?, 'frame')`, fmt.Sprint(i))
+		if err != nil {
+			t.Fatalf("write frame %d: %v", i, err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+
+	reader, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=busy_timeout(200)")
+	if err != nil {
+		t.Fatalf("open reader: %v", err)
+	}
+	defer func() { _ = reader.Close() }()
+	tx, err := reader.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("begin read tx: %v", err)
+	}
+	var n int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM turns`).Scan(&n); err != nil {
+		t.Fatalf("read in tx: %v", err)
+	}
+
+	_, err = Compact(dataDir)
+	if !errors.Is(err, ErrDatabaseBusy) {
+		_ = tx.Rollback()
+		t.Fatalf("compact error = %v, want ErrDatabaseBusy", err)
+	}
+	if !strings.Contains(err.Error(), "ccvault") {
+		t.Errorf("error %q does not tell the user which processes to close", err)
+	}
+
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("rollback reader: %v", err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatalf("close reader: %v", err)
+	}
+	if _, err := Compact(dataDir); err != nil {
+		t.Fatalf("compact after reader released: %v", err)
+	}
+}
+
+// TestLockExclusive_ReportsBusyWhateverStatementTripsFirst pins down the
+// other half of the lock refusal. Taking the exclusive lock in WAL mode
+// needs exclusive access to the WAL index, so depending on what is in the
+// WAL the refusal can surface on the pragma read rather than on the write.
+// Both have to come back as ErrDatabaseBusy.
+func TestLockExclusive_ReportsBusyWhateverStatementTripsFirst(t *testing.T) {
+	dataDir := t.TempDir()
+	database, err := Open(dataDir)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	var mode string
+	if err := database.QueryRow("PRAGMA journal_mode=WAL").Scan(&mode); err != nil {
+		t.Fatalf("set wal: %v", err)
+	}
+	ctx := context.Background()
+	for i := 0; i < 50; i++ {
+		_, err := database.ExecContext(ctx,
+			`INSERT INTO sync_state (key, value) VALUES (?, 'frame')`, fmt.Sprint(i))
+		if err != nil {
+			t.Fatalf("write frame %d: %v", i, err)
+		}
+	}
+	if err := database.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	dbPath := filepath.Join(dataDir, "ccvault.db")
+	reader, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=busy_timeout(200)")
+	if err != nil {
+		t.Fatalf("open reader: %v", err)
+	}
+	defer func() { _ = reader.Close() }()
+	rtx, err := reader.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("begin read tx: %v", err)
+	}
+	defer func() { _ = rtx.Rollback() }()
+	var seen int
+	if err := rtx.QueryRow(`SELECT COUNT(*) FROM sync_state`).Scan(&seen); err != nil {
+		t.Fatalf("read in tx: %v", err)
+	}
+
+	pool, err := sql.Open("sqlite",
+		fmt.Sprintf("file:%s?_pragma=busy_timeout(%d)", dbPath, compactBusyTimeoutMS))
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer func() { _ = pool.Close() }()
+	pool.SetMaxOpenConns(1)
+	conn, err := pool.Conn(ctx)
+	if err != nil {
+		t.Fatalf("acquire conn: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	err = lockExclusive(ctx, conn)
+	if err == nil {
+		t.Fatal("took the exclusive lock while a reader held a WAL snapshot")
+	}
+	if !errors.Is(err, ErrDatabaseBusy) {
+		t.Fatalf("lockExclusive error = %v, want ErrDatabaseBusy", err)
 	}
 }
 

@@ -162,6 +162,12 @@ func withAfterCopy(fn func(tmpPath string) error) CompactOption {
 // The database is held under an exclusive lock for the whole run, so the
 // copy cannot drift from the file it replaces. Compaction refuses rather
 // than waiting indefinitely if another process is using the archive.
+//
+// The one step that could break the guarantee above is removing the -wal
+// before the rename, since a write-ahead log can hold committed
+// transactions that the main file does not. checkpointIfWAL therefore
+// verifies that SQLite folded every frame in before anything is deleted, and
+// the swap aborts if it did not.
 func Compact(dataDir string, opts ...CompactOption) (CompactResult, error) {
 	cfg := compactConfig{progress: func(string) {}}
 	for _, opt := range opts {
@@ -220,6 +226,13 @@ func Compact(dataDir string, opts ...CompactOption) (CompactResult, error) {
 	defer func() { _ = closeConn() }()
 
 	result.Before, err = storageStats(ctx, conn, dbPath)
+	if err != nil {
+		return result, err
+	}
+
+	// Captured before the copy, because the copy will not have it: VACUUM
+	// INTO always writes a rollback-journal database.
+	sourceJournalMode, err := journalMode(ctx, conn)
 	if err != nil {
 		return result, err
 	}
@@ -318,10 +331,20 @@ func Compact(dataDir string, opts ...CompactOption) (CompactResult, error) {
 	}
 	swapped = true
 
+	// Read back while the file is still rollback-journal, so a read-only
+	// handle needs no WAL index to open it.
 	result.After, err = readOnlyStorageStats(ctx, dbPath)
 	if err != nil {
 		return result, fmt.Errorf("read back compacted database: %w", err)
 	}
+
+	if strings.EqualFold(sourceJournalMode, "wal") {
+		cfg.progress("restoring WAL mode")
+		if err := restoreWALMode(ctx, dbPath); err != nil {
+			return result, err
+		}
+	}
+
 	result.Duration = time.Since(start)
 	return result, nil
 }
@@ -406,21 +429,31 @@ func checkCompactSpace(dataDir string, before StorageStats) error {
 // changing anything the archive cares about.
 func lockExclusive(ctx context.Context, conn *sql.Conn) error {
 	if _, err := conn.ExecContext(ctx, "PRAGMA locking_mode = EXCLUSIVE"); err != nil {
-		return fmt.Errorf("set exclusive locking mode: %w", err)
+		return lockRefusal("set exclusive locking mode", err)
 	}
 
 	var userVersion int64
 	if err := conn.QueryRowContext(ctx, "PRAGMA user_version").Scan(&userVersion); err != nil {
-		return fmt.Errorf("read user_version: %w", err)
+		return lockRefusal("read user_version", err)
 	}
 	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", userVersion)); err != nil {
-		if isBusyError(err) {
-			return fmt.Errorf("%w: close other ccvault processes (TUI, MCP server, sync) and try again: %w",
-				ErrDatabaseBusy, err)
-		}
-		return fmt.Errorf("take exclusive lock: %w", err)
+		return lockRefusal("take exclusive lock", err)
 	}
 	return nil
+}
+
+// lockRefusal turns a failure to claim the lock into the refusal the user
+// should see. Which statement trips depends on the journal mode and on what
+// is in the WAL — in WAL mode, exclusive locking needs exclusive access to
+// the WAL index, so a reader can make the first pragma read fail rather than
+// the write. Every route has to arrive as ErrDatabaseBusy, not as whichever
+// raw SQLite string happened to surface.
+func lockRefusal(what string, err error) error {
+	if isBusyError(err) {
+		return fmt.Errorf("%w: close other ccvault processes (TUI, MCP server, sync) and try again: %w",
+			ErrDatabaseBusy, err)
+	}
+	return fmt.Errorf("%s: %w", what, err)
 }
 
 func dataVersion(ctx context.Context, q sqlRunner) (int64, error) {
@@ -431,18 +464,65 @@ func dataVersion(ctx context.Context, q sqlRunner) (int64, error) {
 	return v, nil
 }
 
-// checkpointIfWAL folds WAL content into the main file. It is a no-op in
-// rollback-journal mode, where there is no WAL to fold.
-func checkpointIfWAL(ctx context.Context, q sqlRunner) error {
+func journalMode(ctx context.Context, q sqlRunner) (string, error) {
 	var mode string
 	if err := q.QueryRowContext(ctx, "PRAGMA journal_mode").Scan(&mode); err != nil {
-		return fmt.Errorf("pragma journal_mode: %w", err)
+		return "", fmt.Errorf("pragma journal_mode: %w", err)
+	}
+	return mode, nil
+}
+
+// checkpointIfWAL folds WAL content into the main file and refuses unless
+// every frame made it.
+//
+// This is the one step of compaction that can destroy data, so it checks its
+// work. Compact deletes the -wal immediately after this returns; a
+// checkpoint that only partly folded the log would take committed
+// transactions with it that exist nowhere else. The pragma reports
+// (busy, log frames, frames checkpointed) — with a reader pinned to an older
+// snapshot it answers something like (1, 200, 100) and leaves 100 frames
+// behind, which is indistinguishable from success if the row is discarded.
+//
+// A no-op outside WAL, where the pragma answers (0, -1, -1): not a result
+// worth validating, which is why the mode check comes first.
+func checkpointIfWAL(ctx context.Context, q sqlRunner) error {
+	mode, err := journalMode(ctx, q)
+	if err != nil {
+		return err
 	}
 	if !strings.EqualFold(mode, "wal") {
 		return nil
 	}
-	if _, err := q.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+
+	var busy, logFrames, checkpointed int64
+	err = q.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &logFrames, &checkpointed)
+	if err != nil {
 		return fmt.Errorf("checkpoint wal: %w", err)
+	}
+	if busy != 0 || logFrames != checkpointed {
+		return fmt.Errorf("%w: the write-ahead log was not fully folded into the database file, so removing it would lose committed transactions (busy=%d, log=%d, checkpointed=%d)",
+			ErrDatabaseBusy, busy, logFrames, checkpointed)
+	}
+	return nil
+}
+
+// restoreWALMode puts a compacted copy back into WAL mode. VACUUM INTO
+// always writes a rollback-journal database, so without this, reclaiming
+// space would quietly downgrade a WAL archive. journal_mode lives in the
+// file header, so it survives the close.
+func restoreWALMode(ctx context.Context, dbPath string) error {
+	pool, err := sql.Open("sqlite", "file:"+dbPath)
+	if err != nil {
+		return fmt.Errorf("reopen compacted database: %w", err)
+	}
+	defer func() { _ = pool.Close() }()
+
+	var mode string
+	if err := pool.QueryRowContext(ctx, "PRAGMA journal_mode=WAL").Scan(&mode); err != nil {
+		return fmt.Errorf("restore WAL mode after compaction (the compacted data is intact, but the database is now in rollback-journal mode): %w", err)
+	}
+	if !strings.EqualFold(mode, "wal") {
+		return fmt.Errorf("restore WAL mode after compaction: journal_mode is %q (the compacted data is intact)", mode)
 	}
 	return nil
 }

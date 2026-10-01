@@ -168,6 +168,10 @@ leaves it exactly as it was. Consequences worth knowing:
   sync first; it refuses rather than compacting a file someone else is writing.
 - It rewrites the whole file. Expect tens of seconds on a multi-gigabyte
   archive (4.6 GB compacted to 1.9 GB in about 21 seconds).
+- A WAL-mode archive stays in WAL mode. `VACUUM INTO` always writes a
+  rollback-journal database, so the mode is restored after the swap; and the
+  write-ahead log is only removed once SQLite confirms every frame of it was
+  folded into the main file.
 
 ## Search Syntax
 
