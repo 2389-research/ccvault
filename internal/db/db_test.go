@@ -4,6 +4,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -420,6 +421,48 @@ func TestTransaction(t *testing.T) {
 	got, _ := db.GetProject(p.ID)
 	if got == nil {
 		t.Error("project not created in transaction")
+	}
+}
+
+// TestWithTxContextCancelMidTransaction pins the behaviour that makes context
+// the right cancellation mechanism for sync (#24): cancelling while a
+// multi-statement write is in flight stops it where it stands and rolls the
+// whole thing back. A quit flag checked between units of work cannot
+// interrupt a transaction that is already running.
+func TestWithTxContextCancelMidTransaction(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var inserted int
+	err := db.WithTxContext(ctx, func(tx *sql.Tx) error {
+		for i := 0; i < 1000; i++ {
+			p := &models.Project{Path: fmt.Sprintf("/cancel/%d", i), DisplayName: "p"}
+			if err := db.UpsertProjectTx(tx, p); err != nil {
+				return err
+			}
+			inserted++
+			if inserted == 10 {
+				cancel()
+			}
+		}
+		return nil
+	})
+	if err == nil {
+		t.Fatal("expected an error after the transaction's context was cancelled")
+	}
+	if inserted >= 1000 {
+		t.Errorf("transaction ran to completion despite cancellation (%d inserts)", inserted)
+	}
+
+	var count int
+	if err := db.QueryRow("SELECT COUNT(*) FROM projects WHERE path LIKE '/cancel/%'").Scan(&count); err != nil {
+		t.Fatalf("count projects: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("cancelled transaction left %d rows behind; expected a full rollback", count)
 	}
 }
 
