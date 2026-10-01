@@ -658,30 +658,31 @@ func (s *Server) searchConversations(args map[string]interface{}) (interface{}, 
 	return response, nil
 }
 
-// lookupProjectPath resolves a session's project path. Failures come back
-// as warning strings so callers surface them instead of dropping them.
-func (s *Server) lookupProjectPath(projectID int64) (string, []string) {
-	path, _, warnings := s.lookupProjectPathAndName(projectID)
-	return path, warnings
+// lookupProjectPath resolves a session's project path. A failure comes
+// back as a single warning string — empty when the lookup succeeded — so
+// callers surface it instead of dropping it.
+func (s *Server) lookupProjectPath(projectID int64) (path, warning string) {
+	path, _, warning = s.lookupProjectPathAndName(projectID)
+	return path, warning
 }
 
 // lookupProjectPathAndName resolves a project ID to its path AND its
 // adapter-provided label (via projectref.Label). Class C emitters use
 // this so responses carry the {name, path} doctrine shape even when the
 // caller only has a project ID (not a full session with ProjectPath).
-func (s *Server) lookupProjectPathAndName(projectID int64) (path, name string, warnings []string) {
+func (s *Server) lookupProjectPathAndName(projectID int64) (path, name, warning string) {
 	if projectID <= 0 {
-		return "", "", nil
+		return "", "", ""
 	}
 
 	project, err := s.db.GetProject(projectID)
 	switch {
 	case err != nil:
-		return "", "", []string{fmt.Sprintf("project lookup failed for project %d: %v", projectID, err)}
+		return "", "", fmt.Sprintf("project %d unavailable: %v", projectID, err)
 	case project == nil:
-		return "", "", []string{fmt.Sprintf("project %d not found — session references a missing project", projectID)}
+		return "", "", fmt.Sprintf("project %d unavailable: not found, the session references a missing project", projectID)
 	default:
-		return project.Path, projectref.Label(project), nil
+		return project.Path, projectref.Label(project), ""
 	}
 }
 
@@ -706,7 +707,7 @@ func (s *Server) getSessionSummary(args map[string]interface{}) (interface{}, er
 
 	// Get project info — pull both path AND name so the response carries
 	// the Class C {name, path} doctrine shape.
-	projectPath, projectName, warnings := s.lookupProjectPathAndName(session.ProjectID)
+	projectPath, projectName, projectWarning := s.lookupProjectPathAndName(session.ProjectID)
 
 	// Count turn types and extract tool usage
 	turnTypeCounts := make(map[string]int)
@@ -815,8 +816,8 @@ func (s *Server) getSessionSummary(args map[string]interface{}) (interface{}, er
 		"last_user_msg":  lastUserMsg,
 		"hint":           "Use get_turns to paginate through the conversation",
 	}
-	if len(warnings) > 0 {
-		result["warnings"] = warnings
+	if projectWarning != "" {
+		result["warnings"] = []string{projectWarning}
 	}
 	return result, nil
 }
@@ -958,7 +959,7 @@ func (s *Server) getSession(args map[string]interface{}) (interface{}, error) {
 	}
 
 	// Get project info
-	projectPath, warnings := s.lookupProjectPath(session.ProjectID)
+	projectPath, projectWarning := s.lookupProjectPath(session.ProjectID)
 
 	// For large sessions, recommend using get_session_summary + get_turns
 	if len(turns) > 100 {
@@ -968,8 +969,8 @@ func (s *Server) getSession(args map[string]interface{}) (interface{}, error) {
 			"turn_count": len(turns),
 			"hint":       "Call get_session_summary first, then use get_turns with offset/limit to paginate",
 		}
-		if len(warnings) > 0 {
-			result["warnings"] = warnings
+		if projectWarning != "" {
+			result["warnings"] = []string{projectWarning}
 		}
 		return result, nil
 	}
@@ -994,8 +995,8 @@ func (s *Server) getSession(args map[string]interface{}) (interface{}, error) {
 		"turn_count": len(turns),
 		"markdown":   content,
 	}
-	if len(warnings) > 0 {
-		result["warnings"] = warnings
+	if projectWarning != "" {
+		result["warnings"] = []string{projectWarning}
 	}
 	return result, nil
 }
@@ -1166,18 +1167,22 @@ func (s *Server) getStats(args map[string]interface{}) (interface{}, error) {
 		warnings = append(warnings, fmt.Sprintf("activity range unavailable: %v", err))
 	}
 
-	toolStats, err := s.db.GetToolUsageStats(10)
-	if err != nil {
-		warnings = append(warnings, fmt.Sprintf("tool stats unavailable: %v", err))
-	}
-
 	result := map[string]interface{}{
 		"projects":     projectCount,
 		"sessions":     sessionCount,
 		"turns":        turnCount,
 		"total_tokens": totalTokens,
 		"models":       tokensByModel,
-		"top_tools":    toolStats,
+	}
+
+	// Enrichment fields are omitted rather than emitted empty when their
+	// query fails — an agent checking presence must not read a nil
+	// top_tools as "this archive used no tools".
+	toolStats, err := s.db.GetToolUsageStats(10)
+	if err != nil {
+		warnings = append(warnings, fmt.Sprintf("tool stats unavailable: %v", err))
+	} else {
+		result["top_tools"] = toolStats
 	}
 
 	if !firstActivity.IsZero() {

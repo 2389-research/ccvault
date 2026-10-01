@@ -13,6 +13,8 @@
 | `get_stats` | — | — | Archive-wide counts: projects, sessions, turns, total tokens, model breakdown, top tools, date range | Fast overview of the entire archive. `first_activity`, `last_activity`, `days_span`, and `top_tools` are enrichment fields: if their queries fail the fields are omitted and a `warnings` entry is added instead |
 | `get_analytics` | — | `days` (number, default 30) | Daily token breakdown, top projects, model breakdown | Requires DuckDB analytics cache; when the cache is missing, returns `analytics.available: false` with a build-cache hint. Warnings from any degraded query — stats or analytics — appear at `result.warnings`; the embedded `summary` never carries its own `warnings` |
 
+Degraded-query warnings are uniform: each one reads `<what> unavailable: <why>` and arrives in a top-level `warnings[]` array. A warning means the field it names is **absent** from the response, not empty — so check presence rather than trusting a zero value.
+
 Pagination is uniform across `search_conversations`, `get_turns`, `list_sessions`, and `list_projects`: every response echoes `offset` and the `limit` actually applied (an over-max `limit` is clamped, so read it back rather than assuming), and a truncated response adds `has_more: true` plus `next_offset`. Page by re-calling with `offset: next_offset` — not by raising `limit`.
 
 ## 2. Search Query Syntax

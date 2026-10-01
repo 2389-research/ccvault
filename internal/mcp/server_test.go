@@ -339,8 +339,10 @@ func TestGetSessionSummary_WarnsWhenProjectMissing(t *testing.T) {
 	if !ok || len(warnings) == 0 {
 		t.Fatalf("expected warnings about missing project, got %#v", m["warnings"])
 	}
-	if !strings.Contains(warnings[0], "9999") {
-		t.Errorf("warning should name the missing project id, got %q", warnings[0])
+	// Every MCP warning reads "<what> unavailable: <why>" so an agent can
+	// scan the list without learning per-tool phrasing.
+	if !strings.Contains(warnings[0], "project 9999 unavailable:") {
+		t.Errorf("warning should read 'project 9999 unavailable: ...', got %q", warnings[0])
 	}
 }
 
@@ -434,6 +436,73 @@ func TestGetAnalytics_LiftsStatsWarningsToTopLevel(t *testing.T) {
 	}
 	if _, present := summary["warnings"]; present {
 		t.Errorf("summary should not carry its own warnings, got %#v", summary["warnings"])
+	}
+}
+
+func TestGetStats_DegradedFieldsWarn(t *testing.T) {
+	s, database := newTestServer(t)
+	p := seedProject(t, database, "/test/proj")
+	seedSession(t, database, "session-1", p.ID)
+
+	// Dropping tool_uses breaks GetToolUsageStats only — the core
+	// project/session/token queries still answer.
+	if _, err := database.Exec("DROP TABLE tool_uses"); err != nil {
+		t.Fatalf("drop tool_uses: %v", err)
+	}
+
+	result, err := s.getStats(nil)
+	if err != nil {
+		t.Fatalf("getStats: %v", err)
+	}
+
+	m := result.(map[string]interface{})
+	warnings, ok := m["warnings"].([]string)
+	if !ok || len(warnings) != 1 {
+		t.Fatalf("expected exactly one warning, got %#v", m["warnings"])
+	}
+	if !strings.Contains(warnings[0], "tool stats unavailable:") {
+		t.Errorf("warning should read 'tool stats unavailable: ...', got %q", warnings[0])
+	}
+	// The field is omitted, not emitted as null — an agent checking
+	// presence must not see an empty top_tools and read it as "no tools".
+	if _, present := m["top_tools"]; present {
+		t.Errorf("top_tools should be absent when its query failed, got %#v", m["top_tools"])
+	}
+	// Core fields survive the degradation.
+	if m["sessions"].(int) != 1 {
+		t.Errorf("sessions = %v, want 1", m["sessions"])
+	}
+}
+
+func TestGetStats_OmitsActivityRangeWhenUnavailable(t *testing.T) {
+	s, database := newTestServer(t)
+	p := seedProject(t, database, "/test/proj")
+	seedSession(t, database, "session-1", p.ID)
+
+	// GetFirstAndLastActivity reads projects.first_seen_at; GetProjectStats
+	// reads only COUNT(*)/total_tokens from the same table. Dropping the
+	// column degrades the activity range while the rest still answers.
+	if _, err := database.Exec("ALTER TABLE projects DROP COLUMN first_seen_at"); err != nil {
+		t.Fatalf("drop projects.first_seen_at: %v", err)
+	}
+
+	result, err := s.getStats(nil)
+	if err != nil {
+		t.Fatalf("getStats: %v", err)
+	}
+
+	m := result.(map[string]interface{})
+	warnings, ok := m["warnings"].([]string)
+	if !ok || len(warnings) == 0 {
+		t.Fatalf("expected a warning about the activity range, got %#v", m["warnings"])
+	}
+	if !strings.Contains(warnings[0], "activity range unavailable:") {
+		t.Errorf("warning should read 'activity range unavailable: ...', got %q", warnings[0])
+	}
+	for _, field := range []string{"first_activity", "last_activity", "days_span"} {
+		if _, present := m[field]; present {
+			t.Errorf("%s should be absent when the activity range failed, got %#v", field, m[field])
+		}
 	}
 }
 
