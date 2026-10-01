@@ -162,6 +162,127 @@ func TestListSessions_ReportsHasMore(t *testing.T) {
 	}
 }
 
+func TestListSessions_PaginatesWithOffset(t *testing.T) {
+	s, database := newTestServer(t)
+	p := seedProject(t, database, "/test/proj")
+	for i := 1; i <= 3; i++ {
+		seedSession(t, database, fmt.Sprintf("session-%d", i), p.ID)
+	}
+
+	first, err := s.listSessions(map[string]interface{}{"limit": float64(2)})
+	if err != nil {
+		t.Fatalf("listSessions page 1: %v", err)
+	}
+	m1 := first.(map[string]interface{})
+	if m1["offset"] != 0 || m1["limit"] != 2 {
+		t.Errorf("page 1: offset/limit = %v/%v, want 0/2", m1["offset"], m1["limit"])
+	}
+	// Fatal, not just an error: page 2 is fetched with this value, so
+	// continuing past a missing next_offset would panic on the type
+	// assertion below instead of reporting what went wrong.
+	if m1["next_offset"] != 2 {
+		t.Fatalf("page 1: next_offset = %v, want 2", m1["next_offset"])
+	}
+	if hint, _ := m1["hint"].(string); !strings.Contains(hint, "offset") {
+		t.Errorf("page 1 hint should point at offset paging, got %q", hint)
+	}
+
+	second, err := s.listSessions(map[string]interface{}{
+		"limit":  float64(2),
+		"offset": float64(m1["next_offset"].(int)),
+	})
+	if err != nil {
+		t.Fatalf("listSessions page 2: %v", err)
+	}
+	m2 := second.(map[string]interface{})
+	if m2["count"].(int) != 1 {
+		t.Errorf("page 2: count = %v, want 1", m2["count"])
+	}
+	if m2["offset"] != 2 {
+		t.Errorf("page 2: offset = %v, want 2", m2["offset"])
+	}
+	if _, present := m2["has_more"]; present {
+		t.Error("page 2 exhausts the set; has_more should be absent")
+	}
+
+	// The two pages must tile the set with no gaps or repeats.
+	seen := map[string]bool{}
+	for _, page := range []map[string]interface{}{m1, m2} {
+		for _, ref := range page["sessions"].([]map[string]any) {
+			id := ref["id"].(string)
+			if seen[id] {
+				t.Errorf("session %s appeared on two pages", id)
+			}
+			seen[id] = true
+		}
+	}
+	if len(seen) != 3 {
+		t.Errorf("paging covered %d sessions, want 3", len(seen))
+	}
+
+	// Past the end: an empty page, not an error and not a wrap-around.
+	past, err := s.listSessions(map[string]interface{}{"offset": float64(99)})
+	if err != nil {
+		t.Fatalf("listSessions past end: %v", err)
+	}
+	if mPast := past.(map[string]interface{}); mPast["count"].(int) != 0 {
+		t.Errorf("offset past end: count = %v, want 0", mPast["count"])
+	}
+}
+
+func TestListProjects_PaginatesWithOffset(t *testing.T) {
+	s, database := newTestServer(t)
+	for _, path := range []string{"/test/proj-a", "/test/proj-b", "/test/proj-c"} {
+		seedProject(t, database, path)
+	}
+
+	first, err := s.listProjects(map[string]interface{}{"limit": float64(2)})
+	if err != nil {
+		t.Fatalf("listProjects page 1: %v", err)
+	}
+	m1 := first.(map[string]interface{})
+	if m1["offset"] != 0 || m1["limit"] != 2 {
+		t.Errorf("page 1: offset/limit = %v/%v, want 0/2", m1["offset"], m1["limit"])
+	}
+	// Fatal for the same reason as in TestListSessions_PaginatesWithOffset:
+	// the value is used to fetch page 2.
+	if m1["next_offset"] != 2 {
+		t.Fatalf("page 1: next_offset = %v, want 2", m1["next_offset"])
+	}
+	if hint, _ := m1["hint"].(string); !strings.Contains(hint, "offset") {
+		t.Errorf("page 1 hint should point at offset paging, got %q", hint)
+	}
+
+	second, err := s.listProjects(map[string]interface{}{
+		"limit":  float64(2),
+		"offset": float64(m1["next_offset"].(int)),
+	})
+	if err != nil {
+		t.Fatalf("listProjects page 2: %v", err)
+	}
+	m2 := second.(map[string]interface{})
+	if m2["count"].(int) != 1 {
+		t.Errorf("page 2: count = %v, want 1", m2["count"])
+	}
+	if _, present := m2["has_more"]; present {
+		t.Error("page 2 exhausts the set; has_more should be absent")
+	}
+
+	seen := map[string]bool{}
+	for _, page := range []map[string]interface{}{m1, m2} {
+		for _, ref := range page["projects"].([]map[string]any) {
+			path := ref["path"].(string)
+			if seen[path] {
+				t.Errorf("project %s appeared on two pages", path)
+			}
+			seen[path] = true
+		}
+	}
+	if len(seen) != 3 {
+		t.Errorf("paging covered %d projects, want 3", len(seen))
+	}
+}
+
 func TestListProjects_ReportsHasMoreAndClampsLimit(t *testing.T) {
 	s, database := newTestServer(t)
 	seedProject(t, database, "/test/proj-a")
@@ -188,8 +309,23 @@ func TestListProjects_ReportsHasMoreAndClampsLimit(t *testing.T) {
 	if mZero["count"].(int) != 2 {
 		t.Errorf("limit 0: count = %v, want 2 (default limit applied)", mZero["count"])
 	}
+	if mZero["limit"] != 50 {
+		t.Errorf("limit 0: limit = %v, want 50 (default)", mZero["limit"])
+	}
 	if _, present := mZero["has_more"]; present {
 		t.Error("limit 0: has_more should be absent when everything fit")
+	}
+
+	// An oversized limit is clamped to the page maximum. The response
+	// echoes the limit actually applied so the agent can compute offsets
+	// from it instead of from what it asked for.
+	big, err := s.listProjects(map[string]interface{}{"limit": float64(200)})
+	if err != nil {
+		t.Fatalf("listProjects limit 200: %v", err)
+	}
+	mBig := big.(map[string]interface{})
+	if mBig["limit"] != 100 {
+		t.Errorf("limit 200: limit = %v, want 100 (clamped)", mBig["limit"])
 	}
 }
 
@@ -208,8 +344,10 @@ func TestGetSessionSummary_WarnsWhenProjectMissing(t *testing.T) {
 	if !ok || len(warnings) == 0 {
 		t.Fatalf("expected warnings about missing project, got %#v", m["warnings"])
 	}
-	if !strings.Contains(warnings[0], "9999") {
-		t.Errorf("warning should name the missing project id, got %q", warnings[0])
+	// Every MCP warning reads "<what> unavailable: <why>" so an agent can
+	// scan the list without learning per-tool phrasing.
+	if !strings.Contains(warnings[0], "project 9999 unavailable:") {
+		t.Errorf("warning should read 'project 9999 unavailable: ...', got %q", warnings[0])
 	}
 }
 
@@ -273,7 +411,7 @@ func TestGetAnalytics_ReportsUnavailableAnalytics(t *testing.T) {
 	}
 }
 
-func TestGetAnalytics_PropagatesSummaryWarnings(t *testing.T) {
+func TestGetAnalytics_LiftsStatsWarningsToTopLevel(t *testing.T) {
 	s, database := newTestServer(t)
 
 	// Break only an enrichment query so getStats degrades (warns) instead of
@@ -289,16 +427,87 @@ func TestGetAnalytics_PropagatesSummaryWarnings(t *testing.T) {
 	}
 
 	m := result.(map[string]interface{})
+	warnings, ok := m["warnings"].([]string)
+	if !ok || len(warnings) == 0 {
+		t.Fatalf("result[warnings] should be a non-empty []string, got %#v", m["warnings"])
+	}
+	if !strings.Contains(warnings[0], "tool") {
+		t.Errorf("warning should mention tool stats, got %q", warnings[0])
+	}
+
 	summary, ok := m["summary"].(map[string]interface{})
 	if !ok {
 		t.Fatalf("result[summary] is not a map, got %#v", m["summary"])
 	}
-	warnings, ok := summary["warnings"].([]string)
-	if !ok || len(warnings) == 0 {
-		t.Fatalf("summary[warnings] should be a non-empty []string, got %#v", summary["warnings"])
+	if _, present := summary["warnings"]; present {
+		t.Errorf("summary should not carry its own warnings, got %#v", summary["warnings"])
 	}
-	if !strings.Contains(warnings[0], "tool") {
-		t.Errorf("warning should mention tool stats, got %q", warnings[0])
+}
+
+func TestGetStats_DegradedFieldsWarn(t *testing.T) {
+	s, database := newTestServer(t)
+	p := seedProject(t, database, "/test/proj")
+	seedSession(t, database, "session-1", p.ID)
+
+	// Dropping tool_uses breaks GetToolUsageStats only — the core
+	// project/session/token queries still answer.
+	if _, err := database.Exec("DROP TABLE tool_uses"); err != nil {
+		t.Fatalf("drop tool_uses: %v", err)
+	}
+
+	result, err := s.getStats(nil)
+	if err != nil {
+		t.Fatalf("getStats: %v", err)
+	}
+
+	m := result.(map[string]interface{})
+	warnings, ok := m["warnings"].([]string)
+	if !ok || len(warnings) != 1 {
+		t.Fatalf("expected exactly one warning, got %#v", m["warnings"])
+	}
+	if !strings.Contains(warnings[0], "tool stats unavailable:") {
+		t.Errorf("warning should read 'tool stats unavailable: ...', got %q", warnings[0])
+	}
+	// The field is omitted, not emitted as null — an agent checking
+	// presence must not see an empty top_tools and read it as "no tools".
+	if _, present := m["top_tools"]; present {
+		t.Errorf("top_tools should be absent when its query failed, got %#v", m["top_tools"])
+	}
+	// Core fields survive the degradation.
+	if m["sessions"].(int) != 1 {
+		t.Errorf("sessions = %v, want 1", m["sessions"])
+	}
+}
+
+func TestGetStats_OmitsActivityRangeWhenUnavailable(t *testing.T) {
+	s, database := newTestServer(t)
+	p := seedProject(t, database, "/test/proj")
+	seedSession(t, database, "session-1", p.ID)
+
+	// GetFirstAndLastActivity reads projects.first_seen_at; GetProjectStats
+	// reads only COUNT(*)/total_tokens from the same table. Dropping the
+	// column degrades the activity range while the rest still answers.
+	if _, err := database.Exec("ALTER TABLE projects DROP COLUMN first_seen_at"); err != nil {
+		t.Fatalf("drop projects.first_seen_at: %v", err)
+	}
+
+	result, err := s.getStats(nil)
+	if err != nil {
+		t.Fatalf("getStats: %v", err)
+	}
+
+	m := result.(map[string]interface{})
+	warnings, ok := m["warnings"].([]string)
+	if !ok || len(warnings) == 0 {
+		t.Fatalf("expected a warning about the activity range, got %#v", m["warnings"])
+	}
+	if !strings.Contains(warnings[0], "activity range unavailable:") {
+		t.Errorf("warning should read 'activity range unavailable: ...', got %q", warnings[0])
+	}
+	for _, field := range []string{"first_activity", "last_activity", "days_span"} {
+		if _, present := m[field]; present {
+			t.Errorf("%s should be absent when the activity range failed, got %#v", field, m[field])
+		}
 	}
 }
 

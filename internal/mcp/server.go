@@ -347,7 +347,7 @@ func (s *Server) handleToolsList(req *jsonRPCRequest) {
 		},
 		{
 			Name:        "list_sessions",
-			Description: "List recent sessions, optionally filtered by project.",
+			Description: "List recent sessions, optionally filtered by project. Use offset for pagination.",
 			InputSchema: inputSchema{
 				Type: "object",
 				Properties: map[string]property{
@@ -357,14 +357,18 @@ func (s *Server) handleToolsList(req *jsonRPCRequest) {
 					},
 					"limit": {
 						Type:        "number",
-						Description: "Maximum sessions to return (default 20, max 100)",
+						Description: "Sessions per page (default 20, max 100)",
+					},
+					"offset": {
+						Type:        "number",
+						Description: "Skip first N sessions for pagination. Use next_offset from response.",
 					},
 				},
 			},
 		},
 		{
 			Name:        "list_projects",
-			Description: "List all indexed projects with session counts and token usage.",
+			Description: "List all indexed projects with session counts and token usage. Use offset for pagination.",
 			InputSchema: inputSchema{
 				Type: "object",
 				Properties: map[string]property{
@@ -375,7 +379,11 @@ func (s *Server) handleToolsList(req *jsonRPCRequest) {
 					},
 					"limit": {
 						Type:        "number",
-						Description: "Maximum projects to return (default 50, max 100)",
+						Description: "Projects per page (default 50, max 100)",
+					},
+					"offset": {
+						Type:        "number",
+						Description: "Skip first N projects for pagination. Use next_offset from response.",
 					},
 				},
 			},
@@ -650,30 +658,31 @@ func (s *Server) searchConversations(args map[string]interface{}) (interface{}, 
 	return response, nil
 }
 
-// lookupProjectPath resolves a session's project path. Failures come back
-// as warning strings so callers surface them instead of dropping them.
-func (s *Server) lookupProjectPath(projectID int64) (string, []string) {
-	path, _, warnings := s.lookupProjectPathAndName(projectID)
-	return path, warnings
+// lookupProjectPath resolves a session's project path. A failure comes
+// back as a single warning string — empty when the lookup succeeded — so
+// callers surface it instead of dropping it.
+func (s *Server) lookupProjectPath(projectID int64) (path, warning string) {
+	path, _, warning = s.lookupProjectPathAndName(projectID)
+	return path, warning
 }
 
 // lookupProjectPathAndName resolves a project ID to its path AND its
 // adapter-provided label (via projectref.Label). Class C emitters use
 // this so responses carry the {name, path} doctrine shape even when the
 // caller only has a project ID (not a full session with ProjectPath).
-func (s *Server) lookupProjectPathAndName(projectID int64) (path, name string, warnings []string) {
+func (s *Server) lookupProjectPathAndName(projectID int64) (path, name, warning string) {
 	if projectID <= 0 {
-		return "", "", nil
+		return "", "", ""
 	}
 
 	project, err := s.db.GetProject(projectID)
 	switch {
 	case err != nil:
-		return "", "", []string{fmt.Sprintf("project lookup failed for project %d: %v", projectID, err)}
+		return "", "", fmt.Sprintf("project %d unavailable: %v", projectID, err)
 	case project == nil:
-		return "", "", []string{fmt.Sprintf("project %d not found — session references a missing project", projectID)}
+		return "", "", fmt.Sprintf("project %d unavailable: not found, the session references a missing project", projectID)
 	default:
-		return project.Path, projectref.Label(project), nil
+		return project.Path, projectref.Label(project), ""
 	}
 }
 
@@ -698,7 +707,7 @@ func (s *Server) getSessionSummary(args map[string]interface{}) (interface{}, er
 
 	// Get project info — pull both path AND name so the response carries
 	// the Class C {name, path} doctrine shape.
-	projectPath, projectName, warnings := s.lookupProjectPathAndName(session.ProjectID)
+	projectPath, projectName, projectWarning := s.lookupProjectPathAndName(session.ProjectID)
 
 	// Count turn types and extract tool usage
 	turnTypeCounts := make(map[string]int)
@@ -807,8 +816,8 @@ func (s *Server) getSessionSummary(args map[string]interface{}) (interface{}, er
 		"last_user_msg":  lastUserMsg,
 		"hint":           "Use get_turns to paginate through the conversation",
 	}
-	if len(warnings) > 0 {
-		result["warnings"] = warnings
+	if projectWarning != "" {
+		result["warnings"] = []string{projectWarning}
 	}
 	return result, nil
 }
@@ -950,7 +959,7 @@ func (s *Server) getSession(args map[string]interface{}) (interface{}, error) {
 	}
 
 	// Get project info
-	projectPath, warnings := s.lookupProjectPath(session.ProjectID)
+	projectPath, projectWarning := s.lookupProjectPath(session.ProjectID)
 
 	// For large sessions, recommend using get_session_summary + get_turns
 	if len(turns) > 100 {
@@ -960,8 +969,8 @@ func (s *Server) getSession(args map[string]interface{}) (interface{}, error) {
 			"turn_count": len(turns),
 			"hint":       "Call get_session_summary first, then use get_turns with offset/limit to paginate",
 		}
-		if len(warnings) > 0 {
-			result["warnings"] = warnings
+		if projectWarning != "" {
+			result["warnings"] = []string{projectWarning}
 		}
 		return result, nil
 	}
@@ -986,8 +995,8 @@ func (s *Server) getSession(args map[string]interface{}) (interface{}, error) {
 		"turn_count": len(turns),
 		"markdown":   content,
 	}
-	if len(warnings) > 0 {
-		result["warnings"] = warnings
+	if projectWarning != "" {
+		result["warnings"] = []string{projectWarning}
 	}
 	return result, nil
 }
@@ -1002,6 +1011,11 @@ func (s *Server) listSessions(args map[string]interface{}) (interface{}, error) 
 	}
 	if limit <= 0 {
 		limit = 20
+	}
+
+	offset := 0
+	if o, ok := args["offset"].(float64); ok && o > 0 {
+		offset = int(o)
 	}
 
 	var projectID int64
@@ -1041,7 +1055,7 @@ func (s *Server) listSessions(args map[string]interface{}) (interface{}, error) 
 	}
 
 	// Fetch one extra row to detect whether more sessions exist
-	sessions, err := s.db.GetSessions(projectID, limit+1)
+	sessions, err := s.db.GetSessionsPage(projectID, limit+1, offset)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get sessions: %w", err)
 	}
@@ -1062,16 +1076,19 @@ func (s *Server) listSessions(args map[string]interface{}) (interface{}, error) 
 
 	response := map[string]interface{}{
 		"count":    len(sessions),
+		"offset":   offset,
+		"limit":    limit,
 		"sessions": projectref.SessionRefsFromValues(sessions, projectsByID),
 	}
 	if enrichErr != nil {
 		response["warnings"] = []string{
-			fmt.Sprintf("project enrichment lookup failed: %v — session project_name values fell back to basename", enrichErr),
+			fmt.Sprintf("project enrichment unavailable: %v (session project_name values fell back to basename)", enrichErr),
 		}
 	}
 	if hasMore {
 		response["has_more"] = true
-		response["hint"] = "More sessions exist. Raise limit (max 100) or narrow with the project filter."
+		response["next_offset"] = offset + limit
+		response["hint"] = fmt.Sprintf("More sessions exist. Fetch next page with offset=%d, or narrow with the project filter.", offset+limit)
 	}
 
 	return response, nil
@@ -1094,8 +1111,13 @@ func (s *Server) listProjects(args map[string]interface{}) (interface{}, error) 
 		limit = 50
 	}
 
+	offset := 0
+	if o, ok := args["offset"].(float64); ok && o > 0 {
+		offset = int(o)
+	}
+
 	// Fetch one extra row to detect whether more projects exist
-	projects, err := s.db.GetProjects(sortBy, limit+1)
+	projects, err := s.db.GetProjectsPage(sortBy, limit+1, offset)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get projects: %w", err)
 	}
@@ -1109,11 +1131,14 @@ func (s *Server) listProjects(args map[string]interface{}) (interface{}, error) 
 	// shape, plus the operational fields agents need.
 	response := map[string]interface{}{
 		"count":    len(projects),
+		"offset":   offset,
+		"limit":    limit,
 		"projects": projectref.EnrichedRefsFromValues(projects),
 	}
 	if hasMore {
 		response["has_more"] = true
-		response["hint"] = "More projects exist. Raise limit (max 100) or use sort to surface the relevant ones."
+		response["next_offset"] = offset + limit
+		response["hint"] = fmt.Sprintf("More projects exist. Fetch next page with offset=%d, or use sort to surface the relevant ones.", offset+limit)
 	}
 
 	return response, nil
@@ -1142,18 +1167,22 @@ func (s *Server) getStats(args map[string]interface{}) (interface{}, error) {
 		warnings = append(warnings, fmt.Sprintf("activity range unavailable: %v", err))
 	}
 
-	toolStats, err := s.db.GetToolUsageStats(10)
-	if err != nil {
-		warnings = append(warnings, fmt.Sprintf("tool stats unavailable: %v", err))
-	}
-
 	result := map[string]interface{}{
 		"projects":     projectCount,
 		"sessions":     sessionCount,
 		"turns":        turnCount,
 		"total_tokens": totalTokens,
 		"models":       tokensByModel,
-		"top_tools":    toolStats,
+	}
+
+	// Enrichment fields are omitted rather than emitted empty when their
+	// query fails — an agent checking presence must not read a nil
+	// top_tools as "this archive used no tools".
+	toolStats, err := s.db.GetToolUsageStats(10)
+	if err != nil {
+		warnings = append(warnings, fmt.Sprintf("tool stats unavailable: %v", err))
+	} else {
+		result["top_tools"] = toolStats
 	}
 
 	if !firstActivity.IsZero() {
@@ -1180,17 +1209,26 @@ func (s *Server) getAnalytics(args map[string]interface{}) (interface{}, error) 
 
 	result := make(map[string]interface{})
 
+	// Warnings live in exactly one place on this response: top-level
+	// `warnings`. Degraded stats queries and degraded DuckDB queries both
+	// land here, so an agent has a single list to check.
+	var warnings []string
+
 	// Get basic stats
 	stats, err := s.getStats(nil)
 	if err != nil {
 		return nil, err
 	}
+	if summary, ok := stats.(map[string]interface{}); ok {
+		if statsWarnings, ok := summary["warnings"].([]string); ok {
+			warnings = append(warnings, statsWarnings...)
+			delete(summary, "warnings")
+		}
+	}
 	result["summary"] = stats
 
 	// DuckDB analytics: report failures instead of silently omitting sections
 	if s.analyzer != nil {
-		var warnings []string
-
 		dailyTokens, err := s.analyzer.GetTokensByDay(days)
 		if err != nil {
 			warnings = append(warnings, fmt.Sprintf("tokens_by_day unavailable: %v", err))
@@ -1211,10 +1249,6 @@ func (s *Server) getAnalytics(args map[string]interface{}) (interface{}, error) 
 		} else {
 			result["model_breakdown"] = modelStats
 		}
-
-		if len(warnings) > 0 {
-			result["warnings"] = warnings
-		}
 	} else {
 		reason := "analytics cache not initialized"
 		if s.analyzerErr != nil {
@@ -1225,6 +1259,10 @@ func (s *Server) getAnalytics(args map[string]interface{}) (interface{}, error) 
 			"reason":    reason,
 			"hint":      "Run 'ccvault build-cache' to enable DuckDB analytics",
 		}
+	}
+
+	if len(warnings) > 0 {
+		result["warnings"] = warnings
 	}
 
 	return result, nil
