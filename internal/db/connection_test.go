@@ -46,6 +46,14 @@ func TestOpenAppliesConnectionPragmas(t *testing.T) {
 	if busyTimeout != busyTimeoutMS {
 		t.Errorf("busy_timeout = %d, want %d", busyTimeout, busyTimeoutMS)
 	}
+
+	var recursiveTriggers int
+	if err := db.QueryRow("PRAGMA recursive_triggers").Scan(&recursiveTriggers); err != nil {
+		t.Fatalf("pragma recursive_triggers: %v", err)
+	}
+	if recursiveTriggers != recursiveTriggersOn {
+		t.Errorf("recursive_triggers = %d, want %d", recursiveTriggers, recursiveTriggersOn)
+	}
 }
 
 // TestOpenCreatesWALSidecars proves WAL mode reached the file and not just
@@ -133,7 +141,7 @@ func TestVerifyConnectionPragmasRejectsIgnoredOptions(t *testing.T) {
 	if err == nil {
 		t.Fatal("verifyConnectionPragmas accepted a connection where every option was ignored")
 	}
-	for _, want := range []string{"journal_mode", "busy_timeout"} {
+	for _, want := range []string{"journal_mode", "busy_timeout", "recursive_triggers"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not name %s", err, want)
 		}

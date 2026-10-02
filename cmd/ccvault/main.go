@@ -225,6 +225,46 @@ func printStorageSection(s db.StorageStats) {
 	fmt.Println()
 }
 
+// integrityJSON renders the search-index comparison for --json consumers,
+// alongside storageJSON.
+func integrityJSON(f db.FTSIntegrity) map[string]interface{} {
+	return map[string]interface{}{
+		"turns":      f.Turns,
+		"indexed":    f.Indexed,
+		"orphaned":   f.Orphaned,
+		"unindexed":  f.Missing(),
+		"consistent": f.Consistent(),
+	}
+}
+
+// printIntegritySection writes the human-readable search-index block.
+//
+// Drift between turns and turns_fts is otherwise completely silent. An
+// orphaned index entry matches a query and then resolves to no turn at all,
+// so it costs recall without ever surfacing an error; an unindexed turn is
+// held by the archive and invisible to search. Neither shows up in any row
+// count, because turns_fts is an external-content table that answers
+// COUNT(*) from the turns table itself.
+func printIntegritySection(f db.FTSIntegrity) {
+	if f.Turns == 0 && f.Indexed == 0 {
+		return
+	}
+	fmt.Println("Search index:")
+	fmt.Printf("  Indexed:       %d of %d turns\n", f.Indexed-f.Orphaned, f.Turns)
+	if f.Consistent() {
+		fmt.Println()
+		return
+	}
+	if f.Orphaned > 0 {
+		fmt.Printf("  Orphaned:      %d entries that match queries but resolve to no turn\n", f.Orphaned)
+	}
+	if f.Missing() > 0 {
+		fmt.Printf("  Unindexed:     %d turns that search cannot reach\n", f.Missing())
+	}
+	fmt.Println("  Rebuild the index with 'ccvault sync --rebuild'.")
+	fmt.Println()
+}
+
 var orientCmd = &cobra.Command{
 	Use:   "orient",
 	Short: "Output database state for AI agents",
@@ -675,6 +715,11 @@ var statsCmd = &cobra.Command{
 			return fmt.Errorf("get storage stats: %w", err)
 		}
 
+		integrity, err := database.CheckFTSIntegrity()
+		if err != nil {
+			return fmt.Errorf("check search index integrity: %w", err)
+		}
+
 		if jsonOutput {
 			out := map[string]interface{}{
 				"projects":        projectCount,
@@ -685,6 +730,7 @@ var statsCmd = &cobra.Command{
 				"tokens_by_model": tokensByModel,
 				"top_tools":       toolStats,
 				"storage":         storageJSON(storage),
+				"search_index":    integrityJSON(integrity),
 			}
 			if !first.IsZero() && !last.IsZero() {
 				out["activity"] = map[string]interface{}{
@@ -715,6 +761,7 @@ var statsCmd = &cobra.Command{
 		}
 
 		printStorageSection(storage)
+		printIntegritySection(integrity)
 
 		if len(tokensByModel) > 0 {
 			fmt.Println("Tokens by Model:")
