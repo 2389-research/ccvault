@@ -7,7 +7,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"io/fs"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -53,42 +53,30 @@ func TestProjectRefEnforcement(t *testing.T) {
 	violations := []string{}
 	fset := token.NewFileSet()
 
-	err := filepath.WalkDir(repoRoot, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			name := d.Name()
-			// Skip common non-source directories.
-			if name == ".git" || name == "vendor" || name == "node_modules" ||
-				name == ".worktrees" || name == ".scratch" || name == ".intent" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if !strings.HasSuffix(path, ".go") {
-			return nil
-		}
+	// Enumerate with `git ls-files` rather than walking the filesystem.
+	// A walk has to guess which directories aren't source, and it guessed
+	// wrong: it skipped `.worktrees` but Claude Code checks agent worktrees
+	// out under `.claude/worktrees/`, so every allowlisted file reappeared
+	// once per worktree as a phantom violation — green in CI, red locally.
+	// Asking git for the tracked files of THIS working tree excludes nested
+	// worktrees, build output, and untracked scratch by construction, with
+	// no denylist to keep current.
+	for _, rel := range trackedGoFiles(t, repoRoot) {
 		// Test files exercise the field in their own arrangements; the
 		// discipline is about production surface consistency. Migration
 		// tests and projectref's own tests wouldn't be able to verify
 		// anything if the allowlist banned them.
-		if strings.HasSuffix(path, "_test.go") {
-			return nil
-		}
-
-		rel, err := filepath.Rel(repoRoot, path)
-		if err != nil {
-			return err
+		if strings.HasSuffix(rel, "_test.go") {
+			continue
 		}
 		if isAllowlisted(rel) {
-			return nil
+			continue
 		}
 
-		file, err := parser.ParseFile(fset, path, nil, parser.SkipObjectResolution)
+		file, err := parser.ParseFile(fset, filepath.Join(repoRoot, rel), nil, parser.SkipObjectResolution)
 		if err != nil {
 			// Malformed Go isn't this test's job to flag.
-			return nil
+			continue
 		}
 
 		ast.Inspect(file, func(n ast.Node) bool {
@@ -110,10 +98,6 @@ func TestProjectRefEnforcement(t *testing.T) {
 			violations = append(violations, rel+":"+strconv.Itoa(pos.Line))
 			return true
 		})
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("walk repo: %v", err)
 	}
 
 	if len(violations) > 0 {
@@ -126,6 +110,44 @@ func TestProjectRefEnforcement(t *testing.T) {
 			strings.Join(violations, "\n  "),
 		)
 	}
+}
+
+// trackedGoFiles returns every .go file git considers part of the working
+// tree at repoRoot, as repo-relative paths.
+//
+// `git ls-files` reports only the working tree it runs in, so a nested
+// worktree's copies are absent — which is the point: scanning them produced
+// phantom violations against files already allowlisted at their canonical
+// paths. `--others --exclude-standard` adds files that exist but aren't
+// committed yet, so a new surface is caught before it lands rather than
+// after; `.gitignore` already covers `worktrees/`, so those stay excluded.
+func trackedGoFiles(t *testing.T, repoRoot string) []string {
+	t.Helper()
+
+	// Every argument is a literal and the directory is set via cmd.Dir
+	// rather than passed as `-C <path>`, so no caller-supplied value
+	// reaches the argument list.
+	cmd := exec.Command("git", "ls-files", "-z",
+		"--cached", "--others", "--exclude-standard", "--", "*.go")
+	cmd.Dir = repoRoot
+	out, err := cmd.Output()
+	if err != nil {
+		// Failing loudly beats silently scanning nothing and reporting a
+		// clean run, which would make this guard useless exactly when it
+		// is broken.
+		t.Fatalf("git ls-files in %s: %v", repoRoot, err)
+	}
+
+	var files []string
+	for _, name := range strings.Split(string(out), "\x00") {
+		if name != "" {
+			files = append(files, name)
+		}
+	}
+	if len(files) == 0 {
+		t.Fatalf("git ls-files found no .go files under %s", repoRoot)
+	}
+	return files
 }
 
 func isAllowlisted(rel string) bool {
