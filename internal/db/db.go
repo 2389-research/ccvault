@@ -14,6 +14,42 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// Connection settings every ccvault connection must end up with. They are
+// named here, asserted after Open, and used by the tests, so the DSN and the
+// contract can't drift apart.
+const (
+	// busyTimeoutMS is how long a connection waits for a lock before giving
+	// up with SQLITE_BUSY. Sync holds the writer for the length of one
+	// session's transaction; a TUI or MCP reader that arrives mid-write
+	// should wait it out rather than error.
+	busyTimeoutMS = 5000
+
+	// synchronousNormal is PRAGMA synchronous=NORMAL as the pragma reports
+	// it back. In WAL mode NORMAL skips the per-commit fsync and lets the OS
+	// flush at checkpoint instead, which matters because sync commits once
+	// per session across tens of thousands of sessions. The exposure is a
+	// power loss or kernel panic (not a process crash) losing recently
+	// committed transactions; the archive is a derived cache of the JSONL
+	// files, so a re-sync rebuilds anything lost.
+	synchronousNormal = 1
+)
+
+// connectionDSN builds the DSN for the archive.
+//
+// The parameter names matter more than they look. modernc.org/sqlite honours
+// `_pragma=`, `_txlock=` and `_time_format=` only, and silently drops every
+// other query parameter. The `_journal_mode=` / `_synchronous=` /
+// `_busy_timeout=` spellings belong to mattn/go-sqlite3; this DSN carried
+// them for the project's whole history and set none of them, so the archive
+// ran in rollback-journal mode at synchronous=FULL with no busy timeout at
+// all. Nothing noticed, because an ignored option looks exactly like a
+// honoured one from the calling code. verifyConnectionPragmas exists so the
+// next such mistake cannot be silent.
+func connectionDSN(dbPath string) string {
+	return fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(%d)&_pragma=synchronous(NORMAL)",
+		dbPath, busyTimeoutMS)
+}
+
 // DB wraps the SQLite database connection
 type DB struct {
 	*sql.DB
@@ -29,16 +65,26 @@ func Open(dataDir string) (*DB, error) {
 
 	dbPath := filepath.Join(dataDir, dbFileName)
 
-	// Open database with WAL mode for better concurrency
-	dsn := fmt.Sprintf("file:%s?_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=5000", dbPath)
-	sqlDB, err := sql.Open("sqlite", dsn)
+	sqlDB, err := sql.Open("sqlite", connectionDSN(dbPath))
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
 
-	// Set connection pool settings
-	sqlDB.SetMaxOpenConns(1) // SQLite works best with single writer
+	// One connection. WAL would allow concurrent readers alongside the
+	// writer, but this pool is shared by a single process that reads and
+	// writes the same rows, and one connection makes "the writer" a single
+	// identifiable handle rather than whichever pooled connection got there
+	// first. Cross-process concurrency — sync writing while the TUI or MCP
+	// server reads — is what WAL plus busy_timeout is actually for here, and
+	// that is unaffected by this pool's size.
+	sqlDB.SetMaxOpenConns(1)
 	sqlDB.SetMaxIdleConns(1)
+
+	// Read the settings back off the connection instead of trusting the DSN.
+	if err := verifyConnectionPragmas(context.Background(), sqlDB); err != nil {
+		_ = sqlDB.Close()
+		return nil, err
+	}
 
 	db := &DB{
 		DB:   sqlDB,
@@ -52,6 +98,50 @@ func Open(dataDir string) (*DB, error) {
 	}
 
 	return db, nil
+}
+
+// verifyConnectionPragmas reads back every connection setting ccvault depends
+// on and refuses the connection if any of them did not take.
+//
+// This is not defensive padding. The bug it guards against was a DSN whose
+// options the driver dropped without an error for the project's entire
+// history, costing WAL mode and the busy timeout on every connection ever
+// opened. A driver swap, a driver upgrade that renames a parameter, or a typo
+// inside the pragma syntax all reproduce it exactly, and all of them are
+// invisible unless something asks the connection what it actually did.
+func verifyConnectionPragmas(ctx context.Context, q sqlRunner) error {
+	var journal string
+	if err := q.QueryRowContext(ctx, "PRAGMA journal_mode").Scan(&journal); err != nil {
+		return fmt.Errorf("read back journal_mode: %w", err)
+	}
+
+	var synchronous int
+	if err := q.QueryRowContext(ctx, "PRAGMA synchronous").Scan(&synchronous); err != nil {
+		return fmt.Errorf("read back synchronous: %w", err)
+	}
+
+	var busyTimeout int
+	if err := q.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&busyTimeout); err != nil {
+		return fmt.Errorf("read back busy_timeout: %w", err)
+	}
+
+	var mismatches []string
+	if !strings.EqualFold(journal, "wal") {
+		mismatches = append(mismatches, fmt.Sprintf("journal_mode is %q, want wal", journal))
+	}
+	if synchronous != synchronousNormal {
+		mismatches = append(mismatches, fmt.Sprintf("synchronous is %d, want %d (NORMAL)", synchronous, synchronousNormal))
+	}
+	if busyTimeout != busyTimeoutMS {
+		mismatches = append(mismatches, fmt.Sprintf("busy_timeout is %d, want %d", busyTimeout, busyTimeoutMS))
+	}
+
+	if len(mismatches) > 0 {
+		return fmt.Errorf("the SQLite driver did not apply the connection settings ccvault requires (%s); "+
+			"the DSN may use parameter names this driver ignores",
+			strings.Join(mismatches, "; "))
+	}
+	return nil
 }
 
 // init creates the database schema via the versioned migration system
