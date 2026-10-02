@@ -4,6 +4,7 @@
 package sync
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -146,7 +147,7 @@ func TestRunWithClaudeCodeAdapter(t *testing.T) {
 		}),
 	)
 
-	stats, err := syncer.Run()
+	stats, err := syncer.Run(context.Background())
 	if err != nil {
 		t.Fatalf("Run() error: %v", err)
 	}
@@ -186,7 +187,7 @@ func TestIncrementalSyncSkipsUnchanged(t *testing.T) {
 
 	// First sync: full
 	syncer := New(database, sources, WithFullSync(true))
-	stats1, err := syncer.Run()
+	stats1, err := syncer.Run(context.Background())
 	if err != nil {
 		t.Fatalf("first Run() error: %v", err)
 	}
@@ -196,7 +197,7 @@ func TestIncrementalSyncSkipsUnchanged(t *testing.T) {
 
 	// Second sync: incremental (should skip the file since mtime hasn't changed)
 	syncer2 := New(database, sources)
-	stats2, err := syncer2.Run()
+	stats2, err := syncer2.Run(context.Background())
 	if err != nil {
 		t.Fatalf("second Run() error: %v", err)
 	}
@@ -217,7 +218,7 @@ func TestRunWithUnknownAdapterType(t *testing.T) {
 	}
 
 	syncer := New(database, sources)
-	stats, err := syncer.Run()
+	stats, err := syncer.Run(context.Background())
 	if err != nil {
 		t.Fatalf("Run() should not return top-level error for adapter failures, got: %v", err)
 	}
@@ -307,7 +308,7 @@ func TestMultipleSourcesSync(t *testing.T) {
 	}
 
 	syncer := New(database, sources, WithFullSync(true))
-	stats, err := syncer.Run()
+	stats, err := syncer.Run(context.Background())
 	if err != nil {
 		t.Fatalf("Run() error: %v", err)
 	}
@@ -373,7 +374,7 @@ func TestSyncer_FullSyncPreservesPrunedSessions(t *testing.T) {
 	}
 
 	first := New(database, sources)
-	stats1, err := first.Run()
+	stats1, err := first.Run(context.Background())
 	if err != nil {
 		t.Fatalf("first sync: %v", err)
 	}
@@ -388,7 +389,7 @@ func TestSyncer_FullSyncPreservesPrunedSessions(t *testing.T) {
 	writeTestSession(t, claudeHome, "bbbbbbbb-5555-6666-7777-888888888888", "-Users-test-new-project")
 
 	full := New(database, sources, WithFullSync(true))
-	stats2, err := full.Run()
+	stats2, err := full.Run(context.Background())
 	if err != nil {
 		t.Fatalf("full sync: %v", err)
 	}
@@ -448,13 +449,13 @@ func TestSyncer_FullSyncReparsesUnchangedFiles(t *testing.T) {
 		{Name: "claude-code", Type: "claude-code", Path: claudeHome},
 	}
 
-	if _, err := New(database, sources).Run(); err != nil {
+	if _, err := New(database, sources).Run(context.Background()); err != nil {
 		t.Fatalf("first sync: %v", err)
 	}
 
 	// Nothing on disk changed, so an incremental sync would skip the file.
 	full := New(database, sources, WithFullSync(true))
-	stats, err := full.Run()
+	stats, err := full.Run(context.Background())
 	if err != nil {
 		t.Fatalf("full sync: %v", err)
 	}
@@ -487,12 +488,12 @@ func TestSyncer_RepeatedSyncDoesNotInflateProjectCounts(t *testing.T) {
 		{Name: "claude-code", Type: "claude-code", Path: claudeHome},
 	}
 
-	if _, err := New(database, sources).Run(); err != nil {
+	if _, err := New(database, sources).Run(context.Background()); err != nil {
 		t.Fatalf("first sync: %v", err)
 	}
 	// Three more full syncs over the same two files.
 	for i := 0; i < 3; i++ {
-		if _, err := New(database, sources, WithFullSync(true)).Run(); err != nil {
+		if _, err := New(database, sources, WithFullSync(true)).Run(context.Background()); err != nil {
 			t.Fatalf("full sync %d: %v", i, err)
 		}
 	}
@@ -528,7 +529,7 @@ func TestSyncer_RebuildWipesArchive(t *testing.T) {
 		{Name: "claude-code", Type: "claude-code", Path: claudeHome},
 	}
 
-	if _, err := New(database, sources).Run(); err != nil {
+	if _, err := New(database, sources).Run(context.Background()); err != nil {
 		t.Fatalf("first sync: %v", err)
 	}
 
@@ -538,7 +539,7 @@ func TestSyncer_RebuildWipesArchive(t *testing.T) {
 	writeTestSession(t, claudeHome, "bbbbbbbb-5555-6666-7777-888888888888", "-Users-test-new-project")
 
 	rebuild := New(database, sources, WithRebuild(true))
-	if _, err := rebuild.Run(); err != nil {
+	if _, err := rebuild.Run(context.Background()); err != nil {
 		t.Fatalf("rebuild sync: %v", err)
 	}
 
@@ -587,7 +588,7 @@ func TestSyncer_RebuildAbortsBeforeWipeWhenParquetRemoveFails(t *testing.T) {
 	sources := []config.SourceConfig{
 		{Name: "claude-code", Type: "claude-code", Path: claudeHome},
 	}
-	if _, err := New(database, sources).Run(); err != nil {
+	if _, err := New(database, sources).Run(context.Background()); err != nil {
 		t.Fatalf("first sync: %v", err)
 	}
 
@@ -609,7 +610,7 @@ func TestSyncer_RebuildAbortsBeforeWipeWhenParquetRemoveFails(t *testing.T) {
 	}
 
 	rebuild := New(database, sources, WithRebuild(true), WithCacheDir(cacheDir))
-	if _, err := rebuild.Run(); err == nil {
+	if _, err := rebuild.Run(context.Background()); err == nil {
 		t.Fatal("rebuild should fail when the parquet cache can't be invalidated")
 	}
 
@@ -643,7 +644,7 @@ func TestSyncer_IncrementalDoesNotClear(t *testing.T) {
 	}
 
 	first := New(database, sources)
-	if _, err := first.Run(); err != nil {
+	if _, err := first.Run(context.Background()); err != nil {
 		t.Fatalf("first sync: %v", err)
 	}
 
@@ -653,7 +654,7 @@ func TestSyncer_IncrementalDoesNotClear(t *testing.T) {
 	}
 
 	second := New(database, sources) // NOT WithFullSync(true)
-	if _, err := second.Run(); err != nil {
+	if _, err := second.Run(context.Background()); err != nil {
 		t.Fatalf("second sync: %v", err)
 	}
 
@@ -701,7 +702,7 @@ func TestSyncer_FullFlagInvalidatesAnalyticsCache(t *testing.T) {
 		WithFullSync(true),
 		WithCacheDir(cacheDir),
 	)
-	if _, err := syncer.Run(); err != nil {
+	if _, err := syncer.Run(context.Background()); err != nil {
 		t.Fatalf("full sync: %v", err)
 	}
 
@@ -742,7 +743,7 @@ func TestSyncer_IncrementalDoesNotInvalidateCache(t *testing.T) {
 
 	// Incremental (NOT --full), with cache dir set.
 	syncer := New(database, sources, WithCacheDir(cacheDir))
-	if _, err := syncer.Run(); err != nil {
+	if _, err := syncer.Run(context.Background()); err != nil {
 		t.Fatalf("incremental sync: %v", err)
 	}
 

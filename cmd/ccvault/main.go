@@ -101,7 +101,7 @@ var quickstartCmd = &cobra.Command{
 				}),
 			)
 
-			stats, err := syncer.Run()
+			stats, err := syncer.Run(cmd.Context())
 			if err != nil {
 				return fmt.Errorf("sync: %w", err)
 			}
@@ -478,7 +478,7 @@ over the live DB (the path is printed at run), or merge it back in with
 		)
 
 		// Run sync
-		stats, err := syncer.Run()
+		stats, err := syncer.Run(cmd.Context())
 		if err != nil {
 			if rebuild && backupPath != "" {
 				fmt.Fprintf(os.Stderr, "\nsync failed after wiping data. Restore the pre-sync state with:\n"+

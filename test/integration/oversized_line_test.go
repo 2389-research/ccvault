@@ -4,6 +4,7 @@
 package integration
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -64,7 +65,7 @@ this line is not valid json and should be counted as skipped
 	defer func() { _ = database.Close() }()
 
 	// First sync: file is new, should be parsed and indexed.
-	stats, err := sync.New(database, sources, sync.WithFullSync(true)).Run()
+	stats, err := sync.New(database, sources, sync.WithFullSync(true)).Run(context.Background())
 	if err != nil {
 		t.Fatalf("first sync: %v", err)
 	}
@@ -135,7 +136,7 @@ this line is not valid json and should be counted as skipped
 
 	// Second sync (incremental, not --full): the file's mtime hasn't moved,
 	// so the sync should skip it entirely, not re-parse.
-	stats2, err := sync.New(database, sources).Run()
+	stats2, err := sync.New(database, sources).Run(context.Background())
 	if err != nil {
 		t.Fatalf("second sync: %v", err)
 	}
@@ -177,7 +178,7 @@ func TestSync_AllMalformedFile_StillCountsSkippedLines(t *testing.T) {
 	}
 	defer func() { _ = database.Close() }()
 
-	stats, err := sync.New(database, sources, sync.WithFullSync(true)).Run()
+	stats, err := sync.New(database, sources, sync.WithFullSync(true)).Run(context.Background())
 	if err != nil {
 		t.Fatalf("sync: %v", err)
 	}

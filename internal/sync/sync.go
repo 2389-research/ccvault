@@ -4,6 +4,7 @@
 package sync
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -115,10 +116,35 @@ func New(database *db.DB, sources []config.SourceConfig, opts ...Option) *Syncer
 	return s
 }
 
-// Run performs the sync operation
-func (s *Syncer) Run() (*Stats, error) {
+// Run performs the sync operation. Cancelling ctx abandons the run: the
+// current session's transaction is rolled back, the remaining sessions are
+// skipped, and Run returns the stats gathered so far alongside ctx.Err().
+// Sessions already committed stay committed — a cancelled sync is a short
+// sync, not a failed one.
+func (s *Syncer) Run(ctx context.Context) (*Stats, error) {
 	start := time.Now()
 	stats := &Stats{}
+
+	// Track unique projects. projectsSeen counts everything discovered (for
+	// stats); projectsTouched records only the projects we actually wrote a
+	// session into, which is the set whose aggregates need reconciling.
+	projectsSeen := make(map[string]bool)
+	projectsTouched := make(map[string]bool)
+
+	// cancelled wraps up a run that the caller abandoned. The partial stats go
+	// back so the caller can still report what landed, and the project
+	// aggregates get reconciled first: UpsertProject writes them as "existing
+	// + incoming", so stopping mid-run without reconciling leaves the session
+	// and token counters inflated in every view that reads them.
+	cancelled := func() (*Stats, error) {
+		s.reconcileProjects(stats, projectsTouched)
+		stats.Duration = time.Since(start)
+		return stats, ctx.Err()
+	}
+
+	if ctx.Err() != nil {
+		return cancelled()
+	}
 
 	// Both --full and --rebuild re-parse everything, so numbers in the
 	// DuckDB analytics cache can change either way; invalidate it so the
@@ -141,7 +167,7 @@ func (s *Syncer) Run() (*Stats, error) {
 	// an archive that drops what the source no longer keeps isn't an archive.
 	if s.rebuild {
 		s.progress("Rebuild: clearing existing data...")
-		if err := s.db.ResetAll(); err != nil {
+		if err := s.db.ResetAllContext(ctx); err != nil {
 			return nil, fmt.Errorf("reset database: %w", err)
 		}
 	} else if s.full {
@@ -163,12 +189,6 @@ func (s *Syncer) Run() (*Stats, error) {
 		s.progress("Loaded %d stored mtimes", len(storedMtimes))
 	}
 
-	// Track unique projects. projectsSeen counts everything discovered (for
-	// stats); projectsTouched records only the projects we actually wrote a
-	// session into, which is the set whose aggregates need reconciling below.
-	projectsSeen := make(map[string]bool)
-	projectsTouched := make(map[string]bool)
-
 	// Collect all session files across all sources
 	type sourceSession struct {
 		file       adapter.SessionFile
@@ -179,6 +199,9 @@ func (s *Syncer) Run() (*Stats, error) {
 	var allSessions []sourceSession
 
 	for _, src := range s.sources {
+		if ctx.Err() != nil {
+			return cancelled()
+		}
 		s.progress("Scanning source %q (%s) at %s...", src.Name, src.Type, src.Path)
 
 		adpt, err := adapter.Get(src.Type)
@@ -213,7 +236,16 @@ func (s *Syncer) Run() (*Stats, error) {
 	// Process each session
 	total := len(allSessions)
 	for i, ss := range allSessions {
-		if err := s.processSession(ss.file, ss.adapter, ss.sourceName, stats, storedMtimes, projectsSeen, projectsTouched); err != nil {
+		if ctx.Err() != nil {
+			return cancelled()
+		}
+
+		if err := s.processSession(ctx, ss.file, ss.adapter, ss.sourceName, stats, storedMtimes, projectsSeen, projectsTouched); err != nil {
+			// A cancellation shows up here as a rolled-back transaction. That
+			// is not a data problem, so it doesn't belong in stats.Errors.
+			if ctx.Err() != nil {
+				return cancelled()
+			}
 			stats.Errors = append(stats.Errors, fmt.Errorf("session %s: %w", ss.file.Path, err))
 			if s.verbose {
 				s.progress("Error processing %s: %v", ss.file.Path, err)
@@ -227,24 +259,7 @@ func (s *Syncer) Run() (*Stats, error) {
 		}
 	}
 
-	// Reconcile the project aggregate columns against the sessions table.
-	// UpsertProject writes session_count / total_tokens as "existing +
-	// incoming", so every re-parse of an already-indexed session adds to
-	// them again. The old destructive --full hid that by emptying the table
-	// first; now that re-parsing preserves rows, the counters have to be
-	// recomputed from the rows that actually exist.
-	if len(projectsTouched) > 0 {
-		paths := make([]string, 0, len(projectsTouched))
-		for p := range projectsTouched {
-			paths = append(paths, p)
-		}
-		if err := s.db.ReconcileProjectAggregates(paths); err != nil {
-			// Non-fatal: the session/turn rows are already committed, which
-			// is the data that matters. Only the display counters are off.
-			stats.Errors = append(stats.Errors, fmt.Errorf("reconcile project aggregates: %w", err))
-			s.progress("Warning: could not reconcile project counts: %v", err)
-		}
-	}
+	s.reconcileProjects(stats, projectsTouched)
 
 	stats.ProjectsFound = len(projectsSeen)
 	stats.Duration = time.Since(start)
@@ -263,8 +278,37 @@ func (s *Syncer) Run() (*Stats, error) {
 	return stats, nil
 }
 
-// processSession handles a single session file using the given adapter
-func (s *Syncer) processSession(sf adapter.SessionFile, adpt adapter.SourceAdapter, sourceName string, stats *Stats, storedMtimes map[string]time.Time, projectsSeen, projectsTouched map[string]bool) error {
+// reconcileProjects recomputes the project aggregate columns against the
+// sessions table. UpsertProject writes session_count / total_tokens as
+// "existing + incoming", so every re-parse of an already-indexed session adds
+// to them again. The old destructive --full hid that by emptying the table
+// first; now that re-parsing preserves rows, the counters have to be recomputed
+// from the rows that actually exist. Runs at the end of a complete sync and
+// also when a run is cancelled part-way — a half-finished run inflates the
+// counters just as surely as a finished one.
+//
+// Deliberately not context-bound: this is the repair step, and skipping it
+// because the run was cancelled is what leaves the archive reading wrong.
+func (s *Syncer) reconcileProjects(stats *Stats, projectsTouched map[string]bool) {
+	if len(projectsTouched) == 0 {
+		return
+	}
+	paths := make([]string, 0, len(projectsTouched))
+	for p := range projectsTouched {
+		paths = append(paths, p)
+	}
+	if err := s.db.ReconcileProjectAggregates(paths); err != nil {
+		// Non-fatal: the session/turn rows are already committed, which is the
+		// data that matters. Only the display counters are off.
+		stats.Errors = append(stats.Errors, fmt.Errorf("reconcile project aggregates: %w", err))
+		s.progress("Warning: could not reconcile project counts: %v", err)
+	}
+}
+
+// processSession handles a single session file using the given adapter. ctx
+// bounds the write transaction, so a cancellation partway through a large
+// session rolls that session back instead of finishing it.
+func (s *Syncer) processSession(ctx context.Context, sf adapter.SessionFile, adpt adapter.SourceAdapter, sourceName string, stats *Stats, storedMtimes map[string]time.Time, projectsSeen, projectsTouched map[string]bool) error {
 	// Check if we need to process this file
 	if !s.reparseAll() {
 		if !s.needsSync(sf, storedMtimes) {
@@ -385,7 +429,7 @@ func (s *Syncer) processSession(sf adapter.SessionFile, adpt adapter.SourceAdapt
 	session.TurnCount = len(turns)
 
 	// Store everything in a transaction
-	err = s.db.WithTx(func(tx *sql.Tx) error {
+	err = s.db.WithTxContext(ctx, func(tx *sql.Tx) error {
 		// Upsert project — use display name from adapter (source-specific logic)
 		displayName := parsed.DisplayName
 		if displayName == "" {

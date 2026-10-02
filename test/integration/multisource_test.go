@@ -4,6 +4,7 @@
 package integration
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -101,7 +102,7 @@ func TestMultiSourceSyncAndSearch(t *testing.T) {
 
 	// --- Run sync ---
 	syncer := sync.New(database, sources, sync.WithFullSync(true))
-	stats, err := syncer.Run()
+	stats, err := syncer.Run(context.Background())
 	if err != nil {
 		t.Fatalf("sync run: %v", err)
 	}

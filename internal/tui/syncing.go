@@ -4,8 +4,10 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/2389-research/ccvault/internal/config"
@@ -38,6 +40,17 @@ type SyncingModel struct {
 	progressCh chan string
 	countCh    chan syncCountProgress
 	doneCh     chan syncCompleteMsg
+
+	// Lifecycle of the sync goroutine. ctx is cancelled when the user leaves
+	// the syncing view or force-quits; exited closes once the goroutine has
+	// returned, which is the signal the caller needs before closing the
+	// database underneath it.
+	// started is atomic because the shutdown path reads it from the goroutine
+	// that ran the Bubble Tea program, not the one that drove Update.
+	ctx     context.Context
+	cancel  context.CancelFunc
+	started atomic.Bool
+	exited  chan struct{}
 }
 
 // NewSyncingModel creates a new syncing model
@@ -47,6 +60,7 @@ func NewSyncingModel(database *db.DB, sources []config.SourceConfig) *SyncingMod
 		progress.WithWidth(40),
 		progress.WithoutPercentage(),
 	)
+	ctx, cancel := context.WithCancel(context.Background())
 	return &SyncingModel{
 		db:         database,
 		sources:    sources,
@@ -56,6 +70,9 @@ func NewSyncingModel(database *db.DB, sources []config.SourceConfig) *SyncingMod
 		progressCh: make(chan string, 100),
 		countCh:    make(chan syncCountProgress, 100),
 		doneCh:     make(chan syncCompleteMsg, 1),
+		ctx:        ctx,
+		cancel:     cancel,
+		exited:     make(chan struct{}),
 	}
 }
 
@@ -75,25 +92,66 @@ type syncTickMsg struct{}
 
 // Init starts the sync operation
 func (m *SyncingModel) Init() tea.Cmd {
+	if m.started.Swap(true) {
+		// A second goroutine over the same channels would double-close exited
+		// and crash the program. Callers get a fresh model per sync instead.
+		return m.tick()
+	}
+
 	m.startTime = time.Now()
 	m.progress = []string{"Starting sync..."}
 
 	// Launch sync in a goroutine so the TUI stays responsive
 	go func() {
+		defer close(m.exited)
+
 		syncer := sync.New(m.db, m.sources,
+			// Both callbacks block on a full channel, and the channels are only
+			// drained while this view is on screen. Selecting on ctx.Done() is
+			// what lets the goroutine walk away once nobody is listening —
+			// cancelling the context alone cannot unblock a channel send.
 			sync.WithProgressCallback(func(msg string) {
-				m.progressCh <- msg
+				select {
+				case m.progressCh <- msg:
+				case <-m.ctx.Done():
+				}
 			}),
 			sync.WithCountProgressCallback(func(current, total int) {
-				m.countCh <- syncCountProgress{current: current, total: total}
+				select {
+				case m.countCh <- syncCountProgress{current: current, total: total}:
+				case <-m.ctx.Done():
+				}
 			}),
 		)
 
-		stats, err := syncer.Run()
+		stats, err := syncer.Run(m.ctx)
+		// doneCh is buffered, so this never blocks even with no reader left.
 		m.doneCh <- syncCompleteMsg{stats: stats, err: err}
 	}()
 
 	return m.tick()
+}
+
+// Cancel asks the sync goroutine to stop. Safe to call more than once, and
+// safe on a model whose sync never started.
+func (m *SyncingModel) Cancel() {
+	m.cancel()
+}
+
+// WaitForExit blocks until the sync goroutine has returned, or until timeout.
+// Reports whether the goroutine is gone. Callers use this before closing the
+// database so a cancelled sync cannot be mid-transaction when the connection
+// disappears underneath it.
+func (m *SyncingModel) WaitForExit(timeout time.Duration) bool {
+	if !m.started.Load() {
+		return true
+	}
+	select {
+	case <-m.exited:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
 }
 
 // tick returns a command that fires a syncTickMsg after a short delay

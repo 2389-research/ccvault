@@ -5,6 +5,7 @@ package tui
 
 import (
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/2389-research/ccvault/internal/config"
@@ -28,18 +29,19 @@ const (
 
 // KeyMap defines keyboard shortcuts
 type KeyMap struct {
-	Up       key.Binding
-	Down     key.Binding
-	Left     key.Binding
-	Right    key.Binding
-	Enter    key.Binding
-	Back     key.Binding
-	Quit     key.Binding
-	Help     key.Binding
-	Search   key.Binding
-	Refresh  key.Binding
-	PageUp   key.Binding
-	PageDown key.Binding
+	Up        key.Binding
+	Down      key.Binding
+	Left      key.Binding
+	Right     key.Binding
+	Enter     key.Binding
+	Back      key.Binding
+	Quit      key.Binding
+	ForceQuit key.Binding
+	Help      key.Binding
+	Search    key.Binding
+	Refresh   key.Binding
+	PageUp    key.Binding
+	PageDown  key.Binding
 }
 
 var keys = KeyMap{
@@ -67,9 +69,15 @@ var keys = KeyMap{
 		key.WithKeys("esc", "backspace"),
 		key.WithHelp("esc", "back"),
 	),
+	// q is context-sensitive: back in a nested view, quit on the dashboard.
+	// ctrl+c is the universal interrupt and always quits, from any view.
 	Quit: key.NewBinding(
-		key.WithKeys("q", "ctrl+c"),
+		key.WithKeys("q"),
 		key.WithHelp("q", "quit"),
+	),
+	ForceQuit: key.NewBinding(
+		key.WithKeys("ctrl+c"),
+		key.WithHelp("ctrl+c", "quit"),
 	),
 	Help: key.NewBinding(
 		key.WithKeys("?"),
@@ -206,6 +214,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.dashboard.Init()
 
 	case tea.KeyMsg:
+		// ctrl+c quits from anywhere, ahead of every other key handling —
+		// including the sync short-circuit below, so it works mid-sync. The
+		// sync goroutine is cancelled here; tui.Run then waits for it to
+		// unwind before the caller closes the database.
+		if key.Matches(msg, keys.ForceQuit) {
+			m.syncing.Cancel()
+			return m, tea.Quit
+		}
+
 		// If syncing is done and has error, any key continues
 		if m.view == SyncingView && m.syncing.IsDone() {
 			m.dashboard = NewDashboardModel(m.db)
@@ -333,6 +350,9 @@ func (m *Model) pushView(view View, data interface{}) (*Model, tea.Cmd) {
 	case AnalyticsView:
 		cmd = m.analytics.Init()
 	case SyncingView:
+		// Replacing the model drops the only handle on its goroutine, so
+		// retire the old one first rather than orphaning it.
+		m.syncing.Cancel()
 		m.syncing = NewSyncingModel(m.db, m.sources)
 		cmd = m.syncing.Init()
 	}
@@ -343,10 +363,35 @@ func (m *Model) pushView(view View, data interface{}) (*Model, tea.Cmd) {
 // popView goes back to the previous view
 func (m *Model) popView() (*Model, tea.Cmd) {
 	if len(m.viewStack) > 1 {
+		// Leaving the syncing view means SyncingModel.Update stops being
+		// called, so nothing drains the progress channels any more. Without
+		// this the sync goroutine blocks on send and never returns.
+		if m.view == SyncingView {
+			m.syncing.Cancel()
+		}
 		m.viewStack = m.viewStack[:len(m.viewStack)-1]
 		m.view = m.viewStack[len(m.viewStack)-1]
 	}
 	return m, nil
+}
+
+// shutdownSync cancels any running sync and waits for its goroutine to
+// return. Called once the Bubble Tea program has stopped, before the caller
+// closes the database: a sync goroutine still mid-transaction when the
+// connection closes is the data-corruption-adjacent half of #24.
+func (m *Model) shutdownSync() {
+	if m.syncing == nil {
+		return
+	}
+	m.syncing.Cancel()
+	if !m.syncing.WaitForExit(syncShutdownTimeout) {
+		// Give up waiting rather than holding the user's exit open forever, but
+		// say so: the database is about to close under a writer that is still
+		// running, and the archive's counters may not have been reconciled.
+		fmt.Fprintln(os.Stderr,
+			"warning: sync did not stop within "+syncShutdownTimeout.String()+
+				"; run `ccvault sync` to bring the archive back in line")
+	}
 }
 
 // NavigateMsg is sent to navigate to a different view
@@ -363,14 +408,26 @@ type ErrorMsg struct {
 // syncDoneTransitionMsg signals time to transition from sync to dashboard
 type syncDoneTransitionMsg struct{}
 
+// syncShutdownTimeout bounds how long a quit waits for a cancelled sync
+// goroutine to unwind. One session's transaction is the unit of work it has to
+// finish rolling back, so this is generous.
+const syncShutdownTimeout = 5 * time.Second
+
 // Run starts the TUI
 func Run(database *db.DB, cacheDir string, sources []config.SourceConfig) error {
+	m := New(database, cacheDir, sources)
 	p := tea.NewProgram(
-		New(database, cacheDir, sources),
+		m,
 		tea.WithAltScreen(),
 		tea.WithMouseCellMotion(),
 	)
 
 	_, err := p.Run()
+
+	// The program loop has stopped, so nothing drains the sync channels any
+	// more. Unwind the sync goroutine here, while the database is still open:
+	// our caller closes it the moment we return.
+	m.shutdownSync()
+
 	return err
 }

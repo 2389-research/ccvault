@@ -4,6 +4,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -85,10 +86,18 @@ func (db *DB) Close() error {
 // tool_uses empty but turns still populated, and the per-session /
 // per-project aggregate counters would silently drift from row counts.
 func (db *DB) ResetAll() error {
+	return db.ResetAllContext(context.Background())
+}
+
+// ResetAllContext is ResetAll bound to ctx. Wiping a large archive is one long
+// transaction, so a caller that can be cancelled mid-sync needs to be able to
+// interrupt it; cancelling rolls the whole wipe back, same as any other
+// failure part-way through.
+func (db *DB) ResetAllContext(ctx context.Context) error {
 	// Delete data in child-to-parent order so foreign-key-like invariants hold
 	// (turns before sessions, sessions before projects, etc.)
 	tables := []string{"tool_uses", "turns", "sessions", "projects", "source_files"}
-	return db.WithTx(func(tx *sql.Tx) error {
+	return db.WithTxContext(ctx, func(tx *sql.Tx) error {
 		for _, table := range tables {
 			if _, err := tx.Exec("DELETE FROM " + table); err != nil {
 				return fmt.Errorf("delete from %s: %w", table, err)
@@ -162,7 +171,16 @@ func (db *DB) BeginTx() (*sql.Tx, error) {
 
 // WithTx executes a function within a transaction
 func (db *DB) WithTx(fn func(*sql.Tx) error) error {
-	tx, err := db.BeginTx()
+	return db.WithTxContext(context.Background(), fn)
+}
+
+// WithTxContext executes a function within a transaction that is bound to ctx.
+// Cancelling ctx rolls the transaction back, so statements issued after the
+// cancellation fail instead of continuing to write. That is what makes a long
+// multi-statement write (a big session's turns) interruptible mid-flight —
+// a quit flag checked between units of work cannot do that.
+func (db *DB) WithTxContext(ctx context.Context, fn func(*sql.Tx) error) error {
+	tx, err := db.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
