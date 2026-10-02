@@ -244,7 +244,7 @@ func (m *AnalyticsModel) View() string {
 		b.WriteString("\n\n")
 		b.WriteString(errorStyle.Render(fmt.Sprintf("Error: %v", m.err)))
 		b.WriteString("\n\n")
-		b.WriteString(helpStyle.Render("r: retry • esc: back"))
+		b.WriteString(helpStyle.Render("r: retry • esc/q: back • ctrl+c: quit"))
 		return b.String()
 	}
 
@@ -268,7 +268,7 @@ func (m *AnalyticsModel) View() string {
 	if m.ready {
 		scrollPercent = int(m.viewport.ScrollPercent() * 100)
 	}
-	b.WriteString(helpStyle.Render(fmt.Sprintf("←/→ or 1-4: tabs • ↑/↓: scroll • %d%% • r: refresh • esc: back", scrollPercent)))
+	b.WriteString(helpStyle.Render(fmt.Sprintf("←/→ or 1-4: tabs • ↑/↓: scroll • %d%% • r: refresh • esc/q: back • ctrl+c: quit", scrollPercent)))
 
 	return b.String()
 }

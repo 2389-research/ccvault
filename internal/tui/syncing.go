@@ -289,6 +289,11 @@ func (m *SyncingModel) View() string {
 		b.WriteString("\n")
 	}
 
+	// A running sync is interruptible, which was not discoverable anywhere:
+	// esc/q leaves the view and cancels the sync, ctrl+c quits outright.
+	b.WriteString("\n")
+	b.WriteString(helpStyle.Render("esc/q: back • ctrl+c: quit"))
+
 	return b.String()
 }
 
