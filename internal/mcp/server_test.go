@@ -117,9 +117,9 @@ func TestSearchConversations_EmptyResultsIncludeHint(t *testing.T) {
 		t.Fatalf("searchConversations: %v", err)
 	}
 
-	m := result.(map[string]interface{})
-	if m["count"].(int) != 0 {
-		t.Fatalf("count = %v, want 0", m["count"])
+	m := resultMap(t, result)
+	if count := mustInt(t, m, "count"); count != 0 {
+		t.Fatalf("count = %v, want 0", count)
 	}
 	hint, _ := m["hint"].(string)
 	if hint == "" {
@@ -141,8 +141,8 @@ func TestSearchConversations_ResultsHaveNoHint(t *testing.T) {
 		t.Fatalf("searchConversations: %v", err)
 	}
 
-	m := result.(map[string]interface{})
-	if m["count"].(int) == 0 {
+	m := resultMap(t, result)
+	if mustInt(t, m, "count") == 0 {
 		t.Fatal("expected results for 'hello'")
 	}
 	if _, present := m["hint"]; present {
@@ -161,9 +161,9 @@ func TestListSessions_ReportsHasMore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listSessions: %v", err)
 	}
-	m := result.(map[string]interface{})
-	if m["count"].(int) != 2 {
-		t.Errorf("count = %v, want 2", m["count"])
+	m := resultMap(t, result)
+	if count := mustInt(t, m, "count"); count != 2 {
+		t.Errorf("count = %v, want 2", count)
 	}
 	if m["has_more"] != true {
 		t.Error("expected has_more=true when sessions exceed limit")
@@ -176,7 +176,7 @@ func TestListSessions_ReportsHasMore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listSessions all: %v", err)
 	}
-	mAll := all.(map[string]interface{})
+	mAll := resultMap(t, all)
 	if _, present := mAll["has_more"]; present {
 		t.Error("has_more should be absent when everything fit")
 	}
@@ -193,15 +193,15 @@ func TestListSessions_PaginatesWithOffset(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listSessions page 1: %v", err)
 	}
-	m1 := first.(map[string]interface{})
+	m1 := resultMap(t, first)
 	if m1["offset"] != 0 || m1["limit"] != 2 {
 		t.Errorf("page 1: offset/limit = %v/%v, want 0/2", m1["offset"], m1["limit"])
 	}
-	// Fatal, not just an error: page 2 is fetched with this value, so
-	// continuing past a missing next_offset would panic on the type
-	// assertion below instead of reporting what went wrong.
-	if m1["next_offset"] != 2 {
-		t.Fatalf("page 1: next_offset = %v, want 2", m1["next_offset"])
+	// Fatal, not just an error: page 2 is fetched with this value, so a
+	// wrong next_offset makes every assertion below meaningless.
+	nextOffset := mustInt(t, m1, "next_offset")
+	if nextOffset != 2 {
+		t.Fatalf("page 1: next_offset = %v, want 2", nextOffset)
 	}
 	if hint, _ := m1["hint"].(string); !strings.Contains(hint, "offset") {
 		t.Errorf("page 1 hint should point at offset paging, got %q", hint)
@@ -209,14 +209,14 @@ func TestListSessions_PaginatesWithOffset(t *testing.T) {
 
 	second, err := s.listSessions(map[string]interface{}{
 		"limit":  float64(2),
-		"offset": float64(m1["next_offset"].(int)),
+		"offset": float64(nextOffset),
 	})
 	if err != nil {
 		t.Fatalf("listSessions page 2: %v", err)
 	}
-	m2 := second.(map[string]interface{})
-	if m2["count"].(int) != 1 {
-		t.Errorf("page 2: count = %v, want 1", m2["count"])
+	m2 := resultMap(t, second)
+	if count := mustInt(t, m2, "count"); count != 1 {
+		t.Errorf("page 2: count = %v, want 1", count)
 	}
 	if m2["offset"] != 2 {
 		t.Errorf("page 2: offset = %v, want 2", m2["offset"])
@@ -228,8 +228,8 @@ func TestListSessions_PaginatesWithOffset(t *testing.T) {
 	// The two pages must tile the set with no gaps or repeats.
 	seen := map[string]bool{}
 	for _, page := range []map[string]interface{}{m1, m2} {
-		for _, ref := range page["sessions"].([]map[string]any) {
-			id := ref["id"].(string)
+		for _, ref := range mustRefs(t, page, "sessions") {
+			id := mustString(t, ref, "id")
 			if seen[id] {
 				t.Errorf("session %s appeared on two pages", id)
 			}
@@ -245,8 +245,9 @@ func TestListSessions_PaginatesWithOffset(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listSessions past end: %v", err)
 	}
-	if mPast := past.(map[string]interface{}); mPast["count"].(int) != 0 {
-		t.Errorf("offset past end: count = %v, want 0", mPast["count"])
+	mPast := resultMap(t, past)
+	if count := mustInt(t, mPast, "count"); count != 0 {
+		t.Errorf("offset past end: count = %v, want 0", count)
 	}
 }
 
@@ -260,14 +261,15 @@ func TestListProjects_PaginatesWithOffset(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listProjects page 1: %v", err)
 	}
-	m1 := first.(map[string]interface{})
+	m1 := resultMap(t, first)
 	if m1["offset"] != 0 || m1["limit"] != 2 {
 		t.Errorf("page 1: offset/limit = %v/%v, want 0/2", m1["offset"], m1["limit"])
 	}
 	// Fatal for the same reason as in TestListSessions_PaginatesWithOffset:
 	// the value is used to fetch page 2.
-	if m1["next_offset"] != 2 {
-		t.Fatalf("page 1: next_offset = %v, want 2", m1["next_offset"])
+	nextOffset := mustInt(t, m1, "next_offset")
+	if nextOffset != 2 {
+		t.Fatalf("page 1: next_offset = %v, want 2", nextOffset)
 	}
 	if hint, _ := m1["hint"].(string); !strings.Contains(hint, "offset") {
 		t.Errorf("page 1 hint should point at offset paging, got %q", hint)
@@ -275,14 +277,14 @@ func TestListProjects_PaginatesWithOffset(t *testing.T) {
 
 	second, err := s.listProjects(map[string]interface{}{
 		"limit":  float64(2),
-		"offset": float64(m1["next_offset"].(int)),
+		"offset": float64(nextOffset),
 	})
 	if err != nil {
 		t.Fatalf("listProjects page 2: %v", err)
 	}
-	m2 := second.(map[string]interface{})
-	if m2["count"].(int) != 1 {
-		t.Errorf("page 2: count = %v, want 1", m2["count"])
+	m2 := resultMap(t, second)
+	if count := mustInt(t, m2, "count"); count != 1 {
+		t.Errorf("page 2: count = %v, want 1", count)
 	}
 	if _, present := m2["has_more"]; present {
 		t.Error("page 2 exhausts the set; has_more should be absent")
@@ -290,8 +292,8 @@ func TestListProjects_PaginatesWithOffset(t *testing.T) {
 
 	seen := map[string]bool{}
 	for _, page := range []map[string]interface{}{m1, m2} {
-		for _, ref := range page["projects"].([]map[string]any) {
-			path := ref["path"].(string)
+		for _, ref := range mustRefs(t, page, "projects") {
+			path := mustString(t, ref, "path")
 			if seen[path] {
 				t.Errorf("project %s appeared on two pages", path)
 			}
@@ -312,9 +314,9 @@ func TestListProjects_ReportsHasMoreAndClampsLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listProjects: %v", err)
 	}
-	m := result.(map[string]interface{})
-	if m["count"].(int) != 1 {
-		t.Errorf("count = %v, want 1", m["count"])
+	m := resultMap(t, result)
+	if count := mustInt(t, m, "count"); count != 1 {
+		t.Errorf("count = %v, want 1", count)
 	}
 	if m["has_more"] != true {
 		t.Error("expected has_more=true when projects exceed limit")
@@ -325,9 +327,9 @@ func TestListProjects_ReportsHasMoreAndClampsLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listProjects limit 0: %v", err)
 	}
-	mZero := zero.(map[string]interface{})
-	if mZero["count"].(int) != 2 {
-		t.Errorf("limit 0: count = %v, want 2 (default limit applied)", mZero["count"])
+	mZero := resultMap(t, zero)
+	if count := mustInt(t, mZero, "count"); count != 2 {
+		t.Errorf("limit 0: count = %v, want 2 (default limit applied)", count)
 	}
 	if mZero["limit"] != 50 {
 		t.Errorf("limit 0: limit = %v, want 50 (default)", mZero["limit"])
@@ -343,7 +345,7 @@ func TestListProjects_ReportsHasMoreAndClampsLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listProjects limit 200: %v", err)
 	}
-	mBig := big.(map[string]interface{})
+	mBig := resultMap(t, big)
 	if mBig["limit"] != 100 {
 		t.Errorf("limit 200: limit = %v, want 100 (clamped)", mBig["limit"])
 	}
@@ -359,7 +361,7 @@ func TestGetSessionSummary_WarnsWhenProjectMissing(t *testing.T) {
 		t.Fatalf("getSessionSummary: %v", err)
 	}
 
-	m := result.(map[string]interface{})
+	m := resultMap(t, result)
 	warnings, ok := m["warnings"].([]string)
 	if !ok || len(warnings) == 0 {
 		t.Fatalf("expected warnings about missing project, got %#v", m["warnings"])
@@ -381,7 +383,7 @@ func TestGetSessionSummary_NoWarningsWhenProjectExists(t *testing.T) {
 		t.Fatalf("getSessionSummary: %v", err)
 	}
 
-	m := result.(map[string]interface{})
+	m := resultMap(t, result)
 	if _, present := m["warnings"]; present {
 		t.Errorf("healthy session should have no warnings, got %#v", m["warnings"])
 	}
@@ -399,7 +401,7 @@ func TestGetSession_WarnsWhenProjectMissing(t *testing.T) {
 		t.Fatalf("getSession: %v", err)
 	}
 
-	m := result.(map[string]interface{})
+	m := resultMap(t, result)
 	warnings, ok := m["warnings"].([]string)
 	if !ok || len(warnings) == 0 {
 		t.Fatalf("expected warnings about missing project, got %#v", m["warnings"])
@@ -418,7 +420,7 @@ func TestGetSession_LargeSessionNoticeIsAWarningsEntry(t *testing.T) {
 		t.Fatalf("getSession: %v", err)
 	}
 
-	m := result.(map[string]interface{})
+	m := resultMap(t, result)
 	// One place to look, not two fields with nearly identical names.
 	if _, present := m["warning"]; present {
 		t.Errorf("get_session must not emit a singular 'warning' field, got %#v", m["warning"])
@@ -438,8 +440,8 @@ func TestGetSession_LargeSessionNoticeIsAWarningsEntry(t *testing.T) {
 	if _, present := m["markdown"]; present {
 		t.Errorf("markdown should be absent when the warning says it is unavailable, got %#v", m["markdown"])
 	}
-	if m["turn_count"] != 101 {
-		t.Errorf("turn_count = %v, want 101", m["turn_count"])
+	if turnCount := mustInt(t, m, "turn_count"); turnCount != 101 {
+		t.Errorf("turn_count = %v, want 101", turnCount)
 	}
 }
 
@@ -454,7 +456,7 @@ func TestGetSession_LargeSessionAndMissingProjectShareOneWarningsArray(t *testin
 		t.Fatalf("getSession: %v", err)
 	}
 
-	m := result.(map[string]interface{})
+	m := resultMap(t, result)
 	if _, present := m["warning"]; present {
 		t.Errorf("get_session must not emit a singular 'warning' field, got %#v", m["warning"])
 	}
@@ -479,7 +481,7 @@ func TestGetAnalytics_ReportsUnavailableAnalytics(t *testing.T) {
 		t.Fatalf("getAnalytics: %v", err)
 	}
 
-	m := result.(map[string]interface{})
+	m := resultMap(t, result)
 	info, ok := m["analytics"].(map[string]interface{})
 	if !ok {
 		t.Fatalf("expected analytics availability object, got %#v", m["analytics"])
@@ -510,7 +512,7 @@ func TestGetAnalytics_LiftsStatsWarningsToTopLevel(t *testing.T) {
 		t.Fatalf("getAnalytics: %v", err)
 	}
 
-	m := result.(map[string]interface{})
+	m := resultMap(t, result)
 	warnings, ok := m["warnings"].([]string)
 	if !ok || len(warnings) == 0 {
 		t.Fatalf("result[warnings] should be a non-empty []string, got %#v", m["warnings"])
@@ -544,7 +546,7 @@ func TestGetStats_DegradedFieldsWarn(t *testing.T) {
 		t.Fatalf("getStats: %v", err)
 	}
 
-	m := result.(map[string]interface{})
+	m := resultMap(t, result)
 	warnings, ok := m["warnings"].([]string)
 	if !ok || len(warnings) != 1 {
 		t.Fatalf("expected exactly one warning, got %#v", m["warnings"])
@@ -558,8 +560,8 @@ func TestGetStats_DegradedFieldsWarn(t *testing.T) {
 		t.Errorf("top_tools should be absent when its query failed, got %#v", m["top_tools"])
 	}
 	// Core fields survive the degradation.
-	if m["sessions"].(int) != 1 {
-		t.Errorf("sessions = %v, want 1", m["sessions"])
+	if sessions := mustInt(t, m, "sessions"); sessions != 1 {
+		t.Errorf("sessions = %v, want 1", sessions)
 	}
 }
 
@@ -580,7 +582,7 @@ func TestGetStats_OmitsActivityRangeWhenUnavailable(t *testing.T) {
 		t.Fatalf("getStats: %v", err)
 	}
 
-	m := result.(map[string]interface{})
+	m := resultMap(t, result)
 	warnings, ok := m["warnings"].([]string)
 	if !ok || len(warnings) == 0 {
 		t.Fatalf("expected a warning about the activity range, got %#v", m["warnings"])
@@ -605,7 +607,7 @@ func TestGetStats_HealthyDBHasNoWarnings(t *testing.T) {
 		t.Fatalf("getStats: %v", err)
 	}
 
-	m := result.(map[string]interface{})
+	m := resultMap(t, result)
 	if _, present := m["warnings"]; present {
 		t.Errorf("healthy db should have no warnings, got %#v", m["warnings"])
 	}
