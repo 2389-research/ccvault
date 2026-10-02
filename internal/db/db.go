@@ -24,6 +24,20 @@ const (
 	// should wait it out rather than error.
 	busyTimeoutMS = 5000
 
+	// recursiveTriggersOn is PRAGMA recursive_triggers=ON as the pragma
+	// reports it back. Turns are written with INSERT OR REPLACE, and SQLite
+	// fires a REPLACE's implicit DELETE through AFTER DELETE triggers only
+	// when recursive triggers are enabled — which they are not by default. The
+	// turns_ad trigger is what removes a row's entry from the turns_fts
+	// external-content index, so with the default setting a replaced turn
+	// indexed its new content and left the old entry behind, matching text no
+	// turns row holds any more.
+	//
+	// The recursion it allows is one level deep and cannot loop: the three
+	// triggers on turns all write to turns_fts, a virtual table, and nothing
+	// writes back to turns.
+	recursiveTriggersOn = 1
+
 	// synchronousNormal is PRAGMA synchronous=NORMAL as the pragma reports
 	// it back. In WAL mode NORMAL skips the per-commit fsync and lets the OS
 	// flush at checkpoint instead, which matters because sync commits once
@@ -46,8 +60,8 @@ const (
 // honoured one from the calling code. verifyConnectionPragmas exists so the
 // next such mistake cannot be silent.
 func connectionDSN(dbPath string) string {
-	return fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(%d)&_pragma=synchronous(NORMAL)",
-		dbPath, busyTimeoutMS)
+	return fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(%d)&_pragma=synchronous(NORMAL)&_pragma=recursive_triggers(%d)",
+		dbPath, busyTimeoutMS, recursiveTriggersOn)
 }
 
 // DB wraps the SQLite database connection
@@ -125,6 +139,11 @@ func verifyConnectionPragmas(ctx context.Context, q sqlRunner) error {
 		return fmt.Errorf("read back busy_timeout: %w", err)
 	}
 
+	var recursiveTriggers int
+	if err := q.QueryRowContext(ctx, "PRAGMA recursive_triggers").Scan(&recursiveTriggers); err != nil {
+		return fmt.Errorf("read back recursive_triggers: %w", err)
+	}
+
 	var mismatches []string
 	if !strings.EqualFold(journal, "wal") {
 		mismatches = append(mismatches, fmt.Sprintf("journal_mode is %q, want wal", journal))
@@ -134,6 +153,9 @@ func verifyConnectionPragmas(ctx context.Context, q sqlRunner) error {
 	}
 	if busyTimeout != busyTimeoutMS {
 		mismatches = append(mismatches, fmt.Sprintf("busy_timeout is %d, want %d", busyTimeout, busyTimeoutMS))
+	}
+	if recursiveTriggers != recursiveTriggersOn {
+		mismatches = append(mismatches, fmt.Sprintf("recursive_triggers is %d, want %d", recursiveTriggers, recursiveTriggersOn))
 	}
 
 	if len(mismatches) > 0 {
@@ -167,10 +189,12 @@ func (db *DB) Close() error {
 // from a clean slate. It is the archive's only destructive operation; ordinary
 // and `--full` syncs never call it.
 // Schema (tables, triggers, FTS index) is left in place — migrations own
-// its lifecycle. Deleting turns cascades to turns_fts via the AFTER DELETE
-// trigger, so no FTS drop is needed here.
+// its lifecycle. Deleting turns clears their turns_fts entries via the AFTER
+// DELETE trigger, but only for rows that still exist: an orphaned index entry
+// has no turns row to delete and would survive the wipe and the re-sync after
+// it. The explicit 'delete-all' is what makes the clean slate actually clean.
 //
-// The five DELETEs run inside a single transaction so mid-reset failure
+// The DELETEs run inside a single transaction so mid-reset failure
 // (disk full, SIGKILL, SQLITE_BUSY on a WAL-mode writer collision) rolls
 // back to the pre-reset state. Otherwise a partial reset would leave
 // tool_uses empty but turns still populated, and the per-session /
@@ -192,6 +216,11 @@ func (db *DB) ResetAllContext(ctx context.Context) error {
 			if _, err := tx.Exec("DELETE FROM " + table); err != nil {
 				return fmt.Errorf("delete from %s: %w", table, err)
 			}
+		}
+		// Empty the search index outright rather than trusting that every
+		// entry had a turns row to delete it.
+		if _, err := tx.Exec("INSERT INTO turns_fts(turns_fts) VALUES('delete-all')"); err != nil {
+			return fmt.Errorf("clear turns_fts: %w", err)
 		}
 		return nil
 	})

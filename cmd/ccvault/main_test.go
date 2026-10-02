@@ -4,6 +4,7 @@
 package main
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -380,6 +381,119 @@ func TestReclaimHint(t *testing.T) {
 			}
 			if tt.wantHint && !strings.Contains(hint, "ccvault vacuum") {
 				t.Errorf("hint %q does not name 'ccvault vacuum'", hint)
+			}
+		})
+	}
+}
+
+func TestIntegrityJSON_ReportsDriftAndVerdict(t *testing.T) {
+	// Three index entries whose turn row is gone, out of an otherwise
+	// fully-indexed archive.
+	out := integrityJSON(db.FTSIntegrity{Turns: 1_200_000, Indexed: 1_200_003, Orphaned: 3})
+
+	wantInt := map[string]int64{
+		"turns":     1_200_000,
+		"indexed":   1_200_003,
+		"orphaned":  3,
+		"unindexed": 0,
+	}
+	for key, want := range wantInt {
+		got, ok := out[key].(int64)
+		if !ok {
+			t.Errorf("%s = %#v, want an int64", key, out[key])
+			continue
+		}
+		if got != want {
+			t.Errorf("%s = %d, want %d", key, got, want)
+		}
+	}
+	if consistent, ok := out["consistent"].(bool); !ok || consistent {
+		t.Errorf("consistent = %#v, want false", out["consistent"])
+	}
+
+	clean := integrityJSON(db.FTSIntegrity{Turns: 1_200_000, Indexed: 1_200_000})
+	if consistent, ok := clean["consistent"].(bool); !ok || !consistent {
+		t.Errorf("consistent = %#v for an index in step, want true", clean["consistent"])
+	}
+}
+
+// captureStdout runs fn with os.Stdout redirected and returns what it wrote.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	orig := os.Stdout
+	os.Stdout = w
+
+	done := make(chan string, 1)
+	go func() {
+		var sb strings.Builder
+		_, _ = io.Copy(&sb, r)
+		done <- sb.String()
+	}()
+
+	fn()
+
+	os.Stdout = orig
+	if err := w.Close(); err != nil {
+		t.Fatalf("close pipe writer: %v", err)
+	}
+	out := <-done
+	if err := r.Close(); err != nil {
+		t.Fatalf("close pipe reader: %v", err)
+	}
+	return out
+}
+
+// The search-index section is the only thing that makes FTS drift visible, so
+// what it prints is the feature.
+func TestPrintIntegritySection(t *testing.T) {
+	tests := []struct {
+		name      string
+		integrity db.FTSIntegrity
+		wantLines []string
+		omitLines []string
+	}{
+		{
+			name:      "a healthy index reports its size and nothing else",
+			integrity: db.FTSIntegrity{Turns: 4200, Indexed: 4200},
+			wantLines: []string{"Search index:", "4200 of 4200 turns"},
+			omitLines: []string{"Orphaned", "Unindexed", "sync --rebuild"},
+		},
+		{
+			name:      "ghost entries are named and the repair is spelled out",
+			integrity: db.FTSIntegrity{Turns: 4200, Indexed: 4203, Orphaned: 3},
+			wantLines: []string{"Orphaned:", "3 entries", "ccvault sync --rebuild"},
+			omitLines: []string{"Unindexed"},
+		},
+		{
+			name:      "turns the index never got are named too",
+			integrity: db.FTSIntegrity{Turns: 4200, Indexed: 4190},
+			wantLines: []string{"Unindexed:", "10 turns", "ccvault sync --rebuild"},
+			omitLines: []string{"Orphaned"},
+		},
+		{
+			name:      "an empty archive prints no section at all",
+			integrity: db.FTSIntegrity{},
+			omitLines: []string{"Search index"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out := captureStdout(t, func() { printIntegritySection(tt.integrity) })
+			for _, want := range tt.wantLines {
+				if !strings.Contains(out, want) {
+					t.Errorf("output does not contain %q:\n%s", want, out)
+				}
+			}
+			for _, omit := range tt.omitLines {
+				if strings.Contains(out, omit) {
+					t.Errorf("output unexpectedly contains %q:\n%s", omit, out)
+				}
 			}
 		})
 	}

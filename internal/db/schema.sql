@@ -80,7 +80,14 @@ CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(
     content_rowid='rowid'
 );
 
--- Triggers to keep FTS in sync
+-- Triggers to keep FTS in sync.
+--
+-- turns_ad depends on PRAGMA recursive_triggers being ON, which ccvault's
+-- connection DSN sets and verifyConnectionPragmas asserts. Turns are written
+-- with INSERT OR REPLACE, and SQLite fires a REPLACE's implicit DELETE
+-- through an AFTER DELETE trigger only when recursive triggers are enabled.
+-- With the default setting a replaced turn indexes its new content and leaves
+-- the old entry in turns_fts, matching text no turns row holds any more.
 CREATE TRIGGER IF NOT EXISTS turns_ai AFTER INSERT ON turns BEGIN
     INSERT INTO turns_fts(rowid, content) VALUES (new.rowid, new.content);
 END;

@@ -1469,3 +1469,272 @@ func TestGetTurns_DropsInvalidRawJSON(t *testing.T) {
 		t.Errorf("json.Marshal(turns) crashed with invalid raw_json still in-place: %v", err)
 	}
 }
+
+// sessions.project_id is nullable, so every read path has to survive a NULL.
+// A session with no project reads back with ProjectID 0 — the value every
+// caller in the tree already tests for with `ProjectID > 0`.
+func TestSessionReadPathsToleratesNullProjectID(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	// A project that is NOT this session's, so a read path that silently
+	// picked "some project" instead of "no project" would be caught.
+	other := &models.Project{Path: "/proj/present", DisplayName: "present"}
+	if err := db.UpsertProject(other); err != nil {
+		t.Fatalf("upsert project: %v", err)
+	}
+
+	const sourceFile = "/proj/orphan/session.jsonl"
+	// Written with raw SQL because UpsertSession can't produce a NULL
+	// project_id — models.Session.ProjectID is an int64. MergeFrom can, and
+	// does; see TestMergeFrom_SessionWithMissingProjectRowStaysReadable.
+	//
+	// Every other column is filled in the way MergeFrom would carry it over
+	// from a source archive written by UpsertSession, so this row differs from
+	// a healthy one in exactly one place. model and git_branch are nullable
+	// too and are still scanned into plain strings; that is a separate defect
+	// from this one and keeping it out of this row keeps the test pointed at
+	// project_id.
+	_, err := db.Exec(
+		`INSERT INTO sessions (id, project_id, started_at, ended_at, model, git_branch,
+			turn_count, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+			source_file, source)
+		 VALUES ('orphan-session', NULL, ?, ?, 'claude-opus-5', 'main', 2, 10, 5, 0, 0, ?, 'claude-code')`,
+		time.Now().Add(-time.Hour), time.Now(), sourceFile)
+	if err != nil {
+		t.Fatalf("insert orphan session: %v", err)
+	}
+
+	s, err := db.GetSession("orphan-session")
+	if err != nil {
+		t.Fatalf("GetSession on NULL project_id: %v", err)
+	}
+	if s == nil {
+		t.Fatal("GetSession returned no session for an existing row")
+	}
+	if s.ProjectID != 0 {
+		t.Errorf("GetSession ProjectID = %d, want 0 for a NULL project_id", s.ProjectID)
+	}
+
+	byFile, err := db.GetSessionBySourceFile(sourceFile)
+	if err != nil {
+		t.Fatalf("GetSessionBySourceFile on NULL project_id: %v", err)
+	}
+	if byFile == nil {
+		t.Fatal("GetSessionBySourceFile returned no session for an existing row")
+	}
+	if byFile.ProjectID != 0 {
+		t.Errorf("GetSessionBySourceFile ProjectID = %d, want 0", byFile.ProjectID)
+	}
+
+	page, err := db.GetSessionsPage(0, 0, 0)
+	if err != nil {
+		t.Fatalf("GetSessionsPage with a NULL project_id row present: %v", err)
+	}
+	if len(page) != 1 {
+		t.Fatalf("GetSessionsPage returned %d sessions, want 1", len(page))
+	}
+	if page[0].ProjectID != 0 {
+		t.Errorf("GetSessionsPage ProjectID = %d, want 0", page[0].ProjectID)
+	}
+	if page[0].ProjectPath != "" {
+		t.Errorf("GetSessionsPage ProjectPath = %q, want empty for a session with no project", page[0].ProjectPath)
+	}
+
+	// Filtering by a real project must not pick up the orphan. Guards the
+	// obvious wrong fix: coalescing NULL to a project id.
+	filtered, err := db.GetSessionsPage(other.ID, 0, 0)
+	if err != nil {
+		t.Fatalf("GetSessionsPage filtered: %v", err)
+	}
+	if len(filtered) != 0 {
+		t.Errorf("project %d has %d sessions, want 0 — the orphan was mis-attributed", other.ID, len(filtered))
+	}
+}
+
+// seedSessionForMove returns a session value pointed at sourceFile, with a
+// project row already in place.
+func seedSessionForMove(t *testing.T, db *DB, sourceFile string) *models.Session {
+	t.Helper()
+
+	p := &models.Project{Path: "/proj/moved", DisplayName: "moved"}
+	if err := db.UpsertProject(p); err != nil {
+		t.Fatalf("upsert project: %v", err)
+	}
+	return &models.Session{
+		ID:         "session-moved",
+		ProjectID:  p.ID,
+		StartedAt:  time.Now().Add(-time.Hour),
+		EndedAt:    time.Now(),
+		SourceFile: sourceFile,
+		Source:     "claude-code",
+	}
+}
+
+func sourceFilePaths(t *testing.T, db *DB) []string {
+	t.Helper()
+
+	rows, err := db.Query("SELECT path FROM source_files ORDER BY path")
+	if err != nil {
+		t.Fatalf("query source_files: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var paths []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			t.Fatalf("scan source_files: %v", err)
+		}
+		paths = append(paths, p)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate source_files: %v", err)
+	}
+	return paths
+}
+
+// A session whose file moves on disk must end up pointing at the new path,
+// and the source_files row for the path it left behind must go. Otherwise the
+// row points at a dead path forever and the orphaned source_files entry
+// inflates the "sessions with no source file on disk" count that
+// `sync --rebuild` shows, making a rebuild look more destructive than it is.
+func TestUpsertSession_FollowsMovedSourceFile(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	dir := t.TempDir()
+	oldPath := filepath.Join(dir, "old.jsonl")
+	newPath := filepath.Join(dir, "new.jsonl")
+	if err := os.WriteFile(oldPath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("write session file: %v", err)
+	}
+
+	s := seedSessionForMove(t, db, oldPath)
+	if err := db.UpsertSession(s); err != nil {
+		t.Fatalf("upsert at old path: %v", err)
+	}
+	if err := db.UpsertSourceFileMtime(oldPath, time.Now(), "claude-code"); err != nil {
+		t.Fatalf("record old mtime: %v", err)
+	}
+
+	// The move itself: the old path stops existing.
+	if err := os.Rename(oldPath, newPath); err != nil {
+		t.Fatalf("move session file: %v", err)
+	}
+
+	s.SourceFile = newPath
+	if err := db.UpsertSession(s); err != nil {
+		t.Fatalf("upsert at new path: %v", err)
+	}
+	if err := db.UpsertSourceFileMtime(newPath, time.Now(), "claude-code"); err != nil {
+		t.Fatalf("record new mtime: %v", err)
+	}
+
+	got, err := db.GetSession(s.ID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if got.SourceFile != newPath {
+		t.Errorf("sessions.source_file = %q, want %q", got.SourceFile, newPath)
+	}
+
+	byNew, err := db.GetSessionBySourceFile(newPath)
+	if err != nil {
+		t.Fatalf("GetSessionBySourceFile(new): %v", err)
+	}
+	if byNew == nil {
+		t.Error("session not reachable by its new source file")
+	}
+	byOld, err := db.GetSessionBySourceFile(oldPath)
+	if err != nil {
+		t.Fatalf("GetSessionBySourceFile(old): %v", err)
+	}
+	if byOld != nil {
+		t.Errorf("session still reachable by its old source file %q", oldPath)
+	}
+
+	paths := sourceFilePaths(t, db)
+	if len(paths) != 1 || paths[0] != newPath {
+		t.Errorf("source_files = %v, want only %q — the superseded row survived", paths, newPath)
+	}
+}
+
+// Making source_file updatable also made it clobberable. An upsert carrying
+// no path must not erase a good one: sessionsWithoutSourceFiles skips rows
+// whose source_file is the empty string, so an empty value would drop the
+// session out of `sync --rebuild`'s safety count entirely — the opposite of
+// what #38 is for.
+func TestUpsertSession_EmptySourceFileDoesNotClobberAGoodPath(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+	if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("write session file: %v", err)
+	}
+
+	s := seedSessionForMove(t, db, path)
+	if err := db.UpsertSession(s); err != nil {
+		t.Fatalf("upsert with a path: %v", err)
+	}
+	if err := db.UpsertSourceFileMtime(path, time.Now(), "claude-code"); err != nil {
+		t.Fatalf("record mtime: %v", err)
+	}
+
+	s.SourceFile = ""
+	if err := db.UpsertSession(s); err != nil {
+		t.Fatalf("upsert with an empty path: %v", err)
+	}
+
+	got, err := db.GetSession(s.ID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if got.SourceFile != path {
+		t.Errorf("sessions.source_file = %q, want the original %q kept", got.SourceFile, path)
+	}
+
+	if paths := sourceFilePaths(t, db); len(paths) != 1 || paths[0] != path {
+		t.Errorf("source_files = %v, want only %q still tracked", paths, path)
+	}
+}
+
+// The counterpart: two files that both exist claiming the same session id are
+// not a move, and dropping either one's source_files row would make
+// incremental sync re-parse it on every run.
+func TestUpsertSession_KeepsTrackingBothPathsWhenOldFileStillExists(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	dir := t.TempDir()
+	first := filepath.Join(dir, "first.jsonl")
+	second := filepath.Join(dir, "second.jsonl")
+	for _, p := range []string{first, second} {
+		if err := os.WriteFile(p, []byte("{}\n"), 0o600); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
+	}
+
+	s := seedSessionForMove(t, db, first)
+	if err := db.UpsertSession(s); err != nil {
+		t.Fatalf("upsert at first path: %v", err)
+	}
+	if err := db.UpsertSourceFileMtime(first, time.Now(), "claude-code"); err != nil {
+		t.Fatalf("record first mtime: %v", err)
+	}
+
+	s.SourceFile = second
+	if err := db.UpsertSession(s); err != nil {
+		t.Fatalf("upsert at second path: %v", err)
+	}
+	if err := db.UpsertSourceFileMtime(second, time.Now(), "claude-code"); err != nil {
+		t.Fatalf("record second mtime: %v", err)
+	}
+
+	paths := sourceFilePaths(t, db)
+	if len(paths) != 2 {
+		t.Errorf("source_files = %v, want both paths tracked", paths)
+	}
+}
