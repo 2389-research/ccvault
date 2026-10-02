@@ -55,6 +55,14 @@ type Session struct {
 	// the column that carries the relationship.
 	ParentSessionID string `json:"parent_session_id,omitempty"`
 
+	// LastEntryUUID is the id of the turn at this session's highest ordinal,
+	// empty for a session with no turns. It is what lets a re-parse confirm
+	// it is resuming from the right place: if the transcript it just read
+	// does not contain this turn, the file was rewritten upstream rather
+	// than appended to, and a row count or an mtime cannot tell the
+	// difference.
+	LastEntryUUID string `json:"last_entry_uuid,omitempty"`
+
 	// SubagentCount is how many sessions name this one as their parent. It is
 	// derived at read time, not stored. Default listings show top-level
 	// sessions only, and this count is what keeps that from hiding anything:
@@ -69,11 +77,23 @@ func (s *Session) TotalTokens() int64 {
 
 // Turn represents a single entry in a conversation
 type Turn struct {
-	ID           string          `json:"id"` // UUID
-	SessionID    string          `json:"session_id"`
-	ParentID     string          `json:"parent_id,omitempty"`
-	Type         string          `json:"type"` // user, assistant, tool_use, tool_result, progress
-	Timestamp    time.Time       `json:"timestamp"`
+	ID        string    `json:"id"` // UUID
+	SessionID string    `json:"session_id"`
+	ParentID  string    `json:"parent_id,omitempty"`
+	Type      string    `json:"type"` // user, assistant, tool_use, tool_result, progress
+	Timestamp time.Time `json:"timestamp"`
+
+	// Ordinal is the turn's position within its session, counting from 0 with
+	// no gaps, over every turn type. It is the ordering key — Timestamp ties
+	// to the millisecond inside one assistant response and goes backwards
+	// when a clock skews — and the cursor a caller uses to ask for "the turns
+	// after position N".
+	//
+	// Not omitempty: ordinal 0 is the first turn of every session, and
+	// dropping it from the JSON would make the one position a consumer is
+	// most likely to start from the one position it cannot read.
+	Ordinal int `json:"ordinal"`
+
 	Content      string          `json:"content,omitempty"`  // Extracted text for search
 	RawJSON      json.RawMessage `json:"raw_json,omitempty"` // Original JSONL entry
 	InputTokens  int             `json:"input_tokens,omitempty"`

@@ -26,11 +26,13 @@ type sessionWriter interface {
 const upsertSessionSQL = `
 	INSERT INTO sessions (id, project_id, started_at, ended_at, model, git_branch,
 		turn_count, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-		source_file, source_mtime, has_error, has_subagent, source, parent_session_id)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		source_file, source_mtime, has_error, has_subagent, source, parent_session_id,
+		last_entry_uuid)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(id) DO UPDATE SET
 		ended_at = excluded.ended_at,
 		parent_session_id = COALESCE(excluded.parent_session_id, sessions.parent_session_id),
+		last_entry_uuid = COALESCE(excluded.last_entry_uuid, sessions.last_entry_uuid),
 		model = COALESCE(excluded.model, sessions.model),
 		turn_count = excluded.turn_count,
 		input_tokens = excluded.input_tokens,
@@ -73,6 +75,9 @@ func (db *DB) UpsertSessionTx(tx *sql.Tx, s *models.Session) error {
 // parent_session_id is guarded the same way, via COALESCE: an upsert that
 // doesn't know the session's parent leaves the stored link alone rather than
 // orphaning a subagent row that was correctly linked on a previous sync.
+// last_entry_uuid shares that guard for the same reason — a caller that
+// upserts a session without its turns should not blank the cursor the turns
+// established.
 //
 // Making the column updatable also made it clobberable, so the update guards
 // against an empty incoming path the same way the statement already guards
@@ -112,6 +117,7 @@ func upsertSession(w sessionWriter, s *models.Session) error {
 		s.HasSubagent,
 		source,
 		nullableString(s.ParentSessionID),
+		nullableString(s.LastEntryUUID),
 	)
 	if err != nil {
 		return fmt.Errorf("upsert session: %w", err)
@@ -179,7 +185,7 @@ func (db *DB) GetSession(id string) (*models.Session, error) {
 	query := `
 		SELECT id, project_id, started_at, ended_at, model, git_branch,
 			turn_count, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-			source_file, source, parent_session_id,
+			source_file, source, parent_session_id, last_entry_uuid,
 			(SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = sessions.id)
 		FROM sessions WHERE id = ?`
 
@@ -187,6 +193,11 @@ func (db *DB) GetSession(id string) (*models.Session, error) {
 	var endedAt sql.NullTime
 	var projectID sql.NullInt64
 	var parentSessionID sql.NullString
+	// last_entry_uuid is NULL for a session with no turns, and for every row
+	// that predates migration 008 on an archive whose sessions were emptied
+	// since. Scanned through NullString rather than straight into the string
+	// field — the mistake issue #64 records for model and git_branch.
+	var lastEntryUUID sql.NullString
 	err := db.QueryRow(query, id).Scan(
 		&s.ID,
 		&projectID,
@@ -202,6 +213,7 @@ func (db *DB) GetSession(id string) (*models.Session, error) {
 		&s.SourceFile,
 		&s.Source,
 		&parentSessionID,
+		&lastEntryUUID,
 		&s.SubagentCount,
 	)
 	if err == sql.ErrNoRows {
@@ -212,10 +224,36 @@ func (db *DB) GetSession(id string) (*models.Session, error) {
 	}
 	s.ProjectID = projectID.Int64
 	s.ParentSessionID = parentSessionID.String
+	s.LastEntryUUID = lastEntryUUID.String
 	if endedAt.Valid {
 		s.EndedAt = endedAt.Time
 	}
 	return s, nil
+}
+
+// SessionLastEntryUUIDTx returns the turn id a session row stores as its
+// last_entry_uuid, and whether it carries one at all.
+//
+// Read inside the transaction that is about to replace the session's turns,
+// the stored value is the tail of the *previous* parse — which is what makes
+// it worth storing separately from the turns themselves. Comparing it against
+// the transcript just read distinguishes "this file was appended to" from
+// "this file was rewritten under me", a difference neither an mtime nor a row
+// count can see.
+//
+// false, not the empty string, for a session with no stored tail: a session
+// that has never held a turn is a different thing from one whose tail is
+// unknown, and the caller must not treat the first as a mismatch.
+func (db *DB) SessionLastEntryUUIDTx(tx *sql.Tx, sessionID string) (string, bool, error) {
+	var stored sql.NullString
+	err := tx.QueryRow("SELECT last_entry_uuid FROM sessions WHERE id = ?", sessionID).Scan(&stored)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("read last entry uuid for session %s: %w", sessionID, err)
+	}
+	return stored.String, stored.Valid, nil
 }
 
 // SubagentScope selects which rows a session listing returns.

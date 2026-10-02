@@ -291,6 +291,7 @@ func TestTurnCRUD(t *testing.T) {
 			SessionID: s.ID,
 			Type:      "user",
 			Timestamp: time.Now(),
+			Ordinal:   0,
 			Content:   "Hello, can you help me with Go programming?",
 		},
 		{
@@ -299,6 +300,7 @@ func TestTurnCRUD(t *testing.T) {
 			ParentID:  "turn-1",
 			Type:      "assistant",
 			Timestamp: time.Now().Add(time.Second),
+			Ordinal:   1,
 			Content:   "Of course! I'd be happy to help with Go programming.",
 		},
 	}
@@ -341,9 +343,9 @@ func TestFullTextSearch(t *testing.T) {
 	_ = db.UpsertSession(s)
 
 	turns := []models.Turn{
-		{ID: "turn-1", SessionID: s.ID, Type: "user", Timestamp: time.Now(), Content: "How do I implement a REST API in Go?"},
-		{ID: "turn-2", SessionID: s.ID, Type: "assistant", Timestamp: time.Now(), Content: "You can use the net/http package or a framework like Gin."},
-		{ID: "turn-3", SessionID: s.ID, Type: "user", Timestamp: time.Now(), Content: "What about database connections?"},
+		{ID: "turn-1", SessionID: s.ID, Type: "user", Timestamp: time.Now(), Ordinal: 0, Content: "How do I implement a REST API in Go?"},
+		{ID: "turn-2", SessionID: s.ID, Type: "assistant", Timestamp: time.Now(), Ordinal: 1, Content: "You can use the net/http package or a framework like Gin."},
+		{ID: "turn-3", SessionID: s.ID, Type: "user", Timestamp: time.Now(), Ordinal: 2, Content: "What about database connections?"},
 	}
 	_ = db.InsertTurns(turns)
 
@@ -1420,19 +1422,18 @@ func TestGetTurns_DropsInvalidRawJSON(t *testing.T) {
 		{"turn-invalid-nonjson", `not json at all`},
 		{"turn-empty", ``}, // empty stored as NULL — sql.NullString.Valid=false, skipped
 	}
-	for _, r := range rows {
+	for i, r := range rows {
 		var rawJSON sql.NullString
 		if r.raw != "" {
 			rawJSON = sql.NullString{String: r.raw, Valid: true}
 		}
 		_, err := db.Exec(
-			`INSERT INTO turns (id, session_id, type, timestamp, content, raw_json)
-			 VALUES (?, ?, 'user', ?, 'placeholder', ?)`,
-			r.id, s.ID, now, rawJSON)
+			`INSERT INTO turns (id, session_id, type, timestamp, ordinal, content, raw_json)
+			 VALUES (?, ?, 'user', ?, ?, 'placeholder', ?)`,
+			r.id, s.ID, now, i, rawJSON)
 		if err != nil {
 			t.Fatalf("insert %s: %v", r.id, err)
 		}
-		// Advance time to keep ORDER BY deterministic.
 		now = now.Add(time.Millisecond)
 	}
 

@@ -420,17 +420,50 @@ func mergeSessions(ctx context.Context, tx *sql.Tx, columns map[string][]string,
 		return fmt.Errorf("merge sessions: %w", err)
 	}
 
+	// An archive written before migration 008 has no ordinal column, and
+	// sharedColumns drops whatever the incoming database lacks — so without
+	// this every imported turn would land on the column's DEFAULT 0 and the
+	// second turn in a session would violate the unique index, turning a
+	// recovery import into a hard failure. That archive is the main thing
+	// `ccvault import` is pointed at: a copy taken off another machine, or a
+	// backup predating this column.
+	//
+	// The position is computed the same way migration 008's backfill computes
+	// it — rowid order within the session, which is the order that archive's
+	// parser read the file in. The partition is complete because the join
+	// takes a session's turns all or nothing.
 	turnCols := columns["turns"]
+	turnInsert, turnSelect := columnList(turnCols), qualify("i", turnCols)
+	if !contains(turnCols, "ordinal") {
+		turnInsert += ", " + quoteIdent("ordinal")
+		turnSelect += ", ROW_NUMBER() OVER (PARTITION BY i.session_id ORDER BY i.rowid) - 1"
+	}
 	turnQuery := fmt.Sprintf(`
 		INSERT OR REPLACE INTO main.turns (%s)
 		SELECT %s FROM incoming.turns i
 		JOIN temp.merge_pick k ON k.id = i.session_id`,
-		columnList(turnCols), qualify("i", turnCols))
+		turnInsert, turnSelect)
 	res, err := tx.ExecContext(ctx, turnQuery)
 	if err != nil {
 		return fmt.Errorf("merge turns: %w", err)
 	}
 	stats.TurnsInserted, _ = res.RowsAffected()
+
+	// Same gap on the sessions side, and the turns just landed, so the cursor
+	// is derivable rather than lost. Only ever fills a blank: a session whose
+	// incoming row carried the column keeps what it brought.
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE main.sessions
+		SET last_entry_uuid = (
+			SELECT t.id FROM main.turns t
+			WHERE t.session_id = main.sessions.id
+			ORDER BY t.ordinal DESC
+			LIMIT 1
+		)
+		WHERE id IN (SELECT id FROM temp.merge_pick)
+		  AND last_entry_uuid IS NULL`); err != nil {
+		return fmt.Errorf("fill last_entry_uuid for merged sessions: %w", err)
+	}
 
 	// tool_uses.id is a local autoincrement key; the destination assigns its own.
 	toolCols := without(columns["tool_uses"], "id")
