@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -1264,6 +1265,96 @@ func TestBackupTo_ProducesCompleteRestorablePortableCopy(t *testing.T) {
 	// still finds the seeded turn.
 	var ftsCount int
 	if err := backupSQL.QueryRow("SELECT COUNT(*) FROM turns_fts WHERE turns_fts MATCH ?", "backupcontentcanarytoken").Scan(&ftsCount); err != nil {
+		t.Fatalf("backup FTS query: %v", err)
+	}
+	if ftsCount != 1 {
+		t.Errorf("backup FTS match count = %d, want 1", ftsCount)
+	}
+}
+
+// TestBackupTo_CapturesUncheckpointedWALContent is the question WAL mode
+// raises about every backup: the source's most recent commits may live only
+// in the -wal sidecar, not in the main database file. A backup taken with a
+// file copy would miss them. VACUUM INTO reads through SQL, so it sees the
+// WAL — this pins that, and pins the deliberate consequence that the backup
+// itself is a single rollback-journal file with no sidecars of its own, which
+// is what makes "copy this one file back over the live database" a valid
+// restore procedure.
+func TestBackupTo_CapturesUncheckpointedWALContent(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	var mode string
+	if err := db.QueryRow("PRAGMA journal_mode").Scan(&mode); err != nil {
+		t.Fatalf("read journal_mode: %v", err)
+	}
+	if !strings.EqualFold(mode, "wal") {
+		t.Fatalf("source journal_mode = %q, want wal; this test is about WAL sources", mode)
+	}
+
+	p := &models.Project{Path: "/proj/wal", DisplayName: "wal"}
+	if err := db.UpsertProject(p); err != nil {
+		t.Fatalf("upsert project: %v", err)
+	}
+	s := &models.Session{
+		ID: "session-wal", ProjectID: p.ID,
+		StartedAt: time.Now(), SourceFile: "/proj/wal/session.jsonl",
+	}
+	if err := db.UpsertSession(s); err != nil {
+		t.Fatalf("upsert session: %v", err)
+	}
+	if err := db.InsertTurns([]models.Turn{{
+		ID: "turn-wal", SessionID: s.ID, Type: "user",
+		Timestamp: time.Now(), Content: "walcanarytoken",
+	}}); err != nil {
+		t.Fatalf("insert turn: %v", err)
+	}
+
+	// Deliberately no checkpoint: the writes above should still be sitting
+	// in the log, which is the condition this test exists for.
+	walPath := db.Path() + "-wal"
+	if info, err := os.Stat(walPath); err != nil {
+		t.Fatalf("expected a -wal sidecar holding the recent writes: %v", err)
+	} else if info.Size() == 0 {
+		t.Fatal("-wal sidecar is empty; the writes were already checkpointed")
+	}
+
+	backupPath := filepath.Join(t.TempDir(), "ccvault-wal-backup.db")
+	if err := db.BackupTo(backupPath); err != nil {
+		t.Fatalf("BackupTo: %v", err)
+	}
+
+	// The backup must be self-contained: no sidecars beside it.
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if _, err := os.Stat(backupPath + suffix); err == nil {
+			t.Errorf("backup has a %s sidecar; it should be a single portable file", suffix)
+		}
+	}
+
+	backupSQL, err := sql.Open("sqlite", "file:"+backupPath+"?mode=ro")
+	if err != nil {
+		t.Fatalf("open backup: %v", err)
+	}
+	t.Cleanup(func() { _ = backupSQL.Close() })
+
+	var backupMode string
+	if err := backupSQL.QueryRow("PRAGMA journal_mode").Scan(&backupMode); err != nil {
+		t.Fatalf("backup journal_mode: %v", err)
+	}
+	if strings.EqualFold(backupMode, "wal") {
+		t.Errorf("backup journal_mode = %q; VACUUM INTO is expected to produce a rollback-journal file", backupMode)
+	}
+
+	var turns int
+	if err := backupSQL.QueryRow("SELECT COUNT(*) FROM turns").Scan(&turns); err != nil {
+		t.Fatalf("backup count turns: %v", err)
+	}
+	if turns != 1 {
+		t.Errorf("backup turns = %d, want 1; uncheckpointed WAL content was lost", turns)
+	}
+
+	var ftsCount int
+	if err := backupSQL.QueryRow("SELECT COUNT(*) FROM turns_fts WHERE turns_fts MATCH ?", "walcanarytoken").Scan(&ftsCount); err != nil {
 		t.Fatalf("backup FTS query: %v", err)
 	}
 	if ftsCount != 1 {

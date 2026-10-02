@@ -6,6 +6,7 @@ package db
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -95,6 +96,83 @@ func countRows(t *testing.T, database *DB, query string, args ...interface{}) in
 		t.Fatalf("count query %q: %v", query, err)
 	}
 	return n
+}
+
+// TestMergeFrom_ReadsAnIncomingDatabaseWithAnUncheckpointedWAL covers the
+// case WAL mode adds to `ccvault import`. Every other merge test closes the
+// source first, and a clean close folds the log away — so none of them
+// exercises a source whose newest sessions exist only in its -wal sidecar.
+//
+// That is the realistic shape of the feature's main use: an archive copied
+// off another machine, or left behind by a process that died mid-sync. If
+// ATTACH read the main file alone, the merge would silently import an
+// archive missing its most recent sessions and report success.
+func TestMergeFrom_ReadsAnIncomingDatabaseWithAnUncheckpointedWAL(t *testing.T) {
+	// Build a source and copy main + sidecars away while it is still open,
+	// so the copy keeps a log that was never folded in.
+	srcDir := t.TempDir()
+	source, err := Open(srcDir)
+	if err != nil {
+		t.Fatalf("open source db: %v", err)
+	}
+	seedSession(t, source, "/proj/incoming", "session-in-wal", "walmergecanary", time.Now())
+
+	srcPath := filepath.Join(srcDir, "ccvault.db")
+	if info, err := os.Stat(srcPath + "-wal"); err != nil {
+		t.Fatalf("expected the source's writes to still be in its -wal: %v", err)
+	} else if info.Size() == 0 {
+		t.Fatal("source -wal is empty; the writes were already checkpointed")
+	}
+
+	copyDir := t.TempDir()
+	copiedPath := filepath.Join(copyDir, "ccvault.db")
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		data, err := os.ReadFile(srcPath + suffix)
+		if err != nil {
+			if os.IsNotExist(err) && suffix != "" {
+				continue
+			}
+			t.Fatalf("read source%s: %v", suffix, err)
+		}
+		if err := os.WriteFile(copiedPath+suffix, data, 0o600); err != nil {
+			t.Fatalf("write copy%s: %v", suffix, err)
+		}
+	}
+	if err := source.Close(); err != nil {
+		t.Fatalf("close source db: %v", err)
+	}
+
+	// The copy's main file alone must not contain the session, or this test
+	// would pass without ATTACH ever consulting the log.
+	if _, err := os.Stat(copiedPath + "-wal"); err != nil {
+		t.Fatalf("copied -wal missing: %v", err)
+	}
+
+	dest, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	stats, err := dest.MergeFrom(copiedPath)
+	if err != nil {
+		t.Fatalf("MergeFrom a WAL source: %v", err)
+	}
+	if stats.SessionsInserted != 1 {
+		t.Errorf("sessions inserted = %d, want 1; the incoming -wal was not read", stats.SessionsInserted)
+	}
+	if n := countRows(t, dest, "SELECT COUNT(*) FROM turns WHERE session_id = ?", "session-in-wal"); n != 1 {
+		t.Errorf("turns for session-in-wal = %d, want 1", n)
+	}
+	if n := countRows(t, dest, "SELECT COUNT(*) FROM turns_fts WHERE turns_fts MATCH ?", "walmergecanary"); n != 1 {
+		t.Errorf("FTS matches = %d, want 1", n)
+	}
+
+	// Merging must not have left the destination's own journal mode behind.
+	var mode string
+	if err := dest.QueryRow("PRAGMA journal_mode").Scan(&mode); err != nil {
+		t.Fatalf("destination journal_mode: %v", err)
+	}
+	if !strings.EqualFold(mode, "wal") {
+		t.Errorf("destination journal_mode = %q after merge, want wal", mode)
+	}
 }
 
 func TestMergeFrom_InsertsSessionsAbsentFromDestination(t *testing.T) {

@@ -81,9 +81,12 @@ func bloatDB(t *testing.T, turns, keep int) string {
 	return dataDir
 }
 
-// switchToWAL puts the database into WAL mode, which is where it will be
-// once the ignored-DSN bug (#47) is fixed. journal_mode is persisted in the
-// file header, so this survives close and reopen.
+// switchToWAL asserts the database is in WAL mode rather than putting it
+// there: Open does that now. It stays because the tests that call it are
+// specifically about WAL behaviour, and they should fail at the fixture with
+// a clear message if that ever stops being true, not deep inside a
+// compaction assertion. journal_mode is persisted in the file header, so it
+// survives close and reopen.
 func switchToWAL(t *testing.T, dataDir string) {
 	t.Helper()
 
@@ -99,6 +102,27 @@ func switchToWAL(t *testing.T, dataDir string) {
 	}
 	if !strings.EqualFold(mode, "wal") {
 		t.Fatalf("journal_mode = %q after asking for WAL", mode)
+	}
+}
+
+// switchToRollbackJournal takes a fixture out of WAL. Open now puts every
+// database in WAL, so a test about rollback-journal behaviour has to ask for
+// that mode explicitly instead of relying on the default it used to get.
+func switchToRollbackJournal(t *testing.T, dataDir string) {
+	t.Helper()
+
+	pool, err := sql.Open("sqlite", "file:"+filepath.Join(dataDir, "ccvault.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer func() { _ = pool.Close() }()
+
+	var mode string
+	if err := pool.QueryRow("PRAGMA journal_mode=DELETE").Scan(&mode); err != nil {
+		t.Fatalf("set rollback journal: %v", err)
+	}
+	if strings.EqualFold(mode, "wal") {
+		t.Fatalf("journal_mode = %q after asking for DELETE", mode)
 	}
 }
 
@@ -449,7 +473,11 @@ func TestCompact_HoldsExclusiveLockWhileCopying(t *testing.T) {
 	attempted := false
 	result, err := Compact(dataDir, withAfterCopy(func(string) error {
 		attempted = true
-		other, err := sql.Open("sqlite", "file:"+dbPath+"?_busy_timeout=200")
+		// _pragma= is the only spelling modernc.org/sqlite honours; the
+		// `_busy_timeout=` form this used to carry was silently dropped,
+		// so the write failed instantly instead of waiting its 200ms and
+		// the test passed without ever exercising the wait (#47).
+		other, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=busy_timeout(200)")
 		if err != nil {
 			return err
 		}
@@ -504,11 +532,66 @@ func TestCompact_RefusesWhileAnotherReaderHoldsTheDatabase(t *testing.T) {
 	if err := tx.Rollback(); err != nil {
 		t.Fatalf("rollback reader: %v", err)
 	}
+	// Closing, not just ending the transaction: in WAL mode an open
+	// connection keeps the -shm index mapped, which is enough on its own to
+	// deny the exclusive lock. See
+	// TestCompact_RefusesWhileAnIdleConnectionHoldsTheWALIndex.
+	if err := reader.Close(); err != nil {
+		t.Fatalf("close reader: %v", err)
+	}
 
 	// The refusal must leave a working database, and compaction must work
 	// once the reader has let go.
 	if _, err := Compact(dataDir); err != nil {
 		t.Fatalf("compact after reader released: %v", err)
+	}
+}
+
+// TestCompact_RefusesWhileAnIdleConnectionHoldsTheWALIndex pins how much
+// stricter compaction is in WAL mode than in rollback-journal mode.
+//
+// In rollback-journal mode an idle connection with no open transaction holds
+// no lock, so compaction proceeded. In WAL mode the first query maps the -shm
+// WAL index, and locking_mode=EXCLUSIVE needs that index to itself — so a TUI
+// or MCP server sitting idle with the database open is enough to refuse the
+// run. That is the safe answer rather than a regression (compaction deletes
+// the -wal, so it must not share it), but it is a real change in what the
+// user has to do, and the refusal has to stay a clean ErrDatabaseBusy with
+// the "close other ccvault processes" guidance rather than a raw SQLite
+// string.
+func TestCompact_RefusesWhileAnIdleConnectionHoldsTheWALIndex(t *testing.T) {
+	dataDir := bloatDB(t, 60, 5)
+	if mode := mustJournalMode(t, dataDir); !strings.EqualFold(mode, "wal") {
+		t.Fatalf("fixture journal_mode = %q, want wal; this test is about WAL semantics", mode)
+	}
+	dbPath := filepath.Join(dataDir, "ccvault.db")
+
+	idle, err := sql.Open("sqlite", "file:"+dbPath)
+	if err != nil {
+		t.Fatalf("open idle connection: %v", err)
+	}
+	defer func() { _ = idle.Close() }()
+
+	// sql.Open is lazy, so a query is what actually establishes the
+	// connection and maps the WAL index. No transaction is left open.
+	var n int
+	if err := idle.QueryRow(`SELECT COUNT(*) FROM turns`).Scan(&n); err != nil {
+		t.Fatalf("query on idle connection: %v", err)
+	}
+
+	_, err = Compact(dataDir)
+	if err == nil {
+		t.Fatal("compact succeeded while another connection held the WAL index")
+	}
+	if !errors.Is(err, ErrDatabaseBusy) {
+		t.Fatalf("compact error = %v, want ErrDatabaseBusy", err)
+	}
+
+	if err := idle.Close(); err != nil {
+		t.Fatalf("close idle connection: %v", err)
+	}
+	if _, err := Compact(dataDir); err != nil {
+		t.Fatalf("compact after the idle connection closed: %v", err)
 	}
 }
 
@@ -664,6 +747,7 @@ func TestCheckpointIfWAL_NoOpOutsideWAL(t *testing.T) {
 	dataDir := bloatDB(t, 60, 5)
 	dbPath := filepath.Join(dataDir, "ccvault.db")
 
+	switchToRollbackJournal(t, dataDir)
 	if mode := mustJournalMode(t, dataDir); strings.EqualFold(mode, "wal") {
 		t.Fatalf("fixture is in WAL mode (%q); this test needs a rollback-journal database", mode)
 	}
