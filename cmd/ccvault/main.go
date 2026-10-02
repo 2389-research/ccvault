@@ -701,6 +701,12 @@ Supports Gmail-like query syntax:
 				p = &models.Project{Path: r.ProjectPath}
 			}
 			fmt.Printf("   Project: %s\n", projectref.Inline(p))
+			// Search is never filtered, so hits land inside subagent
+			// transcripts that no default listing shows. Naming the parent
+			// is how the reader places the hit in a conversation.
+			if r.ParentSessionID != "" {
+				fmt.Printf("   Subagent of: %s\n", r.ParentSessionID)
+			}
 			if r.Model != "" {
 				fmt.Printf("   Model: %s\n", r.Model)
 			}
@@ -969,6 +975,31 @@ var listProjectsCmd = &cobra.Command{
 	},
 }
 
+// subagentScopeFromFlags maps the list-sessions flags onto a listing scope.
+// The default hides subagent sessions — on a real machine they outnumber
+// top-level sessions roughly 2.6:1 — while every row still reports how many
+// it stands for. --subagents-of beats --include-subagents because asking for
+// one parent's children is the more specific request.
+func subagentScopeFromFlags(includeSubagents bool, subagentsOf string) (db.SubagentScope, string) {
+	switch {
+	case subagentsOf != "":
+		return db.SubagentsOf, subagentsOf
+	case includeSubagents:
+		return db.SubagentsIncluded, ""
+	default:
+		return db.SubagentsHidden, ""
+	}
+}
+
+// formatSubagentCount renders the SUBS column. Zero reads as "-" rather than
+// "0" so the rows that dispatched work stand out in a long list.
+func formatSubagentCount(n int) string {
+	if n == 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%d", n)
+}
+
 var listSessionsCmd = &cobra.Command{
 	Use:   "list-sessions",
 	Short: "List sessions",
@@ -976,6 +1007,8 @@ var listSessionsCmd = &cobra.Command{
 		jsonOutput, _ := cmd.Flags().GetBool("json")
 		projectFilter, _ := cmd.Flags().GetString("project")
 		limit, _ := cmd.Flags().GetInt("limit")
+		includeSubagents, _ := cmd.Flags().GetBool("include-subagents")
+		subagentsOf, _ := cmd.Flags().GetString("subagents-of")
 
 		cfg, err := loadConfig(cmd)
 		if err != nil {
@@ -1022,7 +1055,13 @@ var listSessionsCmd = &cobra.Command{
 			}
 		}
 
-		sessions, err := database.GetSessions(projectID, limit)
+		scope, parentSessionID := subagentScopeFromFlags(includeSubagents, subagentsOf)
+		sessions, err := database.QuerySessions(db.SessionQuery{
+			ProjectID:       projectID,
+			Limit:           limit,
+			Scope:           scope,
+			ParentSessionID: parentSessionID,
+		})
 		if err != nil {
 			return fmt.Errorf("get sessions: %w", err)
 		}
@@ -1058,11 +1097,11 @@ var listSessionsCmd = &cobra.Command{
 			byPath = projectref.ProjectsByPath(allProjects)
 		}
 		if showProject {
-			fmt.Printf("%-38s %-25s %16s %6s %10s %s\n", "SESSION ID", "PROJECT", "STARTED", "TURNS", "TOKENS", "MODEL")
-			fmt.Println(strings.Repeat("-", 125))
+			fmt.Printf("%-38s %-25s %16s %6s %10s %5s %s\n", "SESSION ID", "PROJECT", "STARTED", "TURNS", "TOKENS", "SUBS", "MODEL")
+			fmt.Println(strings.Repeat("-", 131))
 		} else {
-			fmt.Printf("%-38s %16s %6s %10s %s\n", "SESSION ID", "STARTED", "TURNS", "TOKENS", "MODEL")
-			fmt.Println(strings.Repeat("-", 100))
+			fmt.Printf("%-38s %16s %6s %10s %5s %s\n", "SESSION ID", "STARTED", "TURNS", "TOKENS", "SUBS", "MODEL")
+			fmt.Println(strings.Repeat("-", 106))
 		}
 		for _, s := range sessions {
 			model := s.Model
@@ -1076,20 +1115,22 @@ var listSessionsCmd = &cobra.Command{
 				// compact.Truncate so multibyte adapter labels don't get
 				// byte-sliced (e.g. Cyrillic "Иванов-project").
 				project := compact.Truncate(projectref.LabelFromPath(s.ProjectPath, byPath), 23).Text
-				fmt.Printf("%-38s %-25s %16s %6d %10s %s\n",
+				fmt.Printf("%-38s %-25s %16s %6d %10s %5s %s\n",
 					s.ID,
 					project,
 					s.StartedAt.Format("2006-01-02 15:04"),
 					s.TurnCount,
 					formatTokens(tokens),
+					formatSubagentCount(s.SubagentCount),
 					model,
 				)
 			} else {
-				fmt.Printf("%-38s %16s %6d %10s %s\n",
+				fmt.Printf("%-38s %16s %6d %10s %5s %s\n",
 					s.ID,
 					s.StartedAt.Format("2006-01-02 15:04"),
 					s.TurnCount,
 					formatTokens(tokens),
+					formatSubagentCount(s.SubagentCount),
 					model,
 				)
 			}
@@ -1146,6 +1187,16 @@ var showCmd = &cobra.Command{
 		fmt.Printf("Model: %s\n", session.Model)
 		fmt.Printf("Started: %s\n", session.StartedAt.Format("2006-01-02 15:04:05"))
 		fmt.Printf("Turns: %d\n", len(turns))
+		// The way a reader discovers that a session dispatched work into
+		// transcripts the default listing doesn't show, and the way back up
+		// from one of those transcripts to the session that started it.
+		if session.ParentSessionID != "" {
+			fmt.Printf("Subagent of: %s\n", session.ParentSessionID)
+		}
+		if session.SubagentCount > 0 {
+			fmt.Printf("Subagents: %d (ccvault list-sessions --subagents-of %s)\n",
+				session.SubagentCount, session.ID)
+		}
 		fmt.Println(strings.Repeat("=", 60))
 		fmt.Println()
 
@@ -1456,6 +1507,8 @@ func init() {
 	listSessionsCmd.Flags().Bool("json", false, "Output as JSON")
 	listSessionsCmd.Flags().String("project", "", "Filter by project")
 	listSessionsCmd.Flags().Int("limit", 50, "Maximum number of results")
+	listSessionsCmd.Flags().Bool("include-subagents", false, "List subagent sessions alongside top-level ones")
+	listSessionsCmd.Flags().String("subagents-of", "", "List only the subagent sessions dispatched by this session id")
 
 	// Show flags
 	showCmd.Flags().Bool("json", false, "Output as JSON")
