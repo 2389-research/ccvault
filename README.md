@@ -245,6 +245,46 @@ ccvault uses sensible defaults but can be configured via environment variables:
 | `CCVAULT_CLAUDE_HOME` | `~/.claude` | Claude Code data directory |
 | `CCVAULT_DATA_DIR` | `~/.ccvault` | ccvault data directory |
 
+### Pointing ccvault at another archive
+
+Two persistent flags are available on every command:
+
+| Flag | Answers |
+|------|---------|
+| `--data-dir <path>` | Where the database lives |
+| `--config <path>` | Which config file to read |
+
+`data_dir` is resolved highest precedence first:
+
+1. `--data-dir`
+2. `CCVAULT_DATA_DIR`
+3. `data_dir = "..."` in the config file
+4. `~/.ccvault`
+
+`--data-dir` also **replaces** the config search path, so `~/.ccvault` is not
+read at all when it is given — which is what makes the CLI runnable against a
+throwaway archive in a sandbox that must not touch the real one:
+
+```bash
+mkdir -p /tmp/fixture
+printf 'claude_home = "/tmp/fixture/claude"\n' > /tmp/fixture/config.toml
+ccvault --data-dir /tmp/fixture sync
+ccvault --data-dir /tmp/fixture stats --json
+```
+
+`--config` names a single file instead of searching for one, and a path that
+does not exist is an error rather than a silent fall-back to defaults. Given
+both, `--config` decides where settings come from and `--data-dir` still wins
+for `data_dir` itself.
+
+Note that `--data-dir` redirects the **archive**, not the **source** it reads.
+`claude_home` still defaults to `~/.claude`, so a sandbox that must not read
+the real conversation files needs to redirect that too — via `claude_home` (or
+a `sources` list) in the fixture config, as above, or `CCVAULT_CLAUDE_HOME`.
+A config file that exists but cannot be parsed is now an error for the same
+reason: silently falling back to defaults would send a fixture run at the real
+`~/.claude`.
+
 ## Data Storage
 
 - **SQLite database**: `~/.ccvault/ccvault.db` - Session data with FTS5 full-text search

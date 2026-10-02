@@ -46,7 +46,51 @@ search, analytics, and AI integration.
 Similar to msgvault for email, ccvault provides:
   - Full-text search across all conversations
   - Interactive TUI for drill-down analytics
-  - MCP server for AI assistant integration`,
+  - MCP server for AI assistant integration
+
+Every command reads its archive from one data directory. Resolved highest
+precedence first:
+
+  --data-dir <path>     this flag
+  CCVAULT_DATA_DIR      environment
+  data_dir = "..."      the config file
+  ~/.ccvault            built-in default
+
+--data-dir also REPLACES the config search path, so ~/.ccvault is not read
+at all when it is given. --config names a single config file instead of
+searching for one; a path that does not exist is an error. Together they
+make the whole CLI runnable against a throwaway archive:
+
+  ccvault --data-dir /tmp/fixture sync
+  ccvault --data-dir /tmp/fixture stats --json
+
+--data-dir redirects the archive, not the source it reads: claude_home
+still defaults to ~/.claude. Set claude_home (or sources) in the fixture's
+config.toml, or CCVAULT_CLAUDE_HOME, to redirect that as well.`,
+}
+
+// loadConfig reads configuration honouring the root command's persistent
+// --config and --data-dir flags. Every subcommand goes through this rather
+// than config.Load() so that pointing ccvault at a throwaway archive works
+// uniformly — the recurring need that bare config.Load() could not meet.
+func loadConfig(cmd *cobra.Command) (*config.Config, error) {
+	// Persistent flags from the root are merged into every subcommand's
+	// flag set, so these lookups resolve from any depth.
+	configFile, _ := cmd.Flags().GetString("config")
+	dataDir, _ := cmd.Flags().GetString("data-dir")
+
+	cfg, err := config.LoadWith(config.Options{
+		ConfigFile: configFile,
+		DataDir:    dataDir,
+	})
+	if err != nil {
+		// A bad config path or a malformed config file is a plain message,
+		// not a reason to dump the flag table — that's for argument-shape
+		// errors.
+		cmd.SilenceUsage = true
+		return nil, err
+	}
+	return cfg, nil
 }
 
 var versionCmd = &cobra.Command{
@@ -67,7 +111,7 @@ var quickstartCmd = &cobra.Command{
 		fmt.Println()
 
 		// Load config
-		cfg, err := config.Load()
+		cfg, err := loadConfig(cmd)
 		if err != nil {
 			return fmt.Errorf("load config: %w", err)
 		}
@@ -275,7 +319,7 @@ Use --json for machine-readable output.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		jsonOutput, _ := cmd.Flags().GetBool("json")
 
-		cfg, err := config.Load()
+		cfg, err := loadConfig(cmd)
 		if err != nil {
 			return fmt.Errorf("load config: %w", err)
 		}
@@ -451,7 +495,7 @@ over the live DB (the path is printed at run), or merge it back in with
 		noBackup, _ := cmd.Flags().GetBool("no-backup")
 
 		// Load config
-		cfg, err := config.Load()
+		cfg, err := loadConfig(cmd)
 		if err != nil {
 			return fmt.Errorf("load config: %w", err)
 		}
@@ -571,7 +615,7 @@ var tuiCmd = &cobra.Command{
 	Short: "Launch interactive TUI",
 	Long:  `Open the interactive terminal UI for browsing and analyzing conversations.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		cfg, err := config.Load()
+		cfg, err := loadConfig(cmd)
 		if err != nil {
 			return fmt.Errorf("load config: %w", err)
 		}
@@ -605,7 +649,7 @@ Supports Gmail-like query syntax:
 		jsonOutput, _ := cmd.Flags().GetBool("json")
 		limit, _ := cmd.Flags().GetInt("limit")
 
-		cfg, err := config.Load()
+		cfg, err := loadConfig(cmd)
 		if err != nil {
 			return fmt.Errorf("load config: %w", err)
 		}
@@ -673,7 +717,7 @@ var statsCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		jsonOutput, _ := cmd.Flags().GetBool("json")
 
-		cfg, err := config.Load()
+		cfg, err := loadConfig(cmd)
 		if err != nil {
 			return fmt.Errorf("load config: %w", err)
 		}
@@ -819,7 +863,7 @@ Use --json for machine-readable output.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		jsonOutput, _ := cmd.Flags().GetBool("json")
 
-		cfg, err := config.Load()
+		cfg, err := loadConfig(cmd)
 		if err != nil {
 			return fmt.Errorf("load config: %w", err)
 		}
@@ -872,7 +916,7 @@ var listProjectsCmd = &cobra.Command{
 		sortBy, _ := cmd.Flags().GetString("sort")
 		limit, _ := cmd.Flags().GetInt("limit")
 
-		cfg, err := config.Load()
+		cfg, err := loadConfig(cmd)
 		if err != nil {
 			return fmt.Errorf("load config: %w", err)
 		}
@@ -933,7 +977,7 @@ var listSessionsCmd = &cobra.Command{
 		projectFilter, _ := cmd.Flags().GetString("project")
 		limit, _ := cmd.Flags().GetInt("limit")
 
-		cfg, err := config.Load()
+		cfg, err := loadConfig(cmd)
 		if err != nil {
 			return fmt.Errorf("load config: %w", err)
 		}
@@ -1063,7 +1107,7 @@ var showCmd = &cobra.Command{
 		sessionID := args[0]
 		jsonOutput, _ := cmd.Flags().GetBool("json")
 
-		cfg, err := config.Load()
+		cfg, err := loadConfig(cmd)
 		if err != nil {
 			return fmt.Errorf("load config: %w", err)
 		}
@@ -1150,7 +1194,7 @@ Examples:
 		includeThinking, _ := cmd.Flags().GetBool("thinking")
 		includeToolResults, _ := cmd.Flags().GetBool("tool-results")
 
-		cfg, err := config.Load()
+		cfg, err := loadConfig(cmd)
 		if err != nil {
 			return fmt.Errorf("load config: %w", err)
 		}
@@ -1239,7 +1283,7 @@ Prompts:
 
 Debug mode: Set CCVAULT_MCP_DEBUG=1 for verbose logging to stderr.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		cfg, err := config.Load()
+		cfg, err := loadConfig(cmd)
 		if err != nil {
 			return fmt.Errorf("load config: %w", err)
 		}
@@ -1265,7 +1309,7 @@ var buildCacheCmd = &cobra.Command{
 	Short: "Rebuild analytics cache",
 	Long:  `Rebuild the Parquet analytics cache for fast DuckDB queries.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		cfg, err := config.Load()
+		cfg, err := loadConfig(cmd)
 		if err != nil {
 			return fmt.Errorf("load config: %w", err)
 		}
@@ -1312,7 +1356,7 @@ or to consolidate the archives of two machines into one.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		asJSON, _ := cmd.Flags().GetBool("json")
 
-		cfg, err := config.Load()
+		cfg, err := loadConfig(cmd)
 		if err != nil {
 			return fmt.Errorf("load config: %w", err)
 		}
@@ -1355,6 +1399,15 @@ or to consolidate the archives of two machines into one.`,
 }
 
 func init() {
+	// Persistent overrides, available to every subcommand. --data-dir says
+	// where the archive lives; --config says which file to read settings
+	// from. They are separate because a config file can itself set
+	// data_dir, and because a fixture often needs one without the other.
+	rootCmd.PersistentFlags().String("data-dir", "",
+		"Data directory holding the archive. Overrides CCVAULT_DATA_DIR, the config file, and the ~/.ccvault default, and makes this directory the only place config.toml is looked for")
+	rootCmd.PersistentFlags().String("config", "",
+		"Config file to read (default: config.toml in the data directory, then ./config.toml). A path that does not exist is an error")
+
 	// Add commands
 	rootCmd.AddCommand(versionCmd)
 	rootCmd.AddCommand(quickstartCmd)
