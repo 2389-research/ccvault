@@ -67,6 +67,26 @@ func seedSession(t *testing.T, database *db.DB, sessionID string, projectID int6
 	}
 }
 
+// seedTurns appends n user turns to an existing session. Used to push a
+// session past get_session's 100-turn inline-markdown limit.
+func seedTurns(t *testing.T, database *db.DB, sessionID string, n int) {
+	t.Helper()
+
+	turns := make([]models.Turn, n)
+	for i := range turns {
+		turns[i] = models.Turn{
+			ID:        fmt.Sprintf("%s-bulk-%d", sessionID, i),
+			SessionID: sessionID,
+			Type:      "user",
+			Timestamp: time.Date(2026, 1, 1, 0, 1, 0, 0, time.UTC).Add(time.Duration(i) * time.Second),
+			Content:   fmt.Sprintf("bulk turn %d", i),
+		}
+	}
+	if err := database.InsertTurns(turns); err != nil {
+		t.Fatalf("insert %d bulk turns for %s: %v", n, sessionID, err)
+	}
+}
+
 func seedProject(t *testing.T, database *db.DB, path string) *models.Project {
 	t.Helper()
 
@@ -383,6 +403,70 @@ func TestGetSession_WarnsWhenProjectMissing(t *testing.T) {
 	warnings, ok := m["warnings"].([]string)
 	if !ok || len(warnings) == 0 {
 		t.Fatalf("expected warnings about missing project, got %#v", m["warnings"])
+	}
+}
+
+func TestGetSession_LargeSessionNoticeIsAWarningsEntry(t *testing.T) {
+	s, database := newTestServer(t)
+	p := seedProject(t, database, "/test/proj")
+	seedSession(t, database, "session-big", p.ID)
+	// seedSession already added one turn; 100 more clears the limit.
+	seedTurns(t, database, "session-big", 100)
+
+	result, err := s.getSession(map[string]interface{}{"session_id": "session-big"})
+	if err != nil {
+		t.Fatalf("getSession: %v", err)
+	}
+
+	m := result.(map[string]interface{})
+	// One place to look, not two fields with nearly identical names.
+	if _, present := m["warning"]; present {
+		t.Errorf("get_session must not emit a singular 'warning' field, got %#v", m["warning"])
+	}
+	warnings, ok := m["warnings"].([]string)
+	if !ok || len(warnings) != 1 {
+		t.Fatalf("expected exactly one warning for a large session, got %#v", m["warnings"])
+	}
+	// Same "<what> unavailable: <why>" phrasing as every other MCP warning,
+	// and it names the field the response is missing: markdown.
+	if !strings.Contains(warnings[0], "markdown unavailable:") {
+		t.Errorf("warning should read 'markdown unavailable: ...', got %q", warnings[0])
+	}
+	if !strings.Contains(warnings[0], "101 turns") {
+		t.Errorf("warning should carry the turn count, got %q", warnings[0])
+	}
+	if _, present := m["markdown"]; present {
+		t.Errorf("markdown should be absent when the warning says it is unavailable, got %#v", m["markdown"])
+	}
+	if m["turn_count"] != 101 {
+		t.Errorf("turn_count = %v, want 101", m["turn_count"])
+	}
+}
+
+func TestGetSession_LargeSessionAndMissingProjectShareOneWarningsArray(t *testing.T) {
+	s, database := newTestServer(t)
+	// No project 9999 exists, so both degradations hit the same response.
+	seedSession(t, database, "session-big-orphan", 9999)
+	seedTurns(t, database, "session-big-orphan", 100)
+
+	result, err := s.getSession(map[string]interface{}{"session_id": "session-big-orphan"})
+	if err != nil {
+		t.Fatalf("getSession: %v", err)
+	}
+
+	m := result.(map[string]interface{})
+	if _, present := m["warning"]; present {
+		t.Errorf("get_session must not emit a singular 'warning' field, got %#v", m["warning"])
+	}
+	warnings, ok := m["warnings"].([]string)
+	if !ok || len(warnings) != 2 {
+		t.Fatalf("expected both warnings in one array, got %#v", m["warnings"])
+	}
+	joined := strings.Join(warnings, "\n")
+	for _, want := range []string{"markdown unavailable:", "project 9999 unavailable:"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("warnings should include %q, got %#v", want, warnings)
+		}
 	}
 }
 

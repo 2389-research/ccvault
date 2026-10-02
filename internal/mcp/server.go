@@ -333,7 +333,7 @@ func (s *Server) handleToolsList(req *jsonRPCRequest) {
 		},
 		{
 			Name:        "get_session",
-			Description: "Get full session in markdown format. WARNING: Large sessions may be truncated. Use get_session_summary + get_turns for big sessions.",
+			Description: "Get full session in markdown format. Sessions over 100 turns come back with no markdown and a 'markdown unavailable' entry in warnings[]; markdown is truncated at 50K chars. Use get_session_summary + get_turns for big sessions.",
 			InputSchema: inputSchema{
 				Type: "object",
 				Properties: map[string]property{
@@ -961,18 +961,23 @@ func (s *Server) getSession(args map[string]interface{}) (interface{}, error) {
 	// Get project info
 	projectPath, projectWarning := s.lookupProjectPath(session.ProjectID)
 
-	// For large sessions, recommend using get_session_summary + get_turns
+	// For large sessions, recommend using get_session_summary + get_turns.
+	// The notice lives in the same top-level `warnings` array as every
+	// other degraded-response signal, so an agent has one field to check
+	// rather than a singular `warning` string beside a plural `warnings`.
 	if len(turns) > 100 {
-		result := map[string]interface{}{
-			"warning":    "Large session with " + fmt.Sprintf("%d", len(turns)) + " turns. Use get_session_summary and get_turns for better results.",
+		warnings := []string{
+			fmt.Sprintf("markdown unavailable: large session with %d turns. Use get_session_summary and get_turns for better results.", len(turns)),
+		}
+		if projectWarning != "" {
+			warnings = append(warnings, projectWarning)
+		}
+		return map[string]interface{}{
+			"warnings":   warnings,
 			"session_id": sessionID,
 			"turn_count": len(turns),
 			"hint":       "Call get_session_summary first, then use get_turns with offset/limit to paginate",
-		}
-		if projectWarning != "" {
-			result["warnings"] = []string{projectWarning}
-		}
-		return result, nil
+		}, nil
 	}
 
 	// Export to markdown for smaller sessions
@@ -1445,9 +1450,9 @@ func (s *Server) promptReviewSession(args map[string]interface{}) (promptGetResu
 	}
 
 	// Get project info — cosmetic in a prompt, so lookup failures only log
-	projectPath, projectWarnings := s.lookupProjectPath(session.ProjectID)
-	for _, w := range projectWarnings {
-		s.log("%s", w)
+	projectPath, projectWarning := s.lookupProjectPath(session.ProjectID)
+	if projectWarning != "" {
+		s.log("%s", projectWarning)
 	}
 
 	// Export to markdown for easier reading; the markdown IS the prompt,
