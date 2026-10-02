@@ -1551,3 +1551,149 @@ func TestSessionReadPathsToleratesNullProjectID(t *testing.T) {
 		t.Errorf("project %d has %d sessions, want 0 — the orphan was mis-attributed", other.ID, len(filtered))
 	}
 }
+
+// seedSessionForMove returns a session value pointed at sourceFile, with a
+// project row already in place.
+func seedSessionForMove(t *testing.T, db *DB, sourceFile string) *models.Session {
+	t.Helper()
+
+	p := &models.Project{Path: "/proj/moved", DisplayName: "moved"}
+	if err := db.UpsertProject(p); err != nil {
+		t.Fatalf("upsert project: %v", err)
+	}
+	return &models.Session{
+		ID:         "session-moved",
+		ProjectID:  p.ID,
+		StartedAt:  time.Now().Add(-time.Hour),
+		EndedAt:    time.Now(),
+		SourceFile: sourceFile,
+		Source:     "claude-code",
+	}
+}
+
+func sourceFilePaths(t *testing.T, db *DB) []string {
+	t.Helper()
+
+	rows, err := db.Query("SELECT path FROM source_files ORDER BY path")
+	if err != nil {
+		t.Fatalf("query source_files: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var paths []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			t.Fatalf("scan source_files: %v", err)
+		}
+		paths = append(paths, p)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate source_files: %v", err)
+	}
+	return paths
+}
+
+// A session whose file moves on disk must end up pointing at the new path,
+// and the source_files row for the path it left behind must go. Otherwise the
+// row points at a dead path forever and the orphaned source_files entry
+// inflates the "sessions with no source file on disk" count that
+// `sync --rebuild` shows, making a rebuild look more destructive than it is.
+func TestUpsertSession_FollowsMovedSourceFile(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	dir := t.TempDir()
+	oldPath := filepath.Join(dir, "old.jsonl")
+	newPath := filepath.Join(dir, "new.jsonl")
+	if err := os.WriteFile(oldPath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("write session file: %v", err)
+	}
+
+	s := seedSessionForMove(t, db, oldPath)
+	if err := db.UpsertSession(s); err != nil {
+		t.Fatalf("upsert at old path: %v", err)
+	}
+	if err := db.UpsertSourceFileMtime(oldPath, time.Now(), "claude-code"); err != nil {
+		t.Fatalf("record old mtime: %v", err)
+	}
+
+	// The move itself: the old path stops existing.
+	if err := os.Rename(oldPath, newPath); err != nil {
+		t.Fatalf("move session file: %v", err)
+	}
+
+	s.SourceFile = newPath
+	if err := db.UpsertSession(s); err != nil {
+		t.Fatalf("upsert at new path: %v", err)
+	}
+	if err := db.UpsertSourceFileMtime(newPath, time.Now(), "claude-code"); err != nil {
+		t.Fatalf("record new mtime: %v", err)
+	}
+
+	got, err := db.GetSession(s.ID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if got.SourceFile != newPath {
+		t.Errorf("sessions.source_file = %q, want %q", got.SourceFile, newPath)
+	}
+
+	byNew, err := db.GetSessionBySourceFile(newPath)
+	if err != nil {
+		t.Fatalf("GetSessionBySourceFile(new): %v", err)
+	}
+	if byNew == nil {
+		t.Error("session not reachable by its new source file")
+	}
+	byOld, err := db.GetSessionBySourceFile(oldPath)
+	if err != nil {
+		t.Fatalf("GetSessionBySourceFile(old): %v", err)
+	}
+	if byOld != nil {
+		t.Errorf("session still reachable by its old source file %q", oldPath)
+	}
+
+	paths := sourceFilePaths(t, db)
+	if len(paths) != 1 || paths[0] != newPath {
+		t.Errorf("source_files = %v, want only %q — the superseded row survived", paths, newPath)
+	}
+}
+
+// The counterpart: two files that both exist claiming the same session id are
+// not a move, and dropping either one's source_files row would make
+// incremental sync re-parse it on every run.
+func TestUpsertSession_KeepsTrackingBothPathsWhenOldFileStillExists(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	dir := t.TempDir()
+	first := filepath.Join(dir, "first.jsonl")
+	second := filepath.Join(dir, "second.jsonl")
+	for _, p := range []string{first, second} {
+		if err := os.WriteFile(p, []byte("{}\n"), 0o600); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
+	}
+
+	s := seedSessionForMove(t, db, first)
+	if err := db.UpsertSession(s); err != nil {
+		t.Fatalf("upsert at first path: %v", err)
+	}
+	if err := db.UpsertSourceFileMtime(first, time.Now(), "claude-code"); err != nil {
+		t.Fatalf("record first mtime: %v", err)
+	}
+
+	s.SourceFile = second
+	if err := db.UpsertSession(s); err != nil {
+		t.Fatalf("upsert at second path: %v", err)
+	}
+	if err := db.UpsertSourceFileMtime(second, time.Now(), "claude-code"); err != nil {
+		t.Fatalf("record second mtime: %v", err)
+	}
+
+	paths := sourceFilePaths(t, db)
+	if len(paths) != 2 {
+		t.Errorf("source_files = %v, want both paths tracked", paths)
+	}
+}

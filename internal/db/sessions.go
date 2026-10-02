@@ -5,87 +5,80 @@ package db
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/2389-research/ccvault/pkg/models"
 )
 
-// UpsertSession creates or updates a session record
+// sessionWriter is the overlap between *sql.DB and *sql.Tx that upserting a
+// session needs. It exists so UpsertSession and UpsertSessionTx share one
+// implementation rather than two copies of a sixteen-column statement that
+// have to be edited in lockstep.
+type sessionWriter interface {
+	Exec(query string, args ...interface{}) (sql.Result, error)
+	QueryRow(query string, args ...interface{}) *sql.Row
+}
+
+const upsertSessionSQL = `
+	INSERT INTO sessions (id, project_id, started_at, ended_at, model, git_branch,
+		turn_count, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+		source_file, source_mtime, has_error, has_subagent, source)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	ON CONFLICT(id) DO UPDATE SET
+		ended_at = excluded.ended_at,
+		model = COALESCE(excluded.model, sessions.model),
+		turn_count = excluded.turn_count,
+		input_tokens = excluded.input_tokens,
+		output_tokens = excluded.output_tokens,
+		cache_read_tokens = excluded.cache_read_tokens,
+		cache_write_tokens = excluded.cache_write_tokens,
+		source_file = excluded.source_file,
+		source_mtime = excluded.source_mtime,
+		has_error = excluded.has_error,
+		has_subagent = excluded.has_subagent,
+		source = excluded.source`
+
+// UpsertSession creates or updates a session record. It runs in its own
+// transaction so the row update and the source_files bookkeeping that follows
+// a moved file either both land or neither does.
 func (db *DB) UpsertSession(s *models.Session) error {
-	source := s.Source
-	if source == "" {
-		source = "claude-code"
-	}
-
-	query := `
-		INSERT INTO sessions (id, project_id, started_at, ended_at, model, git_branch,
-			turn_count, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-			source_file, source_mtime, has_error, has_subagent, source)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET
-			ended_at = excluded.ended_at,
-			model = COALESCE(excluded.model, sessions.model),
-			turn_count = excluded.turn_count,
-			input_tokens = excluded.input_tokens,
-			output_tokens = excluded.output_tokens,
-			cache_read_tokens = excluded.cache_read_tokens,
-			cache_write_tokens = excluded.cache_write_tokens,
-			source_mtime = excluded.source_mtime,
-			has_error = excluded.has_error,
-			has_subagent = excluded.has_subagent,
-			source = excluded.source`
-
-	_, err := db.Exec(query,
-		s.ID,
-		s.ProjectID,
-		s.StartedAt,
-		s.EndedAt,
-		s.Model,
-		s.GitBranch,
-		s.TurnCount,
-		s.InputTokens,
-		s.OutputTokens,
-		s.CacheReadTokens,
-		s.CacheWriteTokens,
-		s.SourceFile,
-		time.Now(),
-		s.HasError,
-		s.HasSubagent,
-		source,
-	)
-	if err != nil {
-		return fmt.Errorf("upsert session: %w", err)
-	}
-	return nil
+	return db.WithTx(func(tx *sql.Tx) error {
+		return upsertSession(tx, s)
+	})
 }
 
 // UpsertSessionTx creates or updates a session record within a transaction
 func (db *DB) UpsertSessionTx(tx *sql.Tx, s *models.Session) error {
+	return upsertSession(tx, s)
+}
+
+// upsertSession writes the session row and then follows the file if it moved.
+//
+// source_file is in the ON CONFLICT update list because a session's file does
+// move — a project directory renamed, an archive relocated, an agent dir
+// restructured. Leaving it out pinned the row to the original path for the
+// life of the archive, so anything resolving a session back to its file got a
+// path that no longer existed, and `sync --rebuild`'s confirmation prompt
+// counted the session as having no file on disk, making a rebuild look more
+// destructive than it was.
+func upsertSession(w sessionWriter, s *models.Session) error {
 	source := s.Source
 	if source == "" {
 		source = "claude-code"
 	}
 
-	query := `
-		INSERT INTO sessions (id, project_id, started_at, ended_at, model, git_branch,
-			turn_count, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-			source_file, source_mtime, has_error, has_subagent, source)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET
-			ended_at = excluded.ended_at,
-			model = COALESCE(excluded.model, sessions.model),
-			turn_count = excluded.turn_count,
-			input_tokens = excluded.input_tokens,
-			output_tokens = excluded.output_tokens,
-			cache_read_tokens = excluded.cache_read_tokens,
-			cache_write_tokens = excluded.cache_write_tokens,
-			source_mtime = excluded.source_mtime,
-			has_error = excluded.has_error,
-			has_subagent = excluded.has_subagent,
-			source = excluded.source`
+	// Read the path the row currently holds before overwriting it; the old
+	// value is the only way to find the source_files row left behind.
+	var previousFile string
+	err := w.QueryRow("SELECT source_file FROM sessions WHERE id = ?", s.ID).Scan(&previousFile)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("read current source file for session %s: %w", s.ID, err)
+	}
 
-	_, err := tx.Exec(query,
+	_, err = w.Exec(upsertSessionSQL,
 		s.ID,
 		s.ProjectID,
 		s.StartedAt,
@@ -105,6 +98,34 @@ func (db *DB) UpsertSessionTx(tx *sql.Tx, s *models.Session) error {
 	)
 	if err != nil {
 		return fmt.Errorf("upsert session: %w", err)
+	}
+
+	return forgetSupersededSourceFile(w, previousFile, s.SourceFile)
+}
+
+// forgetSupersededSourceFile drops the source_files row for a path a session
+// has moved away from, so incremental sync stops tracking a file that is gone
+// and the archive stops reporting a source file that cannot be opened.
+//
+// The on-disk check is what distinguishes a move from two live copies of the
+// same session. If the old path still exists, both files are real and both
+// mtimes are worth tracking — deleting either row would make incremental sync
+// re-parse that file on every run, forever.
+func forgetSupersededSourceFile(w sessionWriter, previousFile, currentFile string) error {
+	if previousFile == "" || previousFile == currentFile {
+		return nil
+	}
+	if _, err := os.Stat(previousFile); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		// Can't tell whether the file is gone (permissions, a dead mount).
+		// Keeping the tracking row costs a re-parse; deleting one that is
+		// still live costs a re-parse every sync. Keep it.
+		return nil
+	}
+
+	if _, err := w.Exec("DELETE FROM source_files WHERE path = ?", previousFile); err != nil {
+		return fmt.Errorf("delete superseded source file %s: %w", previousFile, err)
 	}
 	return nil
 }
