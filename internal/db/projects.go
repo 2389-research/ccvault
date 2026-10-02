@@ -210,22 +210,6 @@ func (db *DB) GetProjectStats() (count int, totalTokens int64, err error) {
 	return count, totalTokens, nil
 }
 
-// UpdateProjectStats recalculates project statistics from sessions
-func (db *DB) UpdateProjectStats(projectID int64) error {
-	query := `
-		UPDATE projects SET
-			session_count = (SELECT COUNT(*) FROM sessions WHERE project_id = ?),
-			total_tokens = (SELECT COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens), 0) FROM sessions WHERE project_id = ?),
-			last_activity_at = (SELECT MAX(ended_at) FROM sessions WHERE project_id = ?)
-		WHERE id = ?`
-
-	_, err := db.Exec(query, projectID, projectID, projectID, projectID)
-	if err != nil {
-		return fmt.Errorf("update project stats: %w", err)
-	}
-	return nil
-}
-
 // ReconcileProjectAggregates recomputes session_count and total_tokens from
 // the sessions table for the given project paths. Pass no paths to reconcile
 // every project.
@@ -238,6 +222,12 @@ func (db *DB) ReconcileProjectAggregates(paths []string) error {
 	// first_seen_at and last_activity_at are deliberately left alone: the
 	// former is write-once at insert, the latter is already updated with a
 	// max() comparison, so neither drifts on re-parse.
+	//
+	// That exclusion is the whole reason this function exists rather than a
+	// recompute of every aggregate column. A `MAX(ended_at)` over the stored
+	// datetime text is a string compare over values the driver formatted with
+	// a timezone suffix, so it can pick an earlier moment as the maximum —
+	// which would make last_activity_at worse than leaving it untouched.
 	const recompute = `
 		UPDATE projects SET
 			session_count = (
