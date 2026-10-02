@@ -97,19 +97,44 @@ func seedProject(t *testing.T, database *db.DB, path string) *models.Project {
 	return p
 }
 
+// seedToolUse records one tool invocation against a session's first turn,
+// which is what gives GetToolNamesLike something to match on.
+func seedToolUse(t *testing.T, database *db.DB, sessionID, toolName string) {
+	t.Helper()
+
+	uses := []models.ToolUse{{
+		TurnID:    sessionID + "-turn-1",
+		SessionID: sessionID,
+		ToolName:  toolName,
+		Timestamp: time.Date(2026, 1, 1, 0, 0, 1, 0, time.UTC),
+	}}
+	if err := database.InsertToolUses(uses); err != nil {
+		t.Fatalf("insert tool uses for %s: %v", sessionID, err)
+	}
+}
+
+// narrowProjectsTable replaces the projects table with a two-column view of
+// the same rows. Search still resolves (it reads only projects.id and
+// projects.path) while GetProjects fails on the columns the view drops —
+// the precise shape of a degraded enrichment query, with no mocking.
+func narrowProjectsTable(t *testing.T, database *db.DB) {
+	t.Helper()
+
+	for _, stmt := range []string{
+		`ALTER TABLE projects RENAME TO projects_full`,
+		`CREATE VIEW projects AS SELECT id, path FROM projects_full`,
+	} {
+		if _, err := database.Exec(stmt); err != nil {
+			t.Fatalf("exec %q: %v", stmt, err)
+		}
+	}
+}
+
 func TestSearchConversations_EmptyResultsIncludeHint(t *testing.T) {
 	s, database := newTestServer(t)
 	p := seedProject(t, database, "/test/proj")
 	seedSession(t, database, "session-1", p.ID)
-	toolUses := []models.ToolUse{{
-		TurnID:    "session-1-turn-1",
-		SessionID: "session-1",
-		ToolName:  "mcp__ccvault__search_conversations",
-		Timestamp: time.Now(),
-	}}
-	if err := database.InsertToolUses(toolUses); err != nil {
-		t.Fatalf("insert tool uses: %v", err)
-	}
+	seedToolUse(t, database, "session-1", "mcp__ccvault__search_conversations")
 
 	// Fragment does not full-name match, so the search comes back empty
 	result, err := s.searchConversations(map[string]interface{}{"query": "tool:ccvault"})
@@ -125,9 +150,98 @@ func TestSearchConversations_EmptyResultsIncludeHint(t *testing.T) {
 	if hint == "" {
 		t.Error("empty result should include a hint")
 	}
-	similar, _ := m["similar_tool_names"].([]string)
+	similar := mustField[[]string](t, m, "similar_tool_names")
 	if len(similar) != 1 || similar[0] != "mcp__ccvault__search_conversations" {
 		t.Errorf("similar_tool_names = %v, want [mcp__ccvault__search_conversations]", similar)
+	}
+	if _, present := m["warnings"]; present {
+		t.Errorf("healthy lookup should emit no warnings, got %v", m["warnings"])
+	}
+}
+
+func TestSimilarToolNames_WarnsWhenLookupFails(t *testing.T) {
+	s, database := newTestServer(t)
+	p := seedProject(t, database, "/test/proj")
+	seedSession(t, database, "session-1", p.ID)
+	seedToolUse(t, database, "session-1", "mcp__ccvault__search_conversations")
+
+	// Dropping tool_uses is what a half-migrated or truncated archive looks
+	// like to this lookup: the query errors rather than returning no rows.
+	if _, err := database.Exec("DROP TABLE tool_uses"); err != nil {
+		t.Fatalf("drop tool_uses: %v", err)
+	}
+
+	names, warning := s.similarToolNames("ccvault", 5)
+	if names != nil {
+		t.Errorf("names = %v, want nil when the lookup failed", names)
+	}
+	if !strings.HasPrefix(warning, "similar_tool_names unavailable: ") {
+		t.Errorf("warning = %q, want a 'similar_tool_names unavailable: <why>' entry", warning)
+	}
+}
+
+func TestSimilarToolNames_NoWarningWhenLookupSucceeds(t *testing.T) {
+	s, database := newTestServer(t)
+	p := seedProject(t, database, "/test/proj")
+	seedSession(t, database, "session-1", p.ID)
+	seedToolUse(t, database, "session-1", "mcp__ccvault__search_conversations")
+
+	names, warning := s.similarToolNames("ccvault", 5)
+	if warning != "" {
+		t.Errorf("warning = %q, want empty on a healthy lookup", warning)
+	}
+	if len(names) != 1 || names[0] != "mcp__ccvault__search_conversations" {
+		t.Errorf("names = %v, want [mcp__ccvault__search_conversations]", names)
+	}
+}
+
+// A degraded project lookup leaves every result's project_name on the
+// basename fallback. The response must say so in warnings[] rather than
+// presenting the fallback as the adapter-provided label.
+func TestSearchConversations_WarnsWhenProjectEnrichmentFails(t *testing.T) {
+	s, database := newTestServer(t)
+	p := seedProject(t, database, "/test/proj")
+	seedSession(t, database, "session-1", p.ID)
+	narrowProjectsTable(t, database)
+
+	result, err := s.searchConversations(map[string]interface{}{"query": "hello"})
+	if err != nil {
+		t.Fatalf("searchConversations: %v", err)
+	}
+
+	m := resultMap(t, result)
+	if mustInt(t, m, "count") != 1 {
+		t.Fatalf("count = %v, want 1 — the search itself must still succeed", m["count"])
+	}
+	warnings := mustField[[]string](t, m, "warnings")
+	if len(warnings) != 1 || !strings.HasPrefix(warnings[0], "project enrichment unavailable: ") {
+		t.Errorf("warnings = %v, want one 'project enrichment unavailable: <why>' entry", warnings)
+	}
+}
+
+// Both enrichments report into the same top-level warnings[] array, and a
+// degraded one does not suppress a healthy one's field.
+func TestSearchConversations_WarningsCoexistWithSimilarToolNames(t *testing.T) {
+	s, database := newTestServer(t)
+	p := seedProject(t, database, "/test/proj")
+	seedSession(t, database, "session-1", p.ID)
+	seedToolUse(t, database, "session-1", "mcp__ccvault__search_conversations")
+	narrowProjectsTable(t, database)
+
+	result, err := s.searchConversations(map[string]interface{}{"query": "tool:ccvault"})
+	if err != nil {
+		t.Fatalf("searchConversations: %v", err)
+	}
+
+	m := resultMap(t, result)
+	if mustInt(t, m, "count") != 0 {
+		t.Fatalf("count = %v, want 0 for a partial tool name", m["count"])
+	}
+	if similar := mustField[[]string](t, m, "similar_tool_names"); len(similar) != 1 {
+		t.Errorf("similar_tool_names = %v, want the one seeded tool name", similar)
+	}
+	if warnings := mustField[[]string](t, m, "warnings"); len(warnings) != 1 {
+		t.Errorf("warnings = %v, want exactly the project enrichment entry", warnings)
 	}
 }
 
