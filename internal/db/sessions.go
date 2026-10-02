@@ -109,7 +109,31 @@ func (db *DB) UpsertSessionTx(tx *sql.Tx, s *models.Session) error {
 	return nil
 }
 
-// GetSession retrieves a session by ID
+// GetSession retrieves a session by ID. A session with no project reads back
+// with ProjectID 0.
+//
+// sessions.project_id is nullable, and MergeFrom's contract deliberately
+// imports a session whose project row is missing from the incoming archive
+// with a NULL rather than dropping it — the turns are the part worth keeping.
+// So every read path here has to be able to represent "no project"; scanning
+// project_id straight into models.Session.ProjectID (an int64) errors out on
+// the NULL instead, which is what it used to do.
+//
+// Zero rather than a nullable field in models.Session, and zero rather than a
+// NOT NULL column with a synthetic "unknown project" row, because:
+//
+//   - `ProjectID > 0` is already the tree-wide test for "has a project"
+//     (cmd/ccvault, internal/tui, internal/mcp, internal/projectref all spell
+//     it that way), so zero-means-absent is the convention already in force.
+//   - GetSessionsPage already LEFT JOINs projects and COALESCEs the path, i.e.
+//     this layer was written for sessions with no project from the start. Only
+//     the project_id scan disagreed with the schema.
+//   - A synthetic project row would be counted by GetProjectStats, listed by
+//     `ccvault list-projects` and reported by `ccvault stats` — a repair that
+//     shows up as a fake project in every aggregate.
+//   - Making the column NOT NULL means rewriting the sessions table, a large
+//     blast radius for a defect only reachable by importing an archive that is
+//     already inconsistent.
 func (db *DB) GetSession(id string) (*models.Session, error) {
 	query := `
 		SELECT id, project_id, started_at, ended_at, model, git_branch,
@@ -119,9 +143,10 @@ func (db *DB) GetSession(id string) (*models.Session, error) {
 
 	s := &models.Session{}
 	var endedAt sql.NullTime
+	var projectID sql.NullInt64
 	err := db.QueryRow(query, id).Scan(
 		&s.ID,
-		&s.ProjectID,
+		&projectID,
 		&s.StartedAt,
 		&endedAt,
 		&s.Model,
@@ -140,6 +165,7 @@ func (db *DB) GetSession(id string) (*models.Session, error) {
 	if err != nil {
 		return nil, fmt.Errorf("get session: %w", err)
 	}
+	s.ProjectID = projectID.Int64
 	if endedAt.Valid {
 		s.EndedAt = endedAt.Time
 	}
@@ -184,9 +210,10 @@ func (db *DB) GetSessionsPage(projectID int64, limit, offset int) ([]models.Sess
 	for rows.Next() {
 		var s models.Session
 		var endedAt sql.NullTime
+		var projectID sql.NullInt64
 		err := rows.Scan(
 			&s.ID,
-			&s.ProjectID,
+			&projectID,
 			&s.StartedAt,
 			&endedAt,
 			&s.Model,
@@ -203,6 +230,7 @@ func (db *DB) GetSessionsPage(projectID int64, limit, offset int) ([]models.Sess
 		if err != nil {
 			return nil, fmt.Errorf("scan session: %w", err)
 		}
+		s.ProjectID = projectID.Int64
 		if endedAt.Valid {
 			s.EndedAt = endedAt.Time
 		}
@@ -238,9 +266,10 @@ func (db *DB) GetSessionBySourceFile(path string) (*models.Session, error) {
 	s := &models.Session{}
 	var endedAt sql.NullTime
 	var sourceMtime sql.NullTime
+	var projectID sql.NullInt64
 	err := db.QueryRow(query, path).Scan(
 		&s.ID,
-		&s.ProjectID,
+		&projectID,
 		&s.StartedAt,
 		&endedAt,
 		&s.Model,
@@ -259,6 +288,7 @@ func (db *DB) GetSessionBySourceFile(path string) (*models.Session, error) {
 	if err != nil {
 		return nil, fmt.Errorf("get session by source: %w", err)
 	}
+	s.ProjectID = projectID.Int64
 	if endedAt.Valid {
 		s.EndedAt = endedAt.Time
 	}

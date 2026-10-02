@@ -1469,3 +1469,85 @@ func TestGetTurns_DropsInvalidRawJSON(t *testing.T) {
 		t.Errorf("json.Marshal(turns) crashed with invalid raw_json still in-place: %v", err)
 	}
 }
+
+// sessions.project_id is nullable, so every read path has to survive a NULL.
+// A session with no project reads back with ProjectID 0 — the value every
+// caller in the tree already tests for with `ProjectID > 0`.
+func TestSessionReadPathsToleratesNullProjectID(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	// A project that is NOT this session's, so a read path that silently
+	// picked "some project" instead of "no project" would be caught.
+	other := &models.Project{Path: "/proj/present", DisplayName: "present"}
+	if err := db.UpsertProject(other); err != nil {
+		t.Fatalf("upsert project: %v", err)
+	}
+
+	const sourceFile = "/proj/orphan/session.jsonl"
+	// Written with raw SQL because UpsertSession can't produce a NULL
+	// project_id — models.Session.ProjectID is an int64. MergeFrom can, and
+	// does; see TestMergeFrom_SessionWithMissingProjectRowStaysReadable.
+	//
+	// Every other column is filled in the way MergeFrom would carry it over
+	// from a source archive written by UpsertSession, so this row differs from
+	// a healthy one in exactly one place. model and git_branch are nullable
+	// too and are still scanned into plain strings; that is a separate defect
+	// from this one and keeping it out of this row keeps the test pointed at
+	// project_id.
+	_, err := db.Exec(
+		`INSERT INTO sessions (id, project_id, started_at, ended_at, model, git_branch,
+			turn_count, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+			source_file, source)
+		 VALUES ('orphan-session', NULL, ?, ?, 'claude-opus-5', 'main', 2, 10, 5, 0, 0, ?, 'claude-code')`,
+		time.Now().Add(-time.Hour), time.Now(), sourceFile)
+	if err != nil {
+		t.Fatalf("insert orphan session: %v", err)
+	}
+
+	s, err := db.GetSession("orphan-session")
+	if err != nil {
+		t.Fatalf("GetSession on NULL project_id: %v", err)
+	}
+	if s == nil {
+		t.Fatal("GetSession returned no session for an existing row")
+	}
+	if s.ProjectID != 0 {
+		t.Errorf("GetSession ProjectID = %d, want 0 for a NULL project_id", s.ProjectID)
+	}
+
+	byFile, err := db.GetSessionBySourceFile(sourceFile)
+	if err != nil {
+		t.Fatalf("GetSessionBySourceFile on NULL project_id: %v", err)
+	}
+	if byFile == nil {
+		t.Fatal("GetSessionBySourceFile returned no session for an existing row")
+	}
+	if byFile.ProjectID != 0 {
+		t.Errorf("GetSessionBySourceFile ProjectID = %d, want 0", byFile.ProjectID)
+	}
+
+	page, err := db.GetSessionsPage(0, 0, 0)
+	if err != nil {
+		t.Fatalf("GetSessionsPage with a NULL project_id row present: %v", err)
+	}
+	if len(page) != 1 {
+		t.Fatalf("GetSessionsPage returned %d sessions, want 1", len(page))
+	}
+	if page[0].ProjectID != 0 {
+		t.Errorf("GetSessionsPage ProjectID = %d, want 0", page[0].ProjectID)
+	}
+	if page[0].ProjectPath != "" {
+		t.Errorf("GetSessionsPage ProjectPath = %q, want empty for a session with no project", page[0].ProjectPath)
+	}
+
+	// Filtering by a real project must not pick up the orphan. Guards the
+	// obvious wrong fix: coalescing NULL to a project id.
+	filtered, err := db.GetSessionsPage(other.ID, 0, 0)
+	if err != nil {
+		t.Fatalf("GetSessionsPage filtered: %v", err)
+	}
+	if len(filtered) != 0 {
+		t.Errorf("project %d has %d sessions, want 0 — the orphan was mis-attributed", other.ID, len(filtered))
+	}
+}

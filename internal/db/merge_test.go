@@ -314,6 +314,57 @@ func TestMergeFrom_RemapsProjectIDs(t *testing.T) {
 	}
 }
 
+// MergeFrom's documented contract is that a session whose project row is
+// missing from the incoming archive imports with a NULL project_id rather
+// than being dropped — the turns are the part worth keeping. That is only
+// true if the session is still readable afterwards.
+func TestMergeFrom_SessionWithMissingProjectRowStaysReadable(t *testing.T) {
+	dest, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	src := newSourceDB(t, func(s *DB) {
+		seedSession(t, s, "/work/truncated", "session-orphan", "zymurgy orphaned content", now)
+		// Simulate the hand-edited / truncated archive the contract is
+		// written for: the session survives, its project row doesn't.
+		if _, err := s.Exec("DELETE FROM projects"); err != nil {
+			t.Fatalf("drop source project rows: %v", err)
+		}
+	})
+
+	if _, err := dest.MergeFrom(src); err != nil {
+		t.Fatalf("MergeFrom: %v", err)
+	}
+
+	var projectID interface{}
+	if err := dest.QueryRow("SELECT project_id FROM sessions WHERE id = 'session-orphan'").Scan(&projectID); err != nil {
+		t.Fatalf("read imported project_id: %v", err)
+	}
+	if projectID != nil {
+		t.Fatalf("imported project_id = %v, want NULL — this test no longer exercises the NULL path", projectID)
+	}
+
+	s, err := dest.GetSession("session-orphan")
+	if err != nil {
+		t.Fatalf("GetSession on imported orphan: %v", err)
+	}
+	if s == nil {
+		t.Fatal("GetSession returned nothing for the imported session")
+	}
+	if s.ProjectID != 0 {
+		t.Errorf("ProjectID = %d, want 0", s.ProjectID)
+	}
+
+	// The reason for keeping the session at all.
+	hits, err := dest.SearchTurns("zymurgy", 10)
+	if err != nil {
+		t.Fatalf("SearchTurns: %v", err)
+	}
+	if len(hits) != 1 {
+		t.Errorf("search for the orphan's content returned %d hits, want 1", len(hits))
+	}
+}
+
 func TestMergeFrom_ReconcilesProjectAggregates(t *testing.T) {
 	dest, cleanup := setupTestDB(t)
 	defer cleanup()
