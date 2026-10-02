@@ -35,7 +35,10 @@ const upsertSessionSQL = `
 		output_tokens = excluded.output_tokens,
 		cache_read_tokens = excluded.cache_read_tokens,
 		cache_write_tokens = excluded.cache_write_tokens,
-		source_file = excluded.source_file,
+		source_file = CASE
+			WHEN excluded.source_file != '' THEN excluded.source_file
+			ELSE sessions.source_file
+		END,
 		source_mtime = excluded.source_mtime,
 		has_error = excluded.has_error,
 		has_subagent = excluded.has_subagent,
@@ -64,6 +67,13 @@ func (db *DB) UpsertSessionTx(tx *sql.Tx, s *models.Session) error {
 // path that no longer existed, and `sync --rebuild`'s confirmation prompt
 // counted the session as having no file on disk, making a rebuild look more
 // destructive than it was.
+//
+// Making the column updatable also made it clobberable, so the update guards
+// against an empty incoming path the same way the statement already guards
+// model: an upsert that carries no path keeps the one on the row.
+// sessionsWithoutSourceFiles skips rows whose source_file is the empty
+// string, so an empty value would drop the session out of the rebuild safety
+// count altogether.
 func upsertSession(w sessionWriter, s *models.Session) error {
 	source := s.Source
 	if source == "" {

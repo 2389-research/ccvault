@@ -1660,6 +1660,47 @@ func TestUpsertSession_FollowsMovedSourceFile(t *testing.T) {
 	}
 }
 
+// Making source_file updatable also made it clobberable. An upsert carrying
+// no path must not erase a good one: sessionsWithoutSourceFiles skips rows
+// whose source_file is the empty string, so an empty value would drop the
+// session out of `sync --rebuild`'s safety count entirely — the opposite of
+// what #38 is for.
+func TestUpsertSession_EmptySourceFileDoesNotClobberAGoodPath(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+	if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("write session file: %v", err)
+	}
+
+	s := seedSessionForMove(t, db, path)
+	if err := db.UpsertSession(s); err != nil {
+		t.Fatalf("upsert with a path: %v", err)
+	}
+	if err := db.UpsertSourceFileMtime(path, time.Now(), "claude-code"); err != nil {
+		t.Fatalf("record mtime: %v", err)
+	}
+
+	s.SourceFile = ""
+	if err := db.UpsertSession(s); err != nil {
+		t.Fatalf("upsert with an empty path: %v", err)
+	}
+
+	got, err := db.GetSession(s.ID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if got.SourceFile != path {
+		t.Errorf("sessions.source_file = %q, want the original %q kept", got.SourceFile, path)
+	}
+
+	if paths := sourceFilePaths(t, db); len(paths) != 1 || paths[0] != path {
+		t.Errorf("source_files = %v, want only %q still tracked", paths, path)
+	}
+}
+
 // The counterpart: two files that both exist claiming the same session id are
 // not a move, and dropping either one's source_files row would make
 // incremental sync re-parse it on every run.
