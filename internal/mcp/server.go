@@ -306,9 +306,10 @@ func (s *Server) handleToolsList(req *jsonRPCRequest) {
 		},
 		{
 			Name: "get_turns",
-			Description: "Get paginated turns from a session, in conversation order. Use offset to navigate " +
-				"through the conversation. Every turn reports its ordinal — its position in the session, " +
-				"counting from 0 — which is stable across calls and is the cursor to resume from.",
+			Description: "Get paginated turns from a session, in conversation order. Every turn reports its " +
+				"ordinal — its position in the session, counting from 0, stable across calls. To walk a " +
+				"session, pass the response's next_after_ordinal back as after_ordinal; offset also works " +
+				"but counts rows in the last response rather than naming a turn.",
 			InputSchema: inputSchema{
 				Type: "object",
 				Properties: map[string]property{
@@ -316,9 +317,15 @@ func (s *Server) handleToolsList(req *jsonRPCRequest) {
 						Type:        "string",
 						Description: "Session UUID",
 					},
+					"after_ordinal": {
+						Type: "number",
+						Description: "Resume after this position in the session. Prefer this over offset: " +
+							"it names a turn, so it is unaffected by a type filter and still means the " +
+							"same thing on a later call. Pass the previous response's next_after_ordinal.",
+					},
 					"offset": {
 						Type:        "number",
-						Description: "Skip first N turns (default: 0)",
+						Description: "Skip first N turns (default: 0). Ignored when after_ordinal is given.",
 					},
 					"limit": {
 						Type:        "number",
@@ -858,8 +865,23 @@ func (s *Server) getSessionSummary(args map[string]interface{}) (interface{}, er
 		"tools_used":     topToolsMap,
 		"first_user_msg": firstUserMsg,
 		"last_user_msg":  lastUserMsg,
-		"hint":           "Use get_turns to paginate through the conversation",
+		"hint": "Use get_turns to paginate through the conversation, resuming with " +
+			"after_ordinal",
 	}
+
+	// Where the session's sequence ends, so a caller can resume from the tail
+	// without fetching the conversation to find it. last_entry_uuid names the
+	// turn at that position: a caller holding both can tell "the session grew"
+	// from "the transcript was rewritten under me", which a turn count cannot.
+	cursor, err := s.db.SessionTurnCursor(sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("read turn cursor: %w", err)
+	}
+	if cursor.Found {
+		result["last_ordinal"] = cursor.LastOrdinal
+		result["last_entry_uuid"] = cursor.LastEntryUUID
+	}
+
 	if projectWarning != "" {
 		result["warnings"] = []string{projectWarning}
 	}
@@ -872,8 +894,12 @@ func (s *Server) getTurns(args map[string]interface{}) (interface{}, error) {
 		return nil, fmt.Errorf("session_id is required")
 	}
 
+	// limit and offset arrive from an MCP caller, so both bounds are
+	// clamped. Without the lower one a negative value reaches the slice
+	// expressions below and panics the server, and limit 0 reports has_more
+	// with no turns, which walks a caller into an endless loop.
 	limit := 20
-	if l, ok := args["limit"].(float64); ok {
+	if l, ok := args["limit"].(float64); ok && l > 0 {
 		limit = int(l)
 		if limit > 50 {
 			limit = 50
@@ -881,8 +907,18 @@ func (s *Server) getTurns(args map[string]interface{}) (interface{}, error) {
 	}
 
 	offset := 0
-	if o, ok := args["offset"].(float64); ok {
+	if o, ok := args["offset"].(float64); ok && o > 0 {
 		offset = int(o)
+	}
+
+	// after_ordinal resumes from a turn's position in the session rather than
+	// from a count of rows. That distinction is the point of the ordinal:
+	// offset indexes whatever this call returned, so it shifts the moment a
+	// type filter is applied and means something different on the next call,
+	// while a position names one turn in the session forever.
+	afterOrdinal, resumeFromOrdinal := -1, false
+	if a, ok := args["after_ordinal"].(float64); ok {
+		afterOrdinal, resumeFromOrdinal = int(a), true
 	}
 
 	typeFilter, _ := args["type"].(string)
@@ -905,8 +941,19 @@ func (s *Server) getTurns(args map[string]interface{}) (interface{}, error) {
 
 	totalCount := len(turns)
 
-	// Apply offset
-	if offset >= len(turns) {
+	// after_ordinal and offset are two ways to say the same thing, so taking
+	// both would mean applying one on top of the other. A position wins:
+	// nothing else in the response is as specific.
+	if resumeFromOrdinal {
+		offset = 0
+		kept := turns[:0]
+		for _, t := range turns {
+			if t.Ordinal > afterOrdinal {
+				kept = append(kept, t)
+			}
+		}
+		turns = kept
+	} else if offset >= len(turns) {
 		turns = nil
 	} else {
 		turns = turns[offset:]
@@ -978,6 +1025,15 @@ func (s *Server) getTurns(args map[string]interface{}) (interface{}, error) {
 		"limit":       limit,
 		"count":       len(compactTurns),
 		"turns":       compactTurns,
+	}
+
+	// next_after_ordinal is the resume point for the page just returned, and
+	// it is reported whether or not there is more: a caller polling a live
+	// session wants to know where it got to even when it has caught up.
+	if n := len(compactTurns); n > 0 {
+		if ordinal, ok := compactTurns[n-1]["ordinal"].(int); ok {
+			response["next_after_ordinal"] = ordinal
+		}
 	}
 
 	if hasMore {

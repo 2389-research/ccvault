@@ -183,24 +183,8 @@ type TurnCursor struct {
 // (session_id, ordinal) turns this into an index seek, and a denormalized
 // counter is one more thing to drift during the per-file replace sync does.
 func (db *DB) SessionTurnCursor(sessionID string) (TurnCursor, error) {
-	return sessionTurnCursor(db.DB, sessionID)
-}
-
-// SessionTurnCursorTx is SessionTurnCursor inside a transaction, so a caller
-// can read the cursor and replace the session's turns atomically.
-func (db *DB) SessionTurnCursorTx(tx *sql.Tx, sessionID string) (TurnCursor, error) {
-	return sessionTurnCursor(tx, sessionID)
-}
-
-// cursorReader is the overlap between *sql.DB and *sql.Tx that reading a
-// cursor needs.
-type cursorReader interface {
-	QueryRow(query string, args ...interface{}) *sql.Row
-}
-
-func sessionTurnCursor(r cursorReader, sessionID string) (TurnCursor, error) {
 	var c TurnCursor
-	err := r.QueryRow(`
+	err := db.QueryRow(`
 		SELECT ordinal, id FROM turns
 		WHERE session_id = ?
 		ORDER BY ordinal DESC
