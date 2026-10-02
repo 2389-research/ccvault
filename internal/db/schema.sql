@@ -34,13 +34,19 @@ CREATE TABLE IF NOT EXISTS sessions (
     source_mtime DATETIME,
     has_error INTEGER DEFAULT 0,
     has_subagent INTEGER DEFAULT 0,
-    source TEXT NOT NULL DEFAULT 'claude-code'
+    source TEXT NOT NULL DEFAULT 'claude-code',
+    parent_session_id TEXT REFERENCES sessions(id),
+    -- The uuid of the turn at this session's highest ordinal. Lets a re-parse
+    -- tell "resuming where I left off" from "this transcript was rewritten".
+    last_entry_uuid TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_file ON sessions(source_file);
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
+CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id)
+    WHERE parent_session_id IS NOT NULL;
 
 -- Turns table
 CREATE TABLE IF NOT EXISTS turns (
@@ -52,12 +58,19 @@ CREATE TABLE IF NOT EXISTS turns (
     content TEXT,
     raw_json TEXT,
     input_tokens INTEGER DEFAULT 0,
-    output_tokens INTEGER DEFAULT 0
+    output_tokens INTEGER DEFAULT 0,
+    -- Position within the session, from 0, gapless, over every turn type.
+    -- Ordering reads off this rather than timestamp, which ties and skews.
+    ordinal INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id);
 CREATE INDEX IF NOT EXISTS idx_turns_timestamp ON turns(timestamp);
 CREATE INDEX IF NOT EXISTS idx_turns_type ON turns(type);
+
+-- UNIQUE is what makes a position a cursor: ordinal N of a session identifies
+-- at most one turn. Doubles as the index MAX(ordinal) seeks.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_session_ordinal ON turns(session_id, ordinal);
 
 -- Tool uses table
 CREATE TABLE IF NOT EXISTS tool_uses (
@@ -96,7 +109,12 @@ CREATE TRIGGER IF NOT EXISTS turns_ad AFTER DELETE ON turns BEGIN
     INSERT INTO turns_fts(turns_fts, rowid, content) VALUES('delete', old.rowid, old.content);
 END;
 
-CREATE TRIGGER IF NOT EXISTS turns_au AFTER UPDATE ON turns BEGIN
+-- turns_au is scoped to content, the only column turns_fts indexes. An UPDATE
+-- that leaves content alone leaves the index correct, so firing on every
+-- column only tombstoned and re-added byte-identical documents — which made a
+-- full-table UPDATE (migration 008's ordinal backfill) cost 377 MB of dead
+-- FTS segments on a million-turn archive.
+CREATE TRIGGER IF NOT EXISTS turns_au AFTER UPDATE OF content ON turns BEGIN
     INSERT INTO turns_fts(turns_fts, rowid, content) VALUES('delete', old.rowid, old.content);
     INSERT INTO turns_fts(rowid, content) VALUES (new.rowid, new.content);
 END;

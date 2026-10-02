@@ -31,8 +31,13 @@ type Stats struct {
 	TurnsIndexed               int
 	ToolUsesIndexed            int
 	ProjectsFound              int
-	Errors                     []error
-	Duration                   time.Duration
+	// SessionsRewrittenUpstream counts sessions whose stored last turn was
+	// absent from the transcript this run re-parsed — the file was rewritten
+	// rather than appended to, so the session's history was replaced with a
+	// different one rather than extended.
+	SessionsRewrittenUpstream int
+	Errors                    []error
+	Duration                  time.Duration
 }
 
 // Syncer handles syncing conversation data to ccvault
@@ -409,11 +414,17 @@ func (s *Syncer) processSession(ctx context.Context, sf adapter.SessionFile, adp
 	var toolUses []models.ToolUse
 	for i, pt := range parsed.Turns {
 		turns[i] = models.Turn{
-			ID:           pt.ID,
-			SessionID:    parsed.ID,
-			ParentID:     pt.ParentID,
-			Type:         pt.Type,
-			Timestamp:    pt.Timestamp,
+			ID:        pt.ID,
+			SessionID: parsed.ID,
+			ParentID:  pt.ParentID,
+			Type:      pt.Type,
+			Timestamp: pt.Timestamp,
+			// The slice index is the ordinal. An adapter expresses a
+			// session's order as the order of ParsedSession.Turns and
+			// carries no position field, so deriving it here is what makes
+			// the sequence 0-based and gapless by construction — there is no
+			// second number that could disagree with this one.
+			Ordinal:      i,
 			Content:      pt.Content,
 			RawJSON:      pt.RawJSON,
 			InputTokens:  int(pt.InputTokens),
@@ -437,6 +448,14 @@ func (s *Syncer) processSession(ctx context.Context, sf adapter.SessionFile, adp
 	}
 
 	session.TurnCount = len(turns)
+	if len(turns) > 0 {
+		session.LastEntryUUID = turns[len(turns)-1].ID
+	}
+
+	// Set by the transaction below when the stored tail of the session is
+	// absent from this parse. Reported after the commit, not inside it, so a
+	// rolled-back session is not counted.
+	rewritten := false
 
 	// Store everything in a transaction
 	err = s.db.WithTxContext(ctx, func(tx *sql.Tx) error {
@@ -460,6 +479,28 @@ func (s *Syncer) processSession(ctx context.Context, sf adapter.SessionFile, adp
 
 		// Set project ID on session
 		session.ProjectID = project.ID
+
+		// Confirm the re-parse picked up where the last one left off, before
+		// the rows that recorded where that was are deleted.
+		//
+		// A transcript normally grows by appending, so the turn the previous
+		// sync left at the end of the sequence is still in the file. When it
+		// is not, the file was rewritten rather than extended — truncated,
+		// restored from a backup, or a fork that reused the id — and the
+		// replace below is about to swap the session's history for a
+		// different one. The replace is still the right thing to do; doing it
+		// silently was the problem, because nothing downstream could tell
+		// that a session's turns are not the ones it reported last run.
+		//
+		// Checked against the stored uuid rather than a row count or an
+		// mtime: a rewrite that happens to produce the same number of turns
+		// has the same count, and a rewrite always has a newer mtime, so
+		// neither can see the difference.
+		if storedTail, ok, err := s.db.SessionLastEntryUUIDTx(tx, session.ID); err != nil {
+			return err
+		} else if ok && !containsTurn(turns, storedTail) {
+			rewritten = true
+		}
 
 		// Delete existing turns for this session (for re-sync)
 		if err := s.db.DeleteTurnsForSessionTx(tx, session.ID); err != nil {
@@ -503,8 +544,26 @@ func (s *Syncer) processSession(ctx context.Context, sf adapter.SessionFile, adp
 	stats.SessionsIndexed++
 	stats.TurnsIndexed += len(turns)
 	stats.ToolUsesIndexed += len(toolUses)
+	if rewritten {
+		stats.SessionsRewrittenUpstream++
+		if s.verbose {
+			s.progress("session %s: transcript was rewritten upstream, not appended to — "+
+				"its stored last turn is absent from the file; replaced its %d turn(s)",
+				session.ID, len(turns))
+		}
+	}
 
 	return nil
+}
+
+// containsTurn reports whether any of turns carries the given id.
+func containsTurn(turns []models.Turn, id string) bool {
+	for _, t := range turns {
+		if t.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 // reparseAll reports whether this run must re-parse every discovered file

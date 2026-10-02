@@ -6,6 +6,7 @@ package db
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -21,9 +22,13 @@ func (db *DB) InsertTurns(turns []models.Turn) error {
 
 // InsertTurnsTx inserts multiple turns within a transaction
 func (db *DB) InsertTurnsTx(tx *sql.Tx, turns []models.Turn) error {
+	if err := checkDistinctOrdinals(turns); err != nil {
+		return err
+	}
+
 	stmt, err := tx.Prepare(`
-		INSERT OR REPLACE INTO turns (id, session_id, parent_id, type, timestamp, content, raw_json, input_tokens, output_tokens)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		INSERT OR REPLACE INTO turns (id, session_id, parent_id, type, timestamp, ordinal, content, raw_json, input_tokens, output_tokens)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return fmt.Errorf("prepare insert turns: %w", err)
 	}
@@ -36,6 +41,7 @@ func (db *DB) InsertTurnsTx(tx *sql.Tx, turns []models.Turn) error {
 			t.ParentID,
 			t.Type,
 			t.Timestamp,
+			t.Ordinal,
 			t.Content,
 			t.RawJSON,
 			t.InputTokens,
@@ -49,11 +55,51 @@ func (db *DB) InsertTurnsTx(tx *sql.Tx, turns []models.Turn) error {
 	return nil
 }
 
-// GetTurns retrieves turns for a session
+// checkDistinctOrdinals rejects a batch that gives two turns in one session
+// the same position.
+//
+// The unique index on (session_id, ordinal) already forbids this, but the
+// insert above is INSERT OR REPLACE, and SQLite resolves a REPLACE against a
+// unique index by *deleting* the conflicting row. So a caller that forgot to
+// assign ordinals would not get an error — it would get a session holding one
+// turn where it passed twenty, silently, with every earlier turn deleted on
+// its way in.
+//
+// Checked here rather than left to the schema so the failure says which turns
+// collided instead of which index did.
+func checkDistinctOrdinals(turns []models.Turn) error {
+	type position struct {
+		sessionID string
+		ordinal   int
+	}
+	seen := make(map[position]string, len(turns))
+	for _, t := range turns {
+		p := position{t.SessionID, t.Ordinal}
+		if first, dup := seen[p]; dup {
+			return fmt.Errorf(
+				"insert turns: %q and %q both claim ordinal %d of session %q; "+
+					"an ordinal is a turn's position in its session and must be unique within it",
+				first, t.ID, t.Ordinal, t.SessionID)
+		}
+		seen[p] = t.ID
+	}
+	return nil
+}
+
+// GetTurns retrieves turns for a session, in session order.
+//
+// Ordered by ordinal, not timestamp. Timestamp is not a total order over a
+// session: turns inside one assistant response tie to the millisecond, and a
+// clock that skewed puts turns in the wrong order outright. Sorting on a key
+// with ties also leaves the row order free to change between calls, which
+// matters more than it sounds — every caller that paginates this result
+// (MCP's get_turns slices it by offset and limit) would silently skip and
+// repeat rows. ordinal is unique per session, so the sort is total and the
+// same every time.
 func (db *DB) GetTurns(sessionID string) ([]models.Turn, error) {
 	query := `
-		SELECT id, session_id, parent_id, type, timestamp, content, raw_json, input_tokens, output_tokens
-		FROM turns WHERE session_id = ? ORDER BY timestamp ASC`
+		SELECT id, session_id, parent_id, type, timestamp, ordinal, content, raw_json, input_tokens, output_tokens
+		FROM turns WHERE session_id = ? ORDER BY ordinal ASC`
 
 	rows, err := db.Query(query, sessionID)
 	if err != nil {
@@ -73,6 +119,7 @@ func (db *DB) GetTurns(sessionID string) ([]models.Turn, error) {
 			&parentID,
 			&t.Type,
 			&t.Timestamp,
+			&t.Ordinal,
 			&content,
 			&rawJSON,
 			&t.InputTokens,
@@ -112,6 +159,46 @@ func (db *DB) GetTurns(sessionID string) ([]models.Turn, error) {
 	return turns, rows.Err()
 }
 
+// TurnCursor names the end of a session's turn sequence.
+type TurnCursor struct {
+	// LastOrdinal is the highest ordinal the session holds, so the next turn
+	// appended belongs at LastOrdinal+1.
+	LastOrdinal int
+	// LastEntryUUID is the id of the turn sitting at LastOrdinal.
+	LastEntryUUID string
+	// Found is false for a session with no turns, which is distinct from a
+	// session whose only turn is at ordinal 0.
+	Found bool
+}
+
+// SessionTurnCursor returns the end of a session's turn sequence: the highest
+// ordinal and the turn at it.
+//
+// This is the "everything after position N" primitive. A timestamp watermark
+// cannot do the job — it is ambiguous when turns tie (re-send or skip?) and
+// wrong when a clock skewed — whereas an ordinal is unique within the session
+// by construction.
+//
+// MAX(ordinal) rather than a stored next_ordinal counter: the unique index on
+// (session_id, ordinal) turns this into an index seek, and a denormalized
+// counter is one more thing to drift during the per-file replace sync does.
+func (db *DB) SessionTurnCursor(sessionID string) (TurnCursor, error) {
+	var c TurnCursor
+	err := db.QueryRow(`
+		SELECT ordinal, id FROM turns
+		WHERE session_id = ?
+		ORDER BY ordinal DESC
+		LIMIT 1`, sessionID).Scan(&c.LastOrdinal, &c.LastEntryUUID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return TurnCursor{}, nil
+	}
+	if err != nil {
+		return TurnCursor{}, fmt.Errorf("read turn cursor for session %s: %w", sessionID, err)
+	}
+	c.Found = true
+	return c, nil
+}
+
 // DeleteTurnsForSession removes all turns for a session (for re-sync)
 func (db *DB) DeleteTurnsForSession(sessionID string) error {
 	_, err := db.Exec("DELETE FROM turns WHERE session_id = ?", sessionID)
@@ -132,11 +219,11 @@ func (db *DB) SearchTurns(query string, limit int) ([]models.Turn, error) {
 
 	// Use FTS5 MATCH syntax
 	sqlQuery := `
-		SELECT t.id, t.session_id, t.parent_id, t.type, t.timestamp, t.content, t.input_tokens, t.output_tokens
+		SELECT t.id, t.session_id, t.parent_id, t.type, t.timestamp, t.ordinal, t.content, t.input_tokens, t.output_tokens
 		FROM turns t
 		JOIN turns_fts fts ON t.rowid = fts.rowid
 		WHERE turns_fts MATCH ?
-		ORDER BY rank
+		ORDER BY rank, t.id
 		LIMIT ?`
 
 	rows, err := db.Query(sqlQuery, query, limit)
@@ -156,6 +243,7 @@ func (db *DB) SearchTurns(query string, limit int) ([]models.Turn, error) {
 			&parentID,
 			&t.Type,
 			&t.Timestamp,
+			&t.Ordinal,
 			&content,
 			&t.InputTokens,
 			&t.OutputTokens,
@@ -186,7 +274,7 @@ func (db *DB) SearchTurnsWithFilters(textQuery string, projectID int64, model st
 
 	// Build query based on filters
 	baseQuery := `
-		SELECT DISTINCT t.id, t.session_id, t.parent_id, t.type, t.timestamp, t.content, t.input_tokens, t.output_tokens
+		SELECT DISTINCT t.id, t.session_id, t.parent_id, t.type, t.timestamp, t.ordinal, t.content, t.input_tokens, t.output_tokens
 		FROM turns t
 		JOIN sessions s ON t.session_id = s.id`
 
@@ -221,7 +309,12 @@ func (db *DB) SearchTurnsWithFilters(textQuery string, projectID int64, model st
 		baseQuery += " WHERE " + strings.Join(conditions, " AND ")
 	}
 
-	baseQuery += " ORDER BY t.timestamp DESC LIMIT ?"
+	// Results span sessions, so ordinal is not an ordering key here — a
+	// position only means something inside one session. `t.id` is a
+	// tiebreaker, not a preference: turns that share a timestamp would
+	// otherwise swap places between calls, and a caller paginating the
+	// result would skip and repeat rows.
+	baseQuery += " ORDER BY t.timestamp DESC, t.id ASC LIMIT ?"
 	args = append(args, limit)
 
 	rows, err := db.Query(baseQuery, args...)
@@ -241,6 +334,7 @@ func (db *DB) SearchTurnsWithFilters(textQuery string, projectID int64, model st
 			&parentID,
 			&t.Type,
 			&t.Timestamp,
+			&t.Ordinal,
 			&content,
 			&t.InputTokens,
 			&t.OutputTokens,

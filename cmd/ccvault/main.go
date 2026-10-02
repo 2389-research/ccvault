@@ -586,6 +586,11 @@ over the live DB (the path is printed at run), or merge it back in with
 			fmt.Printf("  Truncated raw_json: %d turn(s) across %d session(s)\n",
 				stats.TurnsWithTruncatedRawJSON, stats.SessionsWithTruncatedTurns)
 		}
+		if stats.SessionsRewrittenUpstream > 0 {
+			fmt.Printf("  Rewritten upstream: %d session(s) — the transcript was replaced, "+
+				"not appended to, so the archived turns were swapped rather than extended\n",
+				stats.SessionsRewrittenUpstream)
+		}
 
 		if len(stats.Errors) > 0 {
 			fmt.Printf("  Errors:    %d\n", len(stats.Errors))

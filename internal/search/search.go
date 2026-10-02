@@ -63,6 +63,7 @@ func (s *Searcher) Search(q *Query, limit int) ([]Result, error) {
 			&r.SessionID,
 			&r.Turn.Type,
 			&r.Turn.Timestamp,
+			&r.Turn.Ordinal,
 			&content,
 			&r.ProjectPath,
 			&r.Model,
@@ -92,7 +93,7 @@ func (s *Searcher) buildQuery(q *Query, limit int) (string, []interface{}) {
 
 	// Base query with joins
 	baseQuery := `
-		SELECT DISTINCT t.id, t.session_id, t.type, t.timestamp, t.content,
+		SELECT DISTINCT t.id, t.session_id, t.type, t.timestamp, t.ordinal, t.content,
 			p.path as project_path, s.model, s.source, s.parent_session_id
 		FROM turns t
 		JOIN sessions s ON t.session_id = s.id
@@ -179,7 +180,12 @@ func (s *Searcher) buildQuery(q *Query, limit int) (string, []interface{}) {
 		baseQuery += " WHERE " + strings.Join(conditions, " AND ")
 	}
 
-	baseQuery += " ORDER BY t.timestamp DESC"
+	// Results span sessions, so a turn's ordinal is not an ordering key here —
+	// a position only means something within one session. `t.id` is a
+	// tiebreaker, not a preference: turns sharing a timestamp would otherwise
+	// change places between calls, so which ones fall inside LIMIT would vary
+	// run to run on the same query against the same data.
+	baseQuery += " ORDER BY t.timestamp DESC, t.id ASC"
 	baseQuery += fmt.Sprintf(" LIMIT %d", limit)
 
 	return baseQuery, args

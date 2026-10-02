@@ -60,6 +60,7 @@ func seedSession(t *testing.T, database *db.DB, sessionID string, projectID int6
 		SessionID: sessionID,
 		Type:      "user",
 		Timestamp: time.Date(2026, 1, 1, 0, 0, 1, 0, time.UTC),
+		Ordinal:   0,
 		Content:   "hello from " + sessionID,
 	}}
 	if err := database.InsertTurns(turns); err != nil {
@@ -69,6 +70,10 @@ func seedSession(t *testing.T, database *db.DB, sessionID string, projectID int6
 
 // seedTurns appends n user turns to an existing session. Used to push a
 // session past get_session's 100-turn inline-markdown limit.
+//
+// Ordinals continue after the turn seedSession wrote, which is what makes
+// these look like appended turns rather than a second numbering of the same
+// session.
 func seedTurns(t *testing.T, database *db.DB, sessionID string, n int) {
 	t.Helper()
 
@@ -79,6 +84,7 @@ func seedTurns(t *testing.T, database *db.DB, sessionID string, n int) {
 			SessionID: sessionID,
 			Type:      "user",
 			Timestamp: time.Date(2026, 1, 1, 0, 1, 0, 0, time.UTC).Add(time.Duration(i) * time.Second),
+			Ordinal:   i + 1,
 			Content:   fmt.Sprintf("bulk turn %d", i),
 		}
 	}

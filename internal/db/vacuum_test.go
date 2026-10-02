@@ -48,15 +48,15 @@ func bloatDB(t *testing.T, turns, keep int) string {
 
 	err = database.WithTx(func(tx *sql.Tx) error {
 		stmt, err := tx.Prepare(
-			`INSERT INTO turns (id, session_id, type, timestamp, content, raw_json)
-			 VALUES (?, 's1', 'assistant', '2026-01-01', ?, ?)`)
+			`INSERT INTO turns (id, session_id, type, timestamp, ordinal, content, raw_json)
+			 VALUES (?, 's1', 'assistant', '2026-01-01', ?, ?, ?)`)
 		if err != nil {
 			return err
 		}
 		defer func() { _ = stmt.Close() }()
 		for i := 0; i < turns; i++ {
 			id := fmt.Sprintf("t%06d", i)
-			if _, err := stmt.Exec(id, content, `{"id":"`+id+`"}`); err != nil {
+			if _, err := stmt.Exec(id, i, content, `{"id":"`+id+`"}`); err != nil {
 				return err
 			}
 		}

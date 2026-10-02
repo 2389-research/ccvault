@@ -98,6 +98,12 @@ func parseSessionReaderWithLimits(r io.Reader, sourcePath string, maxLine, maxRa
 					turn.RawJSON = strippedRawJSON(raw, len(line))
 					stats.TurnsWithTruncatedRawJSON++
 				}
+				// The turn's position in the session: the count of turns
+				// already kept, so the sequence is 0-based and gapless over
+				// every type, and skipped lines leave no hole. Assigned here
+				// rather than from the raw line number because a line the
+				// parser could not use is not a turn.
+				turn.Ordinal = len(turns)
 				turns = append(turns, *turn)
 				updateSessionMetadata(session, turn, raw)
 			}
