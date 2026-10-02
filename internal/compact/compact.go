@@ -33,6 +33,7 @@ package compact
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -279,6 +280,26 @@ func Date(t time.Time, maxWidth int) Result {
 	// are visually identical). Return an empty visibly-shortened cell so
 	// callers pad whitespace instead of showing a misleading value.
 	return shortened("")
+}
+
+// SubagentCount renders the SUBS cell: how many subagent sessions name this
+// session as their parent.
+//
+// It lives in this package because the CLI table and the TUI session list
+// both show it, and the two must not drift onto different renderings of the
+// same number. Session listings hide subagent rows by default, so this count
+// is the only thing telling a reader they exist — "hidden" stops being
+// honest the moment the count disagrees with itself between surfaces.
+//
+// Zero reads as "-" rather than "0" so the sessions that dispatched work
+// stand out in a long list of ones that didn't. Returns a plain string, not
+// a Result: there is no fuller form to compact toward, so nothing here is
+// ever "shortened".
+func SubagentCount(n int) string {
+	if n <= 0 {
+		return "-"
+	}
+	return strconv.Itoa(n)
 }
 
 // Truncate is a small helper for cases where a caller just wants an

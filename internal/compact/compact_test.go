@@ -284,3 +284,31 @@ func TestDate_ZeroTimeReturnsEmpty(t *testing.T) {
 		t.Errorf("Date zero = %v, want empty non-shortened", r)
 	}
 }
+
+// --- SubagentCount -------------------------------------------------------
+
+// TestSubagentCount covers the one spelling of the SUBS cell. It lives here
+// so the CLI table and the TUI session list cannot drift onto two renderings
+// of the same number — the count is what justifies hiding subagent rows by
+// default, so it has to read identically wherever it appears.
+func TestSubagentCount(t *testing.T) {
+	cases := map[int]string{
+		0:  "-",
+		1:  "1",
+		12: "12",
+		72: "72",
+	}
+	for in, want := range cases {
+		if got := SubagentCount(in); got != want {
+			t.Errorf("SubagentCount(%d) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// A negative count cannot come from the COUNT(*) that feeds it, but rendering
+// a stray "-5" into a 4-wide column would silently misalign the row.
+func TestSubagentCount_NegativeReadsAsNone(t *testing.T) {
+	if got := SubagentCount(-1); got != "-" {
+		t.Errorf("SubagentCount(-1) = %q, want %q", got, "-")
+	}
+}

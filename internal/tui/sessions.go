@@ -201,6 +201,7 @@ func (m *SessionsModel) View() string {
 		headerParts = append(headerParts,
 			padVisual("TURNS", layout.Turns),
 			padVisual("TOKENS", layout.Tokens),
+			padVisual("SUBS", layout.Subs),
 			padVisual("MODEL", layout.Model),
 		)
 		b.WriteString(headerStyle.Render(strings.Join(headerParts, " ")))
@@ -253,6 +254,11 @@ func (m *SessionsModel) View() string {
 			parts = append(parts,
 				padVisual(fmt.Sprintf("%d", s.TurnCount), layout.Turns),
 				padVisual(formatTokensPlain(tokens), layout.Tokens),
+				// Subagent rows are filtered out of this list by default, so
+				// this count is the only sign from here that they exist —
+				// and the cue that `a` in the conversation view will open
+				// them. Spelled the same way as `ccvault list-sessions`.
+				padVisual(compact.SubagentCount(s.SubagentCount), layout.Subs),
 				cellText(compact.Model(s.Model, layout.Model), layout.Model, selected),
 			)
 

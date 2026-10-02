@@ -60,6 +60,63 @@ func TestSessionsModel_HidesSubagentsByDefault(t *testing.T) {
 	}
 }
 
+// TestSessionsModel_ListShowsSubagentCount is the discoverability half of the
+// default filtering. The list drops ~75% of rows on a real machine; a reader
+// who cannot see that a session has 2 subagents has no way to know the `a`
+// key would do anything. The count is what earns the filtering, so it is not
+// optional — and it is spelled SUBS here to match `ccvault list-sessions`.
+func TestSessionsModel_ListShowsSubagentCount(t *testing.T) {
+	database := subagentTestDB(t)
+
+	m := NewSessionsModel(database)
+	m.SetSize(140, 40)
+	loaded, ok := m.loadSessions().(sessionsLoadedMsg)
+	if !ok {
+		t.Fatal("loadSessions did not return sessionsLoadedMsg")
+	}
+	m.Update(loaded)
+
+	view := m.View()
+	if !strings.Contains(view, "SUBS") {
+		t.Fatalf("sessions list has no SUBS header:\n%s", view)
+	}
+
+	// parent-a has two subagents, parent-b none. The rows are identified by
+	// their distinct STARTED times.
+	lines := strings.Split(view, "\n")
+	var parentALine, parentBLine string
+	for _, line := range lines {
+		if strings.Contains(line, "12:00") {
+			parentALine = line
+		}
+		if strings.Contains(line, "12:03") {
+			parentBLine = line
+		}
+	}
+	if parentALine == "" || parentBLine == "" {
+		t.Fatalf("could not find the two parent rows:\n%s", view)
+	}
+	if !strings.Contains(parentALine, "2") {
+		t.Errorf("parent-a's row does not report its 2 subagents:\n%s", parentALine)
+	}
+	if !strings.Contains(parentBLine, "-") {
+		t.Errorf("parent-b's row does not render an empty subagent count:\n%s", parentBLine)
+	}
+}
+
+// TestSessionsLayoutAlwaysBudgetsSubs: the count is non-negotiable, so no
+// terminal width may drop the column the way SOURCE is dropped.
+func TestSessionsLayoutAlwaysBudgetsSubs(t *testing.T) {
+	for _, width := range []int{40, 55, 80, 90, 110, 200} {
+		for _, showProject := range []bool{true, false} {
+			layout := pickSessionsLayout(width, showProject)
+			if layout.Subs <= 0 {
+				t.Errorf("width %d showProject=%v dropped the SUBS column", width, showProject)
+			}
+		}
+	}
+}
+
 func TestSessionsModel_ScopedToOneParent(t *testing.T) {
 	database := subagentTestDB(t)
 
