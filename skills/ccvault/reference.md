@@ -100,8 +100,25 @@ tool:Edit project:myapp after:month
 ## 7. Reading While a Sync Is Running
 
 The MCP server reads the same SQLite file `ccvault sync` writes, in WAL mode,
-with no cross-process lock. What a concurrent reader can observe depends on
-which sync mode is running.
+with no cross-process lock. A reader gets a consistent snapshot taken when its
+transaction starts, so it is never blocked by the in-flight writer and never
+sees a half-written transaction. Where it does have to wait — SQLite still
+serialises some operations on the WAL index — it waits up to 5 seconds
+(`busy_timeout`) before returning an error.
+
+> Accurate only since the fix for issue #47. Before that the DSN's options
+> were silently discarded by the driver, so the archive was really in
+> rollback-journal mode with `busy_timeout = 0`, and a reader contending with
+> the writer **errored immediately** instead of observing any of the
+> behaviour described below. An archive created before that fix is converted
+> to WAL the first time any ccvault command opens it.
+
+Because WAL is now real, the database has `-wal` and `-shm` sidecar files
+beside `ccvault.db`. Anything that copies the archive at the file level must
+take all three, or take a backup with `ccvault sync --rebuild`'s automatic
+backup / `BackupTo`, which produce a single self-contained file.
+
+What a concurrent reader can observe depends on which sync mode is running.
 
 | Mode | What a reader sees mid-sync |
 |------|-----------------------------|
@@ -122,6 +139,12 @@ Practical guidance:
   safe mode to run on a schedule.
 - `ccvault import <db>` is additive and runs in a single transaction: readers
   see the archive before or after the merge, never partway through.
+- `ccvault vacuum` is the one command an idle MCP server can block. Compaction
+  takes an exclusive lock, and in WAL mode holding the `-shm` index is enough
+  to deny it — so any process that has opened the archive and run a single
+  query will make `vacuum` refuse with "database is in use by another
+  process", even with no query in flight. Stop the MCP server (and the TUI)
+  before compacting. Nothing is modified when it refuses.
 
 ## 8. Staleness Note
 
