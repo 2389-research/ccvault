@@ -761,3 +761,65 @@ func TestExtractUserContent_IgnoresImageBlocks(t *testing.T) {
 		t.Errorf("extractUserContent = %q, want empty for image-only tool_result", got)
 	}
 }
+
+// --- ordinals ---
+
+// TestParseSessionReader_OrdinalsFollowFileOrder covers the position the
+// parser assigns as it walks the file. The fixture's timestamps are
+// deliberately out of order and tied, so an implementation that sorted by
+// timestamp instead of counting lines would produce different numbers.
+func TestParseSessionReader_OrdinalsFollowFileOrder(t *testing.T) {
+	// Line order: late, tie, tie, progress. Timestamp order: tie, tie,
+	// progress, late.
+	input := `{"uuid":"t-late","sessionId":"sess-ord","type":"user","timestamp":"2026-08-04T10:00:09.000Z","message":{"role":"user","content":"written first, stamped last"}}
+{"uuid":"t-tie-1","sessionId":"sess-ord","type":"assistant","timestamp":"2026-08-04T10:00:01.000Z","message":{"model":"claude","role":"assistant","content":[{"type":"text","text":"one"}]}}
+{"uuid":"t-tie-2","sessionId":"sess-ord","type":"assistant","timestamp":"2026-08-04T10:00:01.000Z","message":{"model":"claude","role":"assistant","content":[{"type":"text","text":"two"}]}}
+{"uuid":"t-progress","sessionId":"sess-ord","type":"progress","timestamp":"2026-08-04T10:00:02.000Z"}`
+
+	turns, _, _, err := ParseSessionReader(strings.NewReader(input), "/test/ordinals.jsonl")
+	if err != nil {
+		t.Fatalf("ParseSessionReader: %v", err)
+	}
+
+	want := []string{"t-late", "t-tie-1", "t-tie-2", "t-progress"}
+	if len(turns) != len(want) {
+		t.Fatalf("got %d turns, want %d", len(turns), len(want))
+	}
+	for i, id := range want {
+		if turns[i].ID != id {
+			t.Fatalf("turn %d = %q, want %q", i, turns[i].ID, id)
+		}
+		if turns[i].Ordinal != i {
+			t.Errorf("turn %q: Ordinal = %d, want %d", id, turns[i].Ordinal, i)
+		}
+	}
+}
+
+// TestParseSessionReader_OrdinalsStayGaplessAcrossSkippedLines pins the thing
+// that makes a gapless sequence a usable cursor: a line the parser could not
+// use is not a turn, so it must not leave a hole in the numbering. Counting
+// raw lines instead of kept turns would number these 0, 3, 5.
+func TestParseSessionReader_OrdinalsStayGaplessAcrossSkippedLines(t *testing.T) {
+	input := `{"uuid":"t-1","sessionId":"sess-gap","type":"user","timestamp":"2026-08-04T10:00:00.000Z","message":{"role":"user","content":"first"}}
+this is not valid json at all
+{"unclosed":
+{"uuid":"t-2","sessionId":"sess-gap","type":"assistant","timestamp":"2026-08-04T10:00:01.000Z","message":{"model":"claude","role":"assistant","content":[{"type":"text","text":"second"}]}}
+{"type":"file-history-snapshot","timestamp":"2026-08-04T10:00:02.000Z"}
+{"uuid":"t-3","sessionId":"sess-gap","type":"user","timestamp":"2026-08-04T10:00:03.000Z","message":{"role":"user","content":"third"}}`
+
+	turns, _, stats, err := ParseSessionReader(strings.NewReader(input), "/test/gaps.jsonl")
+	if err != nil {
+		t.Fatalf("ParseSessionReader: %v", err)
+	}
+	if stats.SkippedLines != 2 {
+		t.Fatalf("SkippedLines = %d, want 2", stats.SkippedLines)
+	}
+	if len(turns) != 3 {
+		t.Fatalf("got %d turns, want 3", len(turns))
+	}
+	for i, turn := range turns {
+		if turn.Ordinal != i {
+			t.Errorf("turn %q: Ordinal = %d, want %d", turn.ID, turn.Ordinal, i)
+		}
+	}
+}

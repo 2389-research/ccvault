@@ -305,8 +305,10 @@ func (s *Server) handleToolsList(req *jsonRPCRequest) {
 			},
 		},
 		{
-			Name:        "get_turns",
-			Description: "Get paginated turns from a session. Use offset to navigate through conversation.",
+			Name: "get_turns",
+			Description: "Get paginated turns from a session, in conversation order. Use offset to navigate " +
+				"through the conversation. Every turn reports its ordinal — its position in the session, " +
+				"counting from 0 — which is stable across calls and is the cursor to resume from.",
 			InputSchema: inputSchema{
 				Type: "object",
 				Properties: map[string]property{
@@ -926,8 +928,13 @@ func (s *Server) getTurns(args map[string]interface{}) (interface{}, error) {
 		}
 
 		turn := map[string]interface{}{
-			"id":        t.ID,
-			"type":      t.Type,
+			"id":   t.ID,
+			"type": t.Type,
+			// The turn's position in the session. Reported because it is what
+			// a caller resumes from: offset counts rows in whatever this call
+			// returned (and shifts when a type filter is applied), while the
+			// ordinal names the turn itself.
+			"ordinal":   t.Ordinal,
 			"timestamp": t.Timestamp.Format(time.RFC3339),
 			"content":   content,
 		}
