@@ -98,7 +98,7 @@ When in doubt, start with **Solution mining** if you have an error message or sp
 2. `search_conversations` returns 200-char snippets — enough to judge relevance without burning context
 3. Use `get_turns` with `type: "user"` to see just what the human asked, or `type: "assistant"` for just responses
 4. Always check `has_more` / `next_offset` in paginated results — don't stop at page 1
-5. Never use `get_session` for sessions with 100+ turns — it returns a warning instead of content
+5. Never use `get_session` for sessions with 100+ turns — it returns a `warnings[]` entry instead of content
 6. Combine operators to narrow before free-text: `project:X tool:Bash "deploy"` beats just `"deploy"`
 7. Use `list_projects` to discover correct project names before searching — partial match is forgiving but exact names yield better results
 8. When mining solutions, search for the error message text in quotes — FTS5 exact phrase matching is the fastest path to relevant sessions
@@ -110,7 +110,7 @@ When in doubt, start with **Solution mining** if you have an error message or sp
 - Fetching full sessions (`get_session`) when summaries suffice — wastes context window
 - Broad free-text searches without operators — returns too much noise
 - Ignoring pagination — the best results might be on page 2+
-- Using `get_session` for large sessions (100+ turns) — server returns a warning, not content
+- Using `get_session` for large sessions (100+ turns) — server returns a `warnings[]` entry, not content
 - Searching `tool:` with a fragment like `tool:ccvault` — `tool:` matches the full tool name (case-insensitive), never substrings. Built-in tools are stored as `Bash`, `Read`, `Edit`; MCP tools under their full prefixed names like `mcp__ccvault__search_conversations`. Empty results include `similar_tool_names` suggestions when close matches exist
 - Not using `type` filter on `get_turns` — reading all turn types when you only need user or assistant messages
 - Repeating searches with the same query — if it didn't work, change the query terms or operators, don't retry the same thing
