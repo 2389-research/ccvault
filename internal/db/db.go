@@ -26,7 +26,7 @@ func Open(dataDir string) (*DB, error) {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
 
-	dbPath := filepath.Join(dataDir, "ccvault.db")
+	dbPath := filepath.Join(dataDir, dbFileName)
 
 	// Open database with WAL mode for better concurrency
 	dsn := fmt.Sprintf("file:%s?_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=5000", dbPath)
