@@ -605,10 +605,18 @@ func (s *Server) searchConversations(args map[string]interface{}) (interface{}, 
 		results = results[:limit]
 	}
 
+	// Degraded enrichment queries report here, in the one top-level
+	// `warnings` array every MCP response uses, and omit their field.
+	var warnings []string
+
 	// Class C — enrich each result with a project_name so agents get
-	// {name, path} doctrine shape uniformly across MCP surfaces.
-	// Best-effort — lookup failures fall back to basename.
-	allProjects, _ := s.db.GetProjects("activity", 0)
+	// {name, path} doctrine shape uniformly across MCP surfaces. A failed
+	// lookup leaves every project_name on the basename fallback, so say so
+	// rather than passing the fallback off as the adapter-provided label.
+	allProjects, enrichErr := s.db.GetProjects("activity", 0)
+	if enrichErr != nil {
+		warnings = append(warnings, fmt.Sprintf("project enrichment unavailable: %v (result project_name values fell back to basename)", enrichErr))
+	}
 	byPath := projectref.ProjectsByPath(allProjects)
 
 	compactResults := make([]map[string]interface{}, 0, len(results))
@@ -647,7 +655,11 @@ func (s *Server) searchConversations(args map[string]interface{}) (interface{}, 
 	if len(compactResults) == 0 {
 		hint := "No results. Broaden the search: drop one filter or try different terms; use list_projects to verify project names."
 		if parsed.Tool != "" {
-			if names, err := s.db.GetToolNamesLike(parsed.Tool, 5); err == nil && len(names) > 0 {
+			names, warning := s.similarToolNames(parsed.Tool, 5)
+			switch {
+			case warning != "":
+				warnings = append(warnings, warning)
+			case len(names) > 0:
 				response["similar_tool_names"] = names
 				hint = fmt.Sprintf("No results for tool:%s — tool matching requires the full tool name. See similar_tool_names for close matches.", parsed.Tool)
 			}
@@ -655,7 +667,23 @@ func (s *Server) searchConversations(args map[string]interface{}) (interface{}, 
 		response["hint"] = hint
 	}
 
+	if len(warnings) > 0 {
+		response["warnings"] = warnings
+	}
+
 	return response, nil
+}
+
+// similarToolNames finds tool names close to a tool: fragment that matched
+// nothing. A failed lookup comes back as a single warning string — empty
+// when the lookup succeeded — so the caller reports the gap instead of
+// returning a response that reads as "no tool name resembles this".
+func (s *Server) similarToolNames(fragment string, limit int) (names []string, warning string) {
+	names, err := s.db.GetToolNamesLike(fragment, limit)
+	if err != nil {
+		return nil, fmt.Sprintf("similar_tool_names unavailable: %v", err)
+	}
+	return names, ""
 }
 
 // lookupProjectPath resolves a session's project path. A failure comes
@@ -714,7 +742,7 @@ func (s *Server) getSessionSummary(args map[string]interface{}) (interface{}, er
 	toolCounts := make(map[string]int)
 	var firstUserMsg, lastUserMsg string
 
-	for i, t := range turns {
+	for _, t := range turns {
 		turnTypeCounts[t.Type]++
 
 		// Track tool usage from raw JSON
@@ -757,8 +785,6 @@ func (s *Server) getSessionSummary(args map[string]interface{}) (interface{}, er
 					firstUserMsg = content
 				}
 				lastUserMsg = content
-				// Keep track of index for "last"
-				_ = i
 			}
 		}
 	}
@@ -1297,7 +1323,13 @@ func (s *Server) promptSummarizeRecent(args map[string]interface{}) (promptGetRe
 	var context strings.Builder
 	fmt.Fprintf(&context, "## Claude Code Activity Summary (Last %d Days)\n\n", days)
 	context.WriteString("### Archive Statistics\n")
-	statsJSON, _ := json.MarshalIndent(stats, "", "  ")
+	// The stats block IS the prompt's data, so a failed marshal must error
+	// rather than hand the model an empty code fence it would read as
+	// "the archive is empty".
+	statsJSON, err := json.MarshalIndent(stats, "", "  ")
+	if err != nil {
+		return promptGetResult{}, fmt.Errorf("marshal archive stats: %w", err)
+	}
 	context.WriteString("```json\n")
 	context.WriteString(string(statsJSON))
 	context.WriteString("\n```\n\n")
@@ -1508,7 +1540,14 @@ func (s *Server) promptCompareApproaches(args map[string]interface{}) (promptGet
 		if i >= 5 {
 			break
 		}
-		session, _ := s.db.GetSession(sessionID)
+		// Date and model are decoration on top of the snippets that carry
+		// the comparison, so a failed lookup drops that one line and logs
+		// rather than failing the prompt — the same call this file makes
+		// for a prompt's cosmetic project lookup.
+		session, err := s.db.GetSession(sessionID)
+		if err != nil {
+			s.log("session %s unavailable for compare_approaches header: %v", sessionID, err)
+		}
 		fmt.Fprintf(&context, "### Session %d (%s)\n", i+1, sessionID[:8])
 		if session != nil {
 			fmt.Fprintf(&context, "Date: %s, Model: %s\n", session.StartedAt.Format("Jan 2"), shortenModel(session.Model))
