@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/2389-research/ccvault/pkg/models"
@@ -25,10 +26,11 @@ type sessionWriter interface {
 const upsertSessionSQL = `
 	INSERT INTO sessions (id, project_id, started_at, ended_at, model, git_branch,
 		turn_count, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-		source_file, source_mtime, has_error, has_subagent, source)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		source_file, source_mtime, has_error, has_subagent, source, parent_session_id)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(id) DO UPDATE SET
 		ended_at = excluded.ended_at,
+		parent_session_id = COALESCE(excluded.parent_session_id, sessions.parent_session_id),
 		model = COALESCE(excluded.model, sessions.model),
 		turn_count = excluded.turn_count,
 		input_tokens = excluded.input_tokens,
@@ -68,6 +70,10 @@ func (db *DB) UpsertSessionTx(tx *sql.Tx, s *models.Session) error {
 // counted the session as having no file on disk, making a rebuild look more
 // destructive than it was.
 //
+// parent_session_id is guarded the same way, via COALESCE: an upsert that
+// doesn't know the session's parent leaves the stored link alone rather than
+// orphaning a subagent row that was correctly linked on a previous sync.
+//
 // Making the column updatable also made it clobberable, so the update guards
 // against an empty incoming path the same way the statement already guards
 // model: an upsert that carries no path keeps the one on the row.
@@ -105,6 +111,7 @@ func upsertSession(w sessionWriter, s *models.Session) error {
 		s.HasError,
 		s.HasSubagent,
 		source,
+		nullableString(s.ParentSessionID),
 	)
 	if err != nil {
 		return fmt.Errorf("upsert session: %w", err)
@@ -165,16 +172,21 @@ func forgetSupersededSourceFile(w sessionWriter, previousFile, currentFile strin
 //   - Making the column NOT NULL means rewriting the sessions table, a large
 //     blast radius for a defect only reachable by importing an archive that is
 //     already inconsistent.
+//
+// GetSession resolves a subagent id as readily as a top-level one — no flag,
+// no separate call. Hidden from default listings is not the same as secret.
 func (db *DB) GetSession(id string) (*models.Session, error) {
 	query := `
 		SELECT id, project_id, started_at, ended_at, model, git_branch,
 			turn_count, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-			source_file, source
+			source_file, source, parent_session_id,
+			(SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = sessions.id)
 		FROM sessions WHERE id = ?`
 
 	s := &models.Session{}
 	var endedAt sql.NullTime
 	var projectID sql.NullInt64
+	var parentSessionID sql.NullString
 	err := db.QueryRow(query, id).Scan(
 		&s.ID,
 		&projectID,
@@ -189,6 +201,8 @@ func (db *DB) GetSession(id string) (*models.Session, error) {
 		&s.CacheWriteTokens,
 		&s.SourceFile,
 		&s.Source,
+		&parentSessionID,
+		&s.SubagentCount,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -197,39 +211,120 @@ func (db *DB) GetSession(id string) (*models.Session, error) {
 		return nil, fmt.Errorf("get session: %w", err)
 	}
 	s.ProjectID = projectID.Int64
+	s.ParentSessionID = parentSessionID.String
 	if endedAt.Valid {
 		s.EndedAt = endedAt.Time
 	}
 	return s, nil
 }
 
+// SubagentScope selects which rows a session listing returns.
+type SubagentScope int
+
+const (
+	// SubagentsHidden is the default for every listing surface: top-level
+	// sessions only. On a real machine subagent transcripts outnumber
+	// top-level ones roughly 2.6:1, so listing them flat turns ~72% of a
+	// session list into agent-* rows.
+	//
+	// It also returns any subagent whose parent is NOT in this archive.
+	// Without that, a sidechain ingested without its parent (a pruned
+	// parent file, a partial merge) would appear in no listing at all and
+	// be counted by no parent's subagent_count — filtering would have
+	// become losing. Hidden is not the same as unreachable.
+	SubagentsHidden SubagentScope = iota
+
+	// SubagentsIncluded flattens the hierarchy: every session row, parents
+	// and subagents alike, in one list.
+	SubagentsIncluded
+
+	// SubagentsOf returns exactly the children of SessionQuery.ParentSessionID.
+	SubagentsOf
+)
+
+// SessionQuery describes one page of a session listing.
+type SessionQuery struct {
+	ProjectID       int64 // 0 means every project
+	Limit           int   // 0 means unlimited
+	Offset          int
+	Scope           SubagentScope
+	ParentSessionID string // required by SubagentsOf, ignored otherwise
+}
+
+// sessionListSelect is the column list every session listing reads. The
+// correlated subagent_count is what earns the default filtering: a surface
+// that hides subagent rows still reports how many it hid, per parent.
+const sessionListSelect = `
+		SELECT s.id, s.project_id, s.started_at, s.ended_at, s.model, s.git_branch,
+			s.turn_count, s.input_tokens, s.output_tokens, s.cache_read_tokens, s.cache_write_tokens,
+			s.source_file, COALESCE(p.path, '') as project_path, s.source,
+			s.parent_session_id,
+			(SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = s.id) as subagent_count
+		FROM sessions s
+		LEFT JOIN projects p ON s.project_id = p.id`
+
 // GetSessions retrieves sessions from the start of the sorted set,
-// optionally filtered to one project.
+// optionally filtered to one project. Returns parents and subagents alike;
+// listing surfaces that want the hidden-by-default behaviour call
+// QuerySessions with SubagentsHidden.
 func (db *DB) GetSessions(projectID int64, limit int) ([]models.Session, error) {
 	return db.GetSessionsPage(projectID, limit, 0)
 }
 
 // GetSessionsPage retrieves one page of sessions: up to limit rows
-// (0 means unlimited) starting at offset in the sorted set.
+// (0 means unlimited) starting at offset in the sorted set. Unfiltered —
+// analytics and export read through here precisely because subagent sessions
+// must be counted.
 func (db *DB) GetSessionsPage(projectID int64, limit, offset int) ([]models.Session, error) {
-	query := `
-		SELECT s.id, s.project_id, s.started_at, s.ended_at, s.model, s.git_branch,
-			s.turn_count, s.input_tokens, s.output_tokens, s.cache_read_tokens, s.cache_write_tokens,
-			s.source_file, COALESCE(p.path, '') as project_path, s.source
-		FROM sessions s
-		LEFT JOIN projects p ON s.project_id = p.id`
+	return db.QuerySessions(SessionQuery{
+		ProjectID: projectID,
+		Limit:     limit,
+		Offset:    offset,
+		Scope:     SubagentsIncluded,
+	})
+}
 
+// QuerySessions returns one page of sessions under the given scope. Every row
+// carries ParentSessionID and SubagentCount regardless of scope, so a caller
+// that filtered can still say what it filtered.
+func (db *DB) QuerySessions(q SessionQuery) ([]models.Session, error) {
+	query := sessionListSelect
+
+	var conditions []string
 	var args []interface{}
-	if projectID > 0 {
-		query += " WHERE s.project_id = ?"
-		args = append(args, projectID)
+
+	if q.ProjectID > 0 {
+		conditions = append(conditions, "s.project_id = ?")
+		args = append(args, q.ProjectID)
+	}
+
+	switch q.Scope {
+	case SubagentsHidden:
+		conditions = append(conditions,
+			"(s.parent_session_id IS NULL OR NOT EXISTS (SELECT 1 FROM sessions pp WHERE pp.id = s.parent_session_id))")
+	case SubagentsIncluded:
+		// No predicate — the flattened list.
+	case SubagentsOf:
+		if q.ParentSessionID == "" {
+			// Without this the clause would be dropped and the caller would
+			// silently get every session instead of one parent's children.
+			return nil, fmt.Errorf("query sessions: SubagentsOf requires a ParentSessionID")
+		}
+		conditions = append(conditions, "s.parent_session_id = ?")
+		args = append(args, q.ParentSessionID)
+	default:
+		return nil, fmt.Errorf("query sessions: unknown subagent scope %d", q.Scope)
+	}
+
+	if len(conditions) > 0 {
+		query += " WHERE " + strings.Join(conditions, " AND ")
 	}
 
 	// `s.id ASC` is a tiebreaker, not a preference: sessions that share a
 	// started_at would otherwise swap positions between calls and offset
 	// pagination would skip or repeat rows.
 	query += " ORDER BY s.started_at DESC, s.id ASC"
-	query += limitOffsetClause(limit, offset)
+	query += limitOffsetClause(q.Limit, q.Offset)
 
 	rows, err := db.Query(query, args...)
 	if err != nil {
@@ -242,6 +337,7 @@ func (db *DB) GetSessionsPage(projectID int64, limit, offset int) ([]models.Sess
 		var s models.Session
 		var endedAt sql.NullTime
 		var projectID sql.NullInt64
+		var parentSessionID sql.NullString
 		err := rows.Scan(
 			&s.ID,
 			&projectID,
@@ -257,11 +353,14 @@ func (db *DB) GetSessionsPage(projectID int64, limit, offset int) ([]models.Sess
 			&s.SourceFile,
 			&s.ProjectPath,
 			&s.Source,
+			&parentSessionID,
+			&s.SubagentCount,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scan session: %w", err)
 		}
 		s.ProjectID = projectID.Int64
+		s.ParentSessionID = parentSessionID.String
 		if endedAt.Valid {
 			s.EndedAt = endedAt.Time
 		}
@@ -269,6 +368,16 @@ func (db *DB) GetSessionsPage(projectID int64, limit, offset int) ([]models.Sess
 	}
 
 	return sessions, rows.Err()
+}
+
+// nullableString maps Go's empty string to SQL NULL. parent_session_id uses
+// NULL for "top-level", and an empty string would be a third state that every
+// read path would then have to know about.
+func nullableString(s string) interface{} {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 // GetSessionStats returns aggregate statistics for sessions

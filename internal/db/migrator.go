@@ -225,6 +225,9 @@ func applyMigration(db *sql.DB, m migration) error {
 			continue
 		}
 		if _, err := tx.Exec(stmt); err != nil {
+			if addColumnAlreadyApplied(stmt, err) {
+				continue
+			}
 			return fmt.Errorf("exec statement in %s: %w\nstatement: %s", m.filename, err, stmt)
 		}
 	}
@@ -235,6 +238,45 @@ func applyMigration(db *sql.DB, m migration) error {
 	}
 
 	return tx.Commit()
+}
+
+// addColumnAlreadyApplied reports whether a failed statement is an
+// ALTER TABLE ... ADD COLUMN whose column is already there.
+//
+// Every other kind of statement a migration runs can be written to tolerate
+// re-application — CREATE ... IF NOT EXISTS, an UPDATE with a guard clause —
+// but SQLite has no ADD COLUMN IF NOT EXISTS, so a column-adding migration
+// cannot make itself replay-safe in SQL. Migrations do get replayed: anything
+// that rewinds schema_version (a test fixture, a recovered database, a
+// hand-repaired archive) re-runs every migration above the rewind point, and
+// without this the first ADD COLUMN it reaches aborts the whole run.
+//
+// Narrow on purpose. Only this one error on only this one statement shape is
+// absorbed; a missing table, a syntax error, or any other failure still aborts
+// the migration and rolls it back.
+func addColumnAlreadyApplied(stmt string, err error) bool {
+	if err == nil {
+		return false
+	}
+	upper := strings.ToUpper(statementBody(stmt))
+	if !strings.HasPrefix(upper, "ALTER TABLE") || !strings.Contains(upper, "ADD COLUMN") {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "duplicate column name")
+}
+
+// statementBody strips the leading comment and blank lines splitStatements
+// carries along with each statement, so callers can match on the SQL itself.
+func statementBody(stmt string) string {
+	lines := strings.Split(stmt, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "--") {
+			continue
+		}
+		return strings.TrimSpace(strings.Join(lines[i:], "\n"))
+	}
+	return ""
 }
 
 // splitStatements splits SQL text into individual statements, correctly handling
