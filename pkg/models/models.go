@@ -48,6 +48,18 @@ type Session struct {
 	HasError         bool      `json:"has_error"`
 	HasSubagent      bool      `json:"has_subagent"`
 	Source           string    `json:"source"` // Which AI tool produced this data (e.g. "claude-code", "codex")
+
+	// ParentSessionID is the id of the session that dispatched this one, empty
+	// for a top-level session. A subagent transcript is its own session row
+	// (see db migration 007), identified by a minted composite id, and this is
+	// the column that carries the relationship.
+	ParentSessionID string `json:"parent_session_id,omitempty"`
+
+	// SubagentCount is how many sessions name this one as their parent. It is
+	// derived at read time, not stored. Default listings show top-level
+	// sessions only, and this count is what keeps that from hiding anything:
+	// a row that says "subagents: 3" is filtered, not secret.
+	SubagentCount int `json:"subagent_count"`
 }
 
 // TotalTokens returns the sum of all token usage

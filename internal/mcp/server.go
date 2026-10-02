@@ -347,7 +347,7 @@ func (s *Server) handleToolsList(req *jsonRPCRequest) {
 		},
 		{
 			Name:        "list_sessions",
-			Description: "List recent sessions, optionally filtered by project. Use offset for pagination.",
+			Description: "List recent top-level sessions, optionally filtered by project. Use offset for pagination. Subagent sessions are not listed by default; every row reports subagent_count, and get_session / get_turns work on a subagent id directly.",
 			InputSchema: inputSchema{
 				Type: "object",
 				Properties: map[string]property{
@@ -362,6 +362,14 @@ func (s *Server) handleToolsList(req *jsonRPCRequest) {
 					"offset": {
 						Type:        "number",
 						Description: "Skip first N sessions for pagination. Use next_offset from response.",
+					},
+					"include_subagents": {
+						Type:        "boolean",
+						Description: "List subagent sessions alongside top-level ones instead of hiding them.",
+					},
+					"subagents_of": {
+						Type:        "string",
+						Description: "List only the subagent sessions dispatched by this session id.",
 					},
 				},
 			},
@@ -627,7 +635,7 @@ func (s *Server) searchConversations(args map[string]interface{}) (interface{}, 
 			snippet = snippet[:200] + "..."
 		}
 
-		compactResults = append(compactResults, map[string]interface{}{
+		result := map[string]interface{}{
 			"session_id":   r.SessionID,
 			"turn_id":      r.Turn.ID,
 			"turn_type":    r.Turn.Type,
@@ -637,7 +645,15 @@ func (s *Server) searchConversations(args map[string]interface{}) (interface{}, 
 			"model":        r.Model,
 			"source":       r.Source,
 			"snippet":      snippet,
-		})
+			// Search is never filtered by the subagent listing default, so a
+			// hit can sit in a transcript list_sessions doesn't show. The
+			// parent id is how an agent walks back to the conversation.
+			"parent_session_id": nil,
+		}
+		if r.ParentSessionID != "" {
+			result["parent_session_id"] = r.ParentSessionID
+		}
+		compactResults = append(compactResults, result)
 	}
 
 	response := map[string]interface{}{
@@ -1085,8 +1101,26 @@ func (s *Server) listSessions(args map[string]interface{}) (interface{}, error) 
 		}
 	}
 
-	// Fetch one extra row to detect whether more sessions exist
-	sessions, err := s.db.GetSessionsPage(projectID, limit+1, offset)
+	// Default to top-level sessions only, the same default the CLI and TUI
+	// use. The per-row subagent_count (always emitted) is what keeps that
+	// from hiding anything, and get_session / get_turns reach a subagent id
+	// with no flag at all.
+	query := db.SessionQuery{
+		ProjectID: projectID,
+		// One extra row detects whether more sessions exist.
+		Limit:  limit + 1,
+		Offset: offset,
+		Scope:  db.SubagentsHidden,
+	}
+	if include, ok := args["include_subagents"].(bool); ok && include {
+		query.Scope = db.SubagentsIncluded
+	}
+	if parent, ok := args["subagents_of"].(string); ok && parent != "" {
+		query.Scope = db.SubagentsOf
+		query.ParentSessionID = parent
+	}
+
+	sessions, err := s.db.QuerySessions(query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get sessions: %w", err)
 	}
@@ -1313,8 +1347,10 @@ func (s *Server) promptSummarizeRecent(args map[string]interface{}) (promptGetRe
 		return promptGetResult{}, err
 	}
 
-	// Get recent sessions
-	sessions, err := s.db.GetSessions(0, 20)
+	// Get recent sessions. Top-level only, the same default list_sessions
+	// uses — a narrative summary of "recent activity" reads as sessions the
+	// user started, not as the agent dispatches inside them.
+	sessions, err := s.db.QuerySessions(db.SessionQuery{Limit: 20, Scope: db.SubagentsHidden})
 	if err != nil {
 		return promptGetResult{}, err
 	}
@@ -1387,8 +1423,12 @@ func (s *Server) promptAnalyzeProject(args map[string]interface{}) (promptGetRes
 	}
 	project := &matches[0]
 
-	// Get sessions for this project
-	sessions, err := s.db.GetSessions(project.ID, 50)
+	// Get sessions for this project — top-level only, matching list_sessions.
+	sessions, err := s.db.QuerySessions(db.SessionQuery{
+		ProjectID: project.ID,
+		Limit:     50,
+		Scope:     db.SubagentsHidden,
+	})
 	if err != nil {
 		return promptGetResult{}, err
 	}

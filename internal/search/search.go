@@ -30,6 +30,12 @@ type Result struct {
 	Model       string      `json:"model,omitempty"`
 	Source      string      `json:"source,omitempty"`
 	Snippet     string      `json:"snippet"`
+
+	// ParentSessionID is set when the hit is inside a subagent transcript.
+	// Search is never filtered by the hidden-by-default rule that applies to
+	// listings — the work a subagent did is most of what there is to find —
+	// so renders use this to label a hit with the session that dispatched it.
+	ParentSessionID string `json:"parent_session_id,omitempty"`
 }
 
 // Search executes a search query and returns results
@@ -51,6 +57,7 @@ func (s *Searcher) Search(q *Query, limit int) ([]Result, error) {
 	for rows.Next() {
 		var r Result
 		var content sql.NullString
+		var parentSessionID sql.NullString
 		err := rows.Scan(
 			&r.Turn.ID,
 			&r.SessionID,
@@ -60,10 +67,12 @@ func (s *Searcher) Search(q *Query, limit int) ([]Result, error) {
 			&r.ProjectPath,
 			&r.Model,
 			&r.Source,
+			&parentSessionID,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scan result: %w", err)
 		}
+		r.ParentSessionID = parentSessionID.String
 		if content.Valid {
 			r.Turn.Content = content.String
 			r.Snippet = makeSnippet(content.String, q.Text, 150)
@@ -84,7 +93,7 @@ func (s *Searcher) buildQuery(q *Query, limit int) (string, []interface{}) {
 	// Base query with joins
 	baseQuery := `
 		SELECT DISTINCT t.id, t.session_id, t.type, t.timestamp, t.content,
-			p.path as project_path, s.model, s.source
+			p.path as project_path, s.model, s.source, s.parent_session_id
 		FROM turns t
 		JOIN sessions s ON t.session_id = s.id
 		JOIN projects p ON s.project_id = p.id`

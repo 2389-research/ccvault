@@ -367,8 +367,11 @@ func (m *Model) pushView(view View, data interface{}) (*Model, tea.Cmd) {
 	case ProjectsView:
 		cmd = m.projects.Init()
 	case SessionsView:
-		if projectID, ok := data.(int64); ok {
-			m.sessions.SetProject(projectID)
+		switch d := data.(type) {
+		case int64:
+			m.sessions.SetProject(d)
+		case SubagentsOf:
+			m.sessions.SetParentSession(string(d))
 		}
 		cmd = m.sessions.Init()
 	case ConversationView:
@@ -430,6 +433,12 @@ type NavigateMsg struct {
 	View View
 	Data interface{}
 }
+
+// SubagentsOf is NavigateMsg.Data for SessionsView when the list should show
+// one session's subagents rather than a project's top-level sessions. A named
+// type rather than a bare string so the two cases can't be confused — an
+// int64 means "project", a SubagentsOf means "this parent's children".
+type SubagentsOf string
 
 // ErrorMsg is sent when an error occurs
 type ErrorMsg struct {

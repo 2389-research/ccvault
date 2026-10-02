@@ -68,42 +68,55 @@ type sessionsLayout struct {
 	Source  int // 0 → drop
 	Turns   int
 	Tokens  int
-	Model   int
+	// Subs is the subagent count per row. Never 0: the list filters subagent
+	// sessions out by default (roughly 75% of rows on a real machine), and
+	// the count is what makes that a sensible default rather than a silent
+	// drop. Dropping the column the way SOURCE is dropped would leave a
+	// reader with no sign the hidden rows exist, so MODEL gives up width
+	// instead. TestSessionsLayoutAlwaysBudgetsSubs guards this.
+	Subs  int
+	Model int
 }
 
 func pickSessionsLayout(terminalWidth int, showProject bool) sessionsLayout {
-	// showProject=true: 6 cols, 5 seps, +2 pad ≤ terminalWidth
-	// showProject=false: 5 cols, 4 seps, +2 pad ≤ terminalWidth
+	// showProject=true: 7 cols, 6 seps, +2 pad ≤ terminalWidth
+	// showProject=false: 6 cols, 5 seps, +2 pad ≤ terminalWidth
+	// (one fewer separator in each case when SOURCE is dropped)
 	// Every tier verified by TestSessionsLayoutFitsWithinBudget.
 	switch {
 	case terminalWidth >= 110:
 		if showProject {
-			// 22+20+10+6+10+24=92, +5=97, +2=99 ≤ 110 ✓
-			return sessionsLayout{Project: 22, Started: 20, Source: 10, Turns: 6, Tokens: 10, Model: 24}
+			// 22+20+10+6+10+4+24=96, +6=102, +2=104 ≤ 110 ✓
+			return sessionsLayout{Project: 22, Started: 20, Source: 10, Turns: 6, Tokens: 10, Subs: 4, Model: 24}
 		}
-		// 20+12+6+10+30=78, +4=82, +2=84 ≤ 110 ✓
-		return sessionsLayout{Project: 0, Started: 20, Source: 12, Turns: 6, Tokens: 10, Model: 30}
+		// 20+12+6+10+4+30=82, +5=87, +2=89 ≤ 110 ✓
+		return sessionsLayout{Project: 0, Started: 20, Source: 12, Turns: 6, Tokens: 10, Subs: 4, Model: 30}
 	case terminalWidth >= 90:
 		if showProject {
-			// 18+16+8+6+10+20=78, +5=83, +2=85 ≤ 90 ✓
-			return sessionsLayout{Project: 18, Started: 16, Source: 8, Turns: 6, Tokens: 10, Model: 20}
+			// MODEL 20→17 to pay for SUBS.
+			// 18+16+8+6+10+4+17=79, +6=85, +2=87 ≤ 90 ✓
+			return sessionsLayout{Project: 18, Started: 16, Source: 8, Turns: 6, Tokens: 10, Subs: 4, Model: 17}
 		}
-		// 20+8+6+10+24=68, +4=72, +2=74 ≤ 90 ✓
-		return sessionsLayout{Project: 0, Started: 20, Source: 8, Turns: 6, Tokens: 10, Model: 24}
+		// 20+8+6+10+4+24=72, +5=77, +2=79 ≤ 90 ✓
+		return sessionsLayout{Project: 0, Started: 20, Source: 8, Turns: 6, Tokens: 10, Subs: 4, Model: 24}
 	case terminalWidth >= 80:
 		if showProject {
-			// 16+14+6+5+8+18=67, +5=72, +2=74 ≤ 80 ✓
-			return sessionsLayout{Project: 16, Started: 14, Source: 6, Turns: 5, Tokens: 8, Model: 18}
+			// MODEL 18→17 to pay for SUBS.
+			// 16+14+6+5+8+4+17=70, +6=76, +2=78 ≤ 80 ✓
+			return sessionsLayout{Project: 16, Started: 14, Source: 6, Turns: 5, Tokens: 8, Subs: 4, Model: 17}
 		}
-		// 20+8+6+10+20=64, +4=68, +2=70 ≤ 80 ✓
-		return sessionsLayout{Project: 0, Started: 20, Source: 8, Turns: 6, Tokens: 10, Model: 20}
+		// 20+8+6+10+4+20=68, +5=73, +2=75 ≤ 80 ✓
+		return sessionsLayout{Project: 0, Started: 20, Source: 8, Turns: 6, Tokens: 10, Subs: 4, Model: 20}
 	default:
 		if showProject {
-			// 14+12+0+4+6+12=48, +5=53, +2=55 ≤ 55 ✓
-			return sessionsLayout{Project: 14, Started: 12, Source: 0, Turns: 4, Tokens: 6, Model: 12}
+			// MODEL 12→7 to pay for SUBS; compact.Model strips the
+			// "claude-" prefix well before that, so the cell stays legible.
+			// 14+12+0+4+6+4+7=47, +5=52, +2=54 ≤ 55 ✓
+			return sessionsLayout{Project: 14, Started: 12, Source: 0, Turns: 4, Tokens: 6, Subs: 4, Model: 7}
 		}
-		// 14+6+4+6+14=44, +4=48, +2=50 ≤ 55 ✓
-		return sessionsLayout{Project: 0, Started: 14, Source: 6, Turns: 4, Tokens: 6, Model: 14}
+		// MODEL 14→9 to pay for SUBS.
+		// 14+6+4+6+4+9=43, +5=48, +2=50 ≤ 55 ✓
+		return sessionsLayout{Project: 0, Started: 14, Source: 6, Turns: 4, Tokens: 6, Subs: 4, Model: 9}
 	}
 }
 
@@ -122,8 +135,8 @@ func (l projectsLayout) totalWidth() int {
 
 // totalWidth for sessionsLayout, same shape.
 func (l sessionsLayout) totalWidth() int {
-	cols := l.Started + l.Turns + l.Tokens + l.Model
-	seps := 3 // between Started/Turns/Tokens/Model
+	cols := l.Started + l.Turns + l.Tokens + l.Subs + l.Model
+	seps := 4 // between Started/Turns/Tokens/Subs/Model
 	if l.Project > 0 {
 		cols += l.Project
 		seps++

@@ -390,6 +390,16 @@ func (s *Syncer) processSession(ctx context.Context, sf adapter.SessionFile, adp
 			session.HasSubagent = b
 		}
 	}
+	// A subagent transcript is its own session row, linked to the session that
+	// dispatched it. Adapters derive the parent id from the on-disk layout
+	// (the transcript's own sessionId field is the parent's, which is why it
+	// can't be used as an identity). Dropping this on the floor is what left
+	// every previously-ingested sidechain row orphaned.
+	if v, ok := parsed.Metadata["parent_session_id"]; ok {
+		if s, ok := v.(string); ok {
+			session.ParentSessionID = s
+		}
+	}
 	// skipped_lines and turns_with_truncated_raw_json diagnostics are
 	// aggregated immediately after Parse, above the empty-session guard,
 	// so a file with no valid turns still contributes to sync totals.

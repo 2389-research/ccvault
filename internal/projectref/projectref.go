@@ -171,6 +171,13 @@ func SessionRef(s *models.Session, projectsByID map[int64]*models.Project) map[s
 		projectName = Label(&models.Project{Path: s.ProjectPath})
 	}
 	// Fields WITHOUT omitempty on models.Session are always present.
+	//
+	// parent_session_id and subagent_count are always present too, filtered
+	// or not. Listings default to top-level sessions, so a script reading the
+	// default output has to be able to see that rows were held back and which
+	// parent holds them — a listing that silently drops rows is a trap.
+	// parent_session_id is null rather than "" for a top-level session: an
+	// empty string would be a third state for consumers to learn.
 	out := map[string]any{
 		"id":                 s.ID,
 		"project_id":         s.ProjectID,
@@ -185,6 +192,11 @@ func SessionRef(s *models.Session, projectsByID map[int64]*models.Project) map[s
 		"has_error":          s.HasError,
 		"has_subagent":       s.HasSubagent,
 		"source":             s.Source,
+		"parent_session_id":  nil,
+		"subagent_count":     s.SubagentCount,
+	}
+	if s.ParentSessionID != "" {
+		out["parent_session_id"] = s.ParentSessionID
 	}
 	// Fields WITH omitempty on models.Session — emit only when non-zero.
 	if s.ProjectPath != "" {

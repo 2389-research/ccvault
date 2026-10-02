@@ -77,7 +77,7 @@ ccvault stats
 | `stats` | Show archive statistics, including reclaimable space |
 | `vacuum` | Reclaim dead space in the database file (see [Storage reclaim](#storage-reclaim)) |
 | `list-projects` | List all indexed projects |
-| `list-sessions` | List sessions (optionally filtered by project) |
+| `list-sessions` | List top-level sessions (optionally filtered by project; `--include-subagents` / `--subagents-of <id>` expand subagent transcripts) |
 | `show [session-id]` | Display a specific session |
 | `export [session-id]` | Export a session to markdown |
 | `build-cache` | Build Parquet analytics cache |

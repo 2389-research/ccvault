@@ -701,6 +701,12 @@ Supports Gmail-like query syntax:
 				p = &models.Project{Path: r.ProjectPath}
 			}
 			fmt.Printf("   Project: %s\n", projectref.Inline(p))
+			// Search is never filtered, so hits land inside subagent
+			// transcripts that no default listing shows. Naming the parent
+			// is how the reader places the hit in a conversation.
+			if r.ParentSessionID != "" {
+				fmt.Printf("   Subagent of: %s\n", r.ParentSessionID)
+			}
 			if r.Model != "" {
 				fmt.Printf("   Model: %s\n", r.Model)
 			}
@@ -969,6 +975,138 @@ var listProjectsCmd = &cobra.Command{
 	},
 }
 
+// subagentScopeFromFlags maps the list-sessions flags onto a listing scope.
+// The default hides subagent sessions — on a real machine they outnumber
+// top-level sessions roughly 2.6:1 — while every row still reports how many
+// it stands for. --subagents-of beats --include-subagents because asking for
+// one parent's children is the more specific request.
+func subagentScopeFromFlags(includeSubagents bool, subagentsOf string) (db.SubagentScope, string) {
+	switch {
+	case subagentsOf != "":
+		return db.SubagentsOf, subagentsOf
+	case includeSubagents:
+		return db.SubagentsIncluded, ""
+	default:
+		return db.SubagentsHidden, ""
+	}
+}
+
+// Column widths for the list-sessions table. Named so the header, the rows,
+// and the separator cannot drift apart — they used to be three magic numbers
+// maintained by hand.
+const (
+	// sessionsIDMinWidth is the historical SESSION ID width: a 36-char uuid
+	// plus two of gutter. It stays the floor so a listing of only top-level
+	// sessions renders exactly as it always has.
+	sessionsIDMinWidth   = 38
+	sessionsIDGutter     = 2
+	sessionsProjectWidth = 25
+	sessionsStartedWidth = 16
+	sessionsTurnsWidth   = 6
+	sessionsTokensWidth  = 10
+	sessionsSubsWidth    = 5
+	sessionsModelWidth   = 25
+)
+
+// sessionIDColumnWidth sizes the SESSION ID column to the ids actually being
+// rendered.
+//
+// A minted subagent id is 72 characters —
+// claude-code:<36-char uuid>:agent-<17 hex> — against a top-level session's
+// 36. A fixed-width %-38s pads but never truncates, so a single subagent row
+// pushed every column after it 34 places right while the header stayed where
+// it was, leaving a reader unable to tell which column was which.
+//
+// Widening rather than truncating is deliberate: the id is the string a user
+// copies into `ccvault show` / `ccvault export`, and a shortened id is worse
+// than a wide column.
+func sessionIDColumnWidth(sessions []models.Session) int {
+	width := sessionsIDMinWidth
+	for _, s := range sessions {
+		if w := visualWidthCLI(s.ID) + sessionsIDGutter; w > width {
+			width = w
+		}
+	}
+	return width
+}
+
+// sessionsTableWidth is the full visible width of the table, used for the
+// separator rule so it always spans exactly the rendered columns.
+func sessionsTableWidth(idWidth int, showProject bool) int {
+	cols := idWidth + sessionsStartedWidth + sessionsTurnsWidth +
+		sessionsTokensWidth + sessionsSubsWidth + sessionsModelWidth
+	seps := 5
+	if showProject {
+		cols += sessionsProjectWidth
+		seps++
+	}
+	return cols + seps
+}
+
+// renderSessionsTable formats the list-sessions table. Extracted from the
+// command so the header/row/separator alignment is testable — the one
+// property that makes the table readable at all.
+func renderSessionsTable(sessions []models.Session, showProject bool, byPath map[string]*models.Project) string {
+	idWidth := sessionIDColumnWidth(sessions)
+
+	var b strings.Builder
+	if showProject {
+		fmt.Fprintf(&b, "%s %-*s %*s %*s %*s %*s %s\n",
+			padVisualCLI("SESSION ID", idWidth),
+			sessionsProjectWidth, "PROJECT",
+			sessionsStartedWidth, "STARTED",
+			sessionsTurnsWidth, "TURNS",
+			sessionsTokensWidth, "TOKENS",
+			sessionsSubsWidth, "SUBS",
+			"MODEL")
+	} else {
+		fmt.Fprintf(&b, "%s %*s %*s %*s %*s %s\n",
+			padVisualCLI("SESSION ID", idWidth),
+			sessionsStartedWidth, "STARTED",
+			sessionsTurnsWidth, "TURNS",
+			sessionsTokensWidth, "TOKENS",
+			sessionsSubsWidth, "SUBS",
+			"MODEL")
+	}
+	b.WriteString(strings.Repeat("-", sessionsTableWidth(idWidth, showProject)))
+	b.WriteString("\n")
+
+	for _, s := range sessions {
+		model := s.Model
+		if len(model) > sessionsModelWidth {
+			model = model[:sessionsModelWidth-3] + "..."
+		}
+		tokens := s.InputTokens + s.OutputTokens
+		if showProject {
+			// Class A — LabelFromPath surfaces adapter DisplayName
+			// instead of falling through to basename. Route through
+			// compact.Truncate so multibyte adapter labels don't get
+			// byte-sliced (e.g. Cyrillic "Иванов-project").
+			project := compact.Truncate(projectref.LabelFromPath(s.ProjectPath, byPath), sessionsProjectWidth-2).Text
+			fmt.Fprintf(&b, "%s %s %*s %*d %*s %*s %s\n",
+				padVisualCLI(s.ID, idWidth),
+				padVisualCLI(project, sessionsProjectWidth),
+				sessionsStartedWidth, s.StartedAt.Format("2006-01-02 15:04"),
+				sessionsTurnsWidth, s.TurnCount,
+				sessionsTokensWidth, formatTokens(tokens),
+				sessionsSubsWidth, compact.SubagentCount(s.SubagentCount),
+				model,
+			)
+		} else {
+			fmt.Fprintf(&b, "%s %*s %*d %*s %*s %s\n",
+				padVisualCLI(s.ID, idWidth),
+				sessionsStartedWidth, s.StartedAt.Format("2006-01-02 15:04"),
+				sessionsTurnsWidth, s.TurnCount,
+				sessionsTokensWidth, formatTokens(tokens),
+				sessionsSubsWidth, compact.SubagentCount(s.SubagentCount),
+				model,
+			)
+		}
+	}
+
+	return b.String()
+}
+
 var listSessionsCmd = &cobra.Command{
 	Use:   "list-sessions",
 	Short: "List sessions",
@@ -976,6 +1114,8 @@ var listSessionsCmd = &cobra.Command{
 		jsonOutput, _ := cmd.Flags().GetBool("json")
 		projectFilter, _ := cmd.Flags().GetString("project")
 		limit, _ := cmd.Flags().GetInt("limit")
+		includeSubagents, _ := cmd.Flags().GetBool("include-subagents")
+		subagentsOf, _ := cmd.Flags().GetString("subagents-of")
 
 		cfg, err := loadConfig(cmd)
 		if err != nil {
@@ -1022,7 +1162,13 @@ var listSessionsCmd = &cobra.Command{
 			}
 		}
 
-		sessions, err := database.GetSessions(projectID, limit)
+		scope, parentSessionID := subagentScopeFromFlags(includeSubagents, subagentsOf)
+		sessions, err := database.QuerySessions(db.SessionQuery{
+			ProjectID:       projectID,
+			Limit:           limit,
+			Scope:           scope,
+			ParentSessionID: parentSessionID,
+		})
 		if err != nil {
 			return fmt.Errorf("get sessions: %w", err)
 		}
@@ -1057,43 +1203,7 @@ var listSessionsCmd = &cobra.Command{
 			}
 			byPath = projectref.ProjectsByPath(allProjects)
 		}
-		if showProject {
-			fmt.Printf("%-38s %-25s %16s %6s %10s %s\n", "SESSION ID", "PROJECT", "STARTED", "TURNS", "TOKENS", "MODEL")
-			fmt.Println(strings.Repeat("-", 125))
-		} else {
-			fmt.Printf("%-38s %16s %6s %10s %s\n", "SESSION ID", "STARTED", "TURNS", "TOKENS", "MODEL")
-			fmt.Println(strings.Repeat("-", 100))
-		}
-		for _, s := range sessions {
-			model := s.Model
-			if len(model) > 25 {
-				model = model[:22] + "..."
-			}
-			tokens := s.InputTokens + s.OutputTokens
-			if showProject {
-				// Class A — LabelFromPath surfaces adapter DisplayName
-				// instead of falling through to basename. Route through
-				// compact.Truncate so multibyte adapter labels don't get
-				// byte-sliced (e.g. Cyrillic "Иванов-project").
-				project := compact.Truncate(projectref.LabelFromPath(s.ProjectPath, byPath), 23).Text
-				fmt.Printf("%-38s %-25s %16s %6d %10s %s\n",
-					s.ID,
-					project,
-					s.StartedAt.Format("2006-01-02 15:04"),
-					s.TurnCount,
-					formatTokens(tokens),
-					model,
-				)
-			} else {
-				fmt.Printf("%-38s %16s %6d %10s %s\n",
-					s.ID,
-					s.StartedAt.Format("2006-01-02 15:04"),
-					s.TurnCount,
-					formatTokens(tokens),
-					model,
-				)
-			}
-		}
+		fmt.Print(renderSessionsTable(sessions, showProject, byPath))
 
 		return nil
 	},
@@ -1146,6 +1256,16 @@ var showCmd = &cobra.Command{
 		fmt.Printf("Model: %s\n", session.Model)
 		fmt.Printf("Started: %s\n", session.StartedAt.Format("2006-01-02 15:04:05"))
 		fmt.Printf("Turns: %d\n", len(turns))
+		// The way a reader discovers that a session dispatched work into
+		// transcripts the default listing doesn't show, and the way back up
+		// from one of those transcripts to the session that started it.
+		if session.ParentSessionID != "" {
+			fmt.Printf("Subagent of: %s\n", session.ParentSessionID)
+		}
+		if session.SubagentCount > 0 {
+			fmt.Printf("Subagents: %d (ccvault list-sessions --subagents-of %s)\n",
+				session.SubagentCount, session.ID)
+		}
 		fmt.Println(strings.Repeat("=", 60))
 		fmt.Println()
 
@@ -1456,6 +1576,8 @@ func init() {
 	listSessionsCmd.Flags().Bool("json", false, "Output as JSON")
 	listSessionsCmd.Flags().String("project", "", "Filter by project")
 	listSessionsCmd.Flags().Int("limit", 50, "Maximum number of results")
+	listSessionsCmd.Flags().Bool("include-subagents", false, "List subagent sessions alongside top-level ones")
+	listSessionsCmd.Flags().String("subagents-of", "", "List only the subagent sessions dispatched by this session id")
 
 	// Show flags
 	showCmd.Flags().Bool("json", false, "Output as JSON")
@@ -1504,15 +1626,21 @@ func formatBytes(n int64) string {
 	return fmt.Sprintf("%.1f PB", value/unit)
 }
 
+// visualWidthCLI returns the visible column count of s (runes, not bytes).
+func visualWidthCLI(s string) int {
+	visW := 0
+	for range s {
+		visW++
+	}
+	return visW
+}
+
 // padVisualCLI left-pads s to visual column width using rune count.
 // Mirrors internal/tui.padVisual — sprintf's %-Ns pads by bytes and
 // would misalign columns when compact.* returns strings containing "…"
 // (3 bytes / 1 col) or non-ASCII path segments.
 func padVisualCLI(s string, width int) string {
-	visW := 0
-	for range s {
-		visW++
-	}
+	visW := visualWidthCLI(s)
 	if visW >= width {
 		return s
 	}

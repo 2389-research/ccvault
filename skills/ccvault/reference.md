@@ -4,11 +4,11 @@
 
 | Tool | Required Params | Optional Params | Returns | Notes |
 |------|----------------|-----------------|---------|-------|
-| `search_conversations` | `query` (string) | `limit` (number, default 10, max 50), `offset` (number) | Paginated results with 200-char snippets | Check `has_more` / `next_offset` for pagination. Each result carries `project_name` (the adapter-provided label, or the path basename as fallback) alongside `project_path`. An empty result for a `tool:` query adds `similar_tool_names` with close matches; both that lookup and the project-name enrichment are enrichment queries — if one fails, its field is omitted and a `warnings` entry (`similar_tool_names unavailable: …` / `project enrichment unavailable: …`) appears instead |
+| `search_conversations` | `query` (string) | `limit` (number, default 10, max 50), `offset` (number) | Paginated results with 200-char snippets | Check `has_more` / `next_offset` for pagination. Each result carries `project_name` (the adapter-provided label, or the path basename as fallback) alongside `project_path`. An empty result for a `tool:` query adds `similar_tool_names` with close matches; both that lookup and the project-name enrichment are enrichment queries — if one fails, its field is omitted and a `warnings` entry (`similar_tool_names unavailable: …` / `project enrichment unavailable: …`) appears instead. Search is **never** filtered by the subagent listing default, so a hit can sit in a transcript `list_sessions` does not show: each result carries `parent_session_id` (null when the hit is in a top-level session) |
 | `get_session_summary` | `session_id` (string) | — | Metadata, turn counts by type, top 10 tools used, first/last user messages (500 chars each) | Most cost-effective entry point for any session |
-| `get_turns` | `session_id` (string) | `offset` (number, default 0), `limit` (number, default 20, max 50), `type` (user/assistant/tool_result) | Paginated turns, content truncated at 1000 chars | Includes tool names; `has_thinking` flag on assistant turns |
+| `get_turns` | `session_id` (string) | `offset` (number, default 0), `limit` (number, default 20, max 50), `type` (user/assistant/tool_result) | Paginated turns, content truncated at 1000 chars | Includes tool names; `has_thinking` flag on assistant turns. Accepts a subagent session id with no extra parameter |
 | `get_session` | `session_id` (string) | — | Full session as markdown | Sessions over 100 turns come back without `markdown`: the response carries `session_id`, `turn_count`, `hint`, and a `markdown unavailable: large session with N turns...` entry in the top-level `warnings[]` array — there is no singular `warning` field. Markdown truncates at 50K chars. Prefer summary + turns for large sessions |
-| `list_sessions` | — | `project` (string, partial match), `limit` (number, default 20, max 100), `offset` (number, default 0) | Recent sessions sorted by date desc, OR an `ambiguous_project_filter` object when the `project` filter matches multiple projects | Partial match on path or display name; returns error (not empty) if no project matches; when the filter matches N>1 projects, returns `{ambiguous_project_filter: true, filter, matched_projects: [{name, path}], hint}` instead of sessions — the agent then re-calls with a more specific filter (typically a full path). Paginates like `search_conversations`: check `has_more` / `next_offset`. Session objects include both `project_path` and `project_name` — the adapter-provided label if any, or the basename fallback. |
+| `list_sessions` | — | `project` (string, partial match), `limit` (number, default 20, max 100), `offset` (number, default 0), `include_subagents` (bool, default false), `subagents_of` (string, a session id) | Recent **top-level** sessions sorted by date desc, OR an `ambiguous_project_filter` object when the `project` filter matches multiple projects | Partial match on path or display name; returns error (not empty) if no project matches; when the filter matches N>1 projects, returns `{ambiguous_project_filter: true, filter, matched_projects: [{name, path}], hint}` instead of sessions — the agent then re-calls with a more specific filter (typically a full path). Paginates like `search_conversations`: check `has_more` / `next_offset`. Session objects include both `project_path` and `project_name` — the adapter-provided label if any, or the basename fallback — plus `parent_session_id` (null for top-level) and `subagent_count`, always, filtered or not. Subagent sessions are hidden by default; `include_subagents: true` flattens them in, `subagents_of: "<id>"` returns just one session's children. |
 | `list_projects` | — | `sort` (name/activity/tokens/sessions, default: activity), `limit` (number, default 50, max 100), `offset` (number, default 0) | Projects with session counts and token usage | Use to discover project names before searching; paginates like `search_conversations` — check `has_more` / `next_offset`. Each project object carries both `name` (the adapter-provided label) and `path` (the disambiguating identifier) — always prefer `path` when uniqueness matters. Sort order includes `path ASC` as tiebreaker so pagination stays stable. |
 | `get_stats` | — | — | Archive-wide counts: projects, sessions, turns, total tokens, model breakdown, top tools, date range | Fast overview of the entire archive. `first_activity`, `last_activity`, `days_span`, and `top_tools` are enrichment fields: if their queries fail the fields are omitted and a `warnings` entry is added instead |
 | `get_analytics` | — | `days` (number, default 30) | Daily token breakdown, top projects, model breakdown | Requires DuckDB analytics cache; when the cache is missing, returns `analytics.available: false` with a build-cache hint. Warnings from any degraded query — stats or analytics — appear at `result.warnings`; the embedded `summary` never carries its own `warnings` |
@@ -97,7 +97,46 @@ tool:Edit project:myapp after:month
 | Full session markdown | 50,000 chars |
 | Tools list in summary | Top 10 |
 
-## 7. Reading While a Sync Is Running
+## 7. Subagent Sessions
+
+A subagent (`Task`/Agent dispatch) writes its own transcript, which the archive
+stores as its **own session row** with a minted composite id:
+
+```
+claude-code:04fb5717-c508-4503-ac85-dc11787cafaa:agent-a01b71e80ea28b3ad
+nanoclaw:845f7a4e-2827-4f87-8c31-2e4d0b429405:agent-a07c3516373ab4719
+ \___ source ___/ \______ parent session uuid ______/ \___ agentId ___/
+```
+
+The id is minted because the transcript's own `sessionId` field holds the
+*parent's* uuid — trusting it would overwrite the session that dispatched the
+work. `parent_session_id` carries the relationship; it is null for a top-level
+session.
+
+Why this matters for reading the archive:
+
+- Subagent transcripts **outnumber top-level ones** (roughly 2.6:1 on a real
+  machine), and they hold about **29% more tokens on top of their parents** —
+  none of it double-counted, because a parent transcript contains no sidechain
+  lines at all. That is where most of the actual tool work lives.
+- **Listings hide them by default** — `list_sessions`, `ccvault list-sessions`,
+  and the TUI session list all show top-level sessions only. Every row reports
+  `subagent_count`, so a filtered listing still tells you what it filtered.
+- **Nothing is unreachable.** `get_session`, `get_turns`, `ccvault show`, and
+  `ccvault export` all take a subagent id with no flag. To expand them:
+  `list_sessions {include_subagents: true}` or `{subagents_of: "<id>"}`;
+  `ccvault list-sessions --include-subagents` / `--subagents-of <id>`; in the
+  TUI, press `a` in a session's conversation view.
+- **Search is never filtered.** A hit inside a subagent transcript comes back
+  like any other, with `parent_session_id` naming the session that dispatched
+  it.
+- **Analytics and `get_stats` always count them.** Totals taken before this
+  landed are lower for that reason; they were undercounting, not drifting.
+- A subagent whose parent is *not* in the archive is shown in the default
+  listing rather than hidden, since no parent's `subagent_count` would
+  otherwise account for it.
+
+## 8. Reading While a Sync Is Running
 
 The MCP server reads the same SQLite file `ccvault sync` writes, in WAL mode,
 with no cross-process lock. A reader gets a consistent snapshot taken when its
@@ -146,6 +185,6 @@ Practical guidance:
   process", even with no query in flight. Stop the MCP server (and the TUI)
   before compacting. Nothing is modified when it refuses.
 
-## 8. Staleness Note
+## 9. Staleness Note
 
 This reference reflects the ccvault MCP server as of its creation. If a query or tool call fails unexpectedly, check the actual MCP server tool descriptions (via the `tools/list` method) which are the authoritative source of truth.

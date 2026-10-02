@@ -229,6 +229,15 @@ func (m *ConversationModel) Update(msg tea.Msg) tea.Cmd {
 			return m.exportSession
 		case msg.String() == "c":
 			return m.copyToClipboard
+		case msg.String() == "a":
+			// Expand this session's subagents. Nothing to expand is not an
+			// error — it just doesn't navigate.
+			if m.session != nil && m.session.SubagentCount > 0 {
+				parent := m.session.ID
+				return func() tea.Msg {
+					return NavigateMsg{View: SessionsView, Data: SubagentsOf(parent)}
+				}
+			}
 		}
 
 	case tea.MouseMsg:
@@ -302,6 +311,15 @@ func (m *ConversationModel) View() string {
 		if m.session.Source != "" {
 			parts = append(parts, m.session.Source)
 		}
+		// Subagent transcripts are hidden from the session list, so the
+		// detail view is where both directions of the relationship surface:
+		// how much work this session dispatched, and what dispatched it.
+		if m.session.SubagentCount > 0 {
+			parts = append(parts, fmt.Sprintf("%d subagents (a)", m.session.SubagentCount))
+		}
+		if m.session.ParentSessionID != "" {
+			parts = append(parts, fmt.Sprintf("subagent of %s", m.session.ParentSessionID))
+		}
 		b.WriteString(subtitleStyle.Render(strings.Join(parts, " • ")))
 		b.WriteString("\n\n")
 	}
@@ -324,7 +342,11 @@ func (m *ConversationModel) View() string {
 	if m.ready {
 		scrollPercent = int(m.viewport.ScrollPercent() * 100)
 	}
-	b.WriteString(helpStyle.Render(fmt.Sprintf("↑/↓/pgup/pgdn: scroll • c: copy • e: export • %d%% • esc/q: back • ctrl+c: quit", scrollPercent)))
+	help := fmt.Sprintf("↑/↓/pgup/pgdn: scroll • c: copy • e: export • %d%% • esc/q: back • ctrl+c: quit", scrollPercent)
+	if m.session != nil && m.session.SubagentCount > 0 {
+		help = fmt.Sprintf("↑/↓/pgup/pgdn: scroll • a: subagents • c: copy • e: export • %d%% • esc/q: back • ctrl+c: quit", scrollPercent)
+	}
+	b.WriteString(helpStyle.Render(help))
 
 	return b.String()
 }

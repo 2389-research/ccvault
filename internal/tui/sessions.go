@@ -27,6 +27,10 @@ type SessionsModel struct {
 	cursor    int
 	offset    int
 	loading   bool
+
+	// parentSessionID scopes the list to one session's subagents. Empty
+	// means the default list: top-level sessions only.
+	parentSessionID string
 }
 
 // NewSessionsModel creates a new sessions model
@@ -40,6 +44,17 @@ func NewSessionsModel(database *db.DB) *SessionsModel {
 // SetProject sets the project to show sessions for
 func (m *SessionsModel) SetProject(projectID int64) {
 	m.projectID = projectID
+	m.parentSessionID = ""
+	m.cursor = 0
+	m.offset = 0
+}
+
+// SetParentSession scopes the list to the subagent sessions one session
+// dispatched. This is how the conversation view expands a parent's subagents:
+// they are hidden from the default list, never unreachable from it.
+func (m *SessionsModel) SetParentSession(parentSessionID string) {
+	m.parentSessionID = parentSessionID
+	m.projectID = 0
 	m.cursor = 0
 	m.offset = 0
 }
@@ -59,7 +74,12 @@ func (m *SessionsModel) loadSessions() tea.Msg {
 		}
 	}
 
-	sessions, err := m.db.GetSessions(m.projectID, 0)
+	query := db.SessionQuery{ProjectID: m.projectID, Scope: db.SubagentsHidden}
+	if m.parentSessionID != "" {
+		query.Scope = db.SubagentsOf
+		query.ParentSessionID = m.parentSessionID
+	}
+	sessions, err := m.db.QuerySessions(query)
 	if err != nil {
 		return ErrorMsg{Err: err}
 	}
@@ -150,7 +170,10 @@ func (m *SessionsModel) View() string {
 	// Title — Class B (inline), path shown so same-basename projects don't
 	// render an ambiguous title when the user drills into one of them.
 	title := "Sessions"
-	if m.project != nil {
+	switch {
+	case m.parentSessionID != "":
+		title = fmt.Sprintf("Subagents of %s", m.parentSessionID)
+	case m.project != nil:
 		title = fmt.Sprintf("Sessions: %s", projectref.Inline(m.project))
 	}
 	b.WriteString(titleStyle.Render(title))
@@ -178,6 +201,7 @@ func (m *SessionsModel) View() string {
 		headerParts = append(headerParts,
 			padVisual("TURNS", layout.Turns),
 			padVisual("TOKENS", layout.Tokens),
+			padVisual("SUBS", layout.Subs),
 			padVisual("MODEL", layout.Model),
 		)
 		b.WriteString(headerStyle.Render(strings.Join(headerParts, " ")))
@@ -230,6 +254,11 @@ func (m *SessionsModel) View() string {
 			parts = append(parts,
 				padVisual(fmt.Sprintf("%d", s.TurnCount), layout.Turns),
 				padVisual(formatTokensPlain(tokens), layout.Tokens),
+				// Subagent rows are filtered out of this list by default, so
+				// this count is the only sign from here that they exist —
+				// and the cue that `a` in the conversation view will open
+				// them. Spelled the same way as `ccvault list-sessions`.
+				padVisual(compact.SubagentCount(s.SubagentCount), layout.Subs),
 				cellText(compact.Model(s.Model, layout.Model), layout.Model, selected),
 			)
 
