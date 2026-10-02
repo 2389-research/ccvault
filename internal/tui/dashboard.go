@@ -232,7 +232,7 @@ func (m *DashboardModel) View() string {
 	}
 
 	// Help
-	b.WriteString(helpStyle.Render("↑/↓: navigate • enter: select • r: refresh • q: quit"))
+	b.WriteString(helpStyle.Render("↑/↓: navigate • enter: select • /: search • r: refresh • q: quit"))
 
 	return b.String()
 }

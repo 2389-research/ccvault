@@ -324,7 +324,7 @@ func (m *ConversationModel) View() string {
 	if m.ready {
 		scrollPercent = int(m.viewport.ScrollPercent() * 100)
 	}
-	b.WriteString(helpStyle.Render(fmt.Sprintf("↑/↓: scroll • pgup/pgdn: page • c: copy • e: export • %d%% • esc: back", scrollPercent)))
+	b.WriteString(helpStyle.Render(fmt.Sprintf("↑/↓/pgup/pgdn: scroll • c: copy • e: export • %d%% • esc/q: back • ctrl+c: quit", scrollPercent)))
 
 	return b.String()
 }

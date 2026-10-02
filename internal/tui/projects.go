@@ -215,7 +215,7 @@ func (m *ProjectsModel) View() string {
 	}
 
 	b.WriteString("\n")
-	b.WriteString(helpStyle.Render("↑/↓: navigate • enter: view sessions • pgup/pgdn: page • esc: back • q: quit"))
+	b.WriteString(helpStyle.Render("↑/↓: navigate • enter: sessions • pgup/pgdn: page • esc/q: back • ctrl+c: quit"))
 
 	return b.String()
 }

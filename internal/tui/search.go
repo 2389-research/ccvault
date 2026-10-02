@@ -44,6 +44,12 @@ func NewSearchModel(database *db.DB) *SearchModel {
 	}
 }
 
+// InputFocused reports whether the query input holds keyboard focus. The app
+// consults this before claiming a printable rune for global navigation.
+func (m *SearchModel) InputFocused() bool {
+	return m.focused
+}
+
 // Init initializes the search model
 func (m *SearchModel) Init() tea.Cmd {
 	m.input.Focus()
@@ -68,6 +74,16 @@ func (m *SearchModel) Update(msg tea.Msg) tea.Cmd {
 		return nil
 
 	case tea.KeyMsg:
+		// While the query input holds focus, printable runes are text and go
+		// straight to it. The single-key shortcuts below would otherwise claim
+		// some of them — "/" refocuses the input, so it was untypable, and the
+		// vim keys g/G belong to results browsing only.
+		if m.focused && isTextRune(msg) {
+			var cmd tea.Cmd
+			m.input, cmd = m.input.Update(msg)
+			return cmd
+		}
+
 		switch msg.String() {
 		case "ctrl+c":
 			return nil // Let parent handle quit
@@ -415,9 +431,10 @@ func (m *SearchModel) View() string {
 	// Footer with context-sensitive help
 	b.WriteString("\n\n")
 	if m.focused {
-		b.WriteString(helpStyle.Render("enter: search │ tab/↓: results │ esc: back"))
+		// No "q: back" here: while the input has focus, q is a character.
+		b.WriteString(helpStyle.Render("enter: search │ tab/↓: results │ esc: back │ ctrl+c: quit"))
 	} else {
-		b.WriteString(helpStyle.Render("enter: open │ ↑/↓: navigate │ pgup/pgdn: page │ /: search │ esc: back"))
+		b.WriteString(helpStyle.Render("enter: open │ ↑/↓/pgup/pgdn: nav │ /: search │ esc/q: back │ ctrl+c: quit"))
 	}
 
 	return b.String()

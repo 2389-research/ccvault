@@ -250,7 +250,7 @@ func (m *SessionsModel) View() string {
 	}
 
 	b.WriteString("\n")
-	b.WriteString(helpStyle.Render("↑/↓: navigate • enter: view conversation • pgup/pgdn: page • esc: back"))
+	b.WriteString(helpStyle.Render("↑/↓: navigate • enter: open • pgup/pgdn: page • esc/q: back • ctrl+c: quit"))
 
 	return b.String()
 }

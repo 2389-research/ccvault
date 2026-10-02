@@ -101,6 +101,27 @@ var keys = KeyMap{
 	),
 }
 
+// isTextRune reports whether a key event carries printable text rather than a
+// command. A single space arrives as tea.KeySpace rather than KeyRunes, and an
+// alt-modified rune is a command combo, not a character.
+func isTextRune(msg tea.KeyMsg) bool {
+	if msg.Alt {
+		return false
+	}
+	return msg.Type == tea.KeyRunes || msg.Type == tea.KeySpace
+}
+
+// textInputFocused reports whether the current view has a text input holding
+// keyboard focus, in which case printable runes are that input's to consume.
+func (m *Model) textInputFocused() bool {
+	// Search is the only view with a text input; the rest navigate with
+	// single keys. Add a case here when another view grows one.
+	if m.view == SearchView {
+		return m.search.InputFocused()
+	}
+	return false
+}
+
 // Model is the main TUI model
 type Model struct {
 	db       *db.DB
@@ -229,6 +250,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.view = DashboardView
 			m.viewStack = []View{DashboardView}
 			return m, m.dashboard.Init()
+		}
+
+		// A focused text input owns every printable rune. Without this,
+		// global single-key navigation makes those characters untypable:
+		// q popped the search view before the input ever saw it, so no
+		// query containing "q" could be entered. ctrl+c is handled above
+		// and stays universal; esc, tab and the arrows are not text, so
+		// they keep navigating.
+		if isTextRune(msg) && m.textInputFocused() {
+			break
 		}
 
 		// Global key handling
