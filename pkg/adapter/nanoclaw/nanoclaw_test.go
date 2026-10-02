@@ -108,7 +108,7 @@ func TestNanoclawAdapter_Discover_IgnoresMetaJSON(t *testing.T) {
 		t.Fatalf("Discover() error: %v", err)
 	}
 	for _, f := range files {
-		if strings.HasSuffix(f.Path, subagentMetaSuffix) {
+		if strings.HasSuffix(f.Path, ".meta.json") {
 			t.Errorf("meta.json leaked into discovery: %s", f.Path)
 		}
 	}
@@ -271,7 +271,7 @@ func TestNanoclawAdapter_Parse_SubagentWithoutMeta(t *testing.T) {
 	}
 }
 
-func TestNanoclawAdapter_isSubagentPath(t *testing.T) {
+func TestNanoclawAdapter_dispatchesOnSubagentPath(t *testing.T) {
 	cases := []struct {
 		path string
 		want bool
@@ -285,8 +285,8 @@ func TestNanoclawAdapter_isSubagentPath(t *testing.T) {
 		{"/foo/.claude/projects/-x/subagents.jsonl", false},
 	}
 	for _, c := range cases {
-		if got := isSubagentPath(c.path); got != c.want {
-			t.Errorf("isSubagentPath(%q) = %v, want %v", c.path, got, c.want)
+		if got := adapter.IsSubagentPath(c.path); got != c.want {
+			t.Errorf("adapter.IsSubagentPath(%q) = %v, want %v", c.path, got, c.want)
 		}
 	}
 }
@@ -316,7 +316,7 @@ func writeNanoclawTree(t *testing.T, group, parentUUID, agentID string) (root, p
 
 	// Sibling meta.json — optional but the primary fixture exercises the
 	// happy path where agentType is populated.
-	metaPath := filepath.Join(subDir, agentID+subagentMetaSuffix)
+	metaPath := filepath.Join(subDir, agentID+".meta.json")
 	if err := os.WriteFile(metaPath, []byte(`{"agentType":"general-purpose"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}

@@ -5,6 +5,7 @@ package claudecode
 
 import (
 	"encoding/json"
+	"path/filepath"
 
 	"github.com/2389-research/ccvault/pkg/adapter"
 	"github.com/2389-research/ccvault/pkg/models"
@@ -32,18 +33,30 @@ func (a *Adapter) Name() string {
 
 // Discover scans a Claude Code home directory for session files and returns them
 // as adapter.SessionFile entries.
+//
+// Subagent transcripts are walked separately: ScanClaudeHome skips subagents/
+// directories and rejects the non-uuid agent-<hex>.jsonl naming, and the
+// nanoclaw adapter depends on it continuing to do both. Parse tells the two
+// apart by path, so Discover can return them in one list.
 func (a *Adapter) Discover(root string) ([]adapter.SessionFile, error) {
 	parserFiles, err := parser.ScanClaudeHome(root)
 	if err != nil {
 		return nil, err
 	}
 
-	files := make([]adapter.SessionFile, len(parserFiles))
-	for i, pf := range parserFiles {
-		files[i] = adapter.SessionFile{
-			Path:        pf.Path,
-			ProjectPath: pf.ProjectPath,
-			ModTime:     pf.ModTime,
+	subagentFiles, err := parser.ScanSubagentFiles(filepath.Join(root, "projects"))
+	if err != nil {
+		return nil, err
+	}
+
+	files := make([]adapter.SessionFile, 0, len(parserFiles)+len(subagentFiles))
+	for _, group := range [][]parser.SessionFile{parserFiles, subagentFiles} {
+		for _, pf := range group {
+			files = append(files, adapter.SessionFile{
+				Path:        pf.Path,
+				ProjectPath: pf.ProjectPath,
+				ModTime:     pf.ModTime,
+			})
 		}
 	}
 	return files, nil
@@ -118,8 +131,36 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 		metadata["turns_with_truncated_raw_json"] = stats.TurnsWithTruncatedRawJSON
 	}
 
+	sessionID := session.ID
+	if adapter.IsSubagentPath(path) {
+		// A subagent transcript's in-band sessionId is its PARENT's uuid, so
+		// session.ID here is the parent's. Trusting it would make every
+		// subagent collide with the session that dispatched it on
+		// sessions.id. Mint the composite id instead and record the link in
+		// metadata, which sync writes to sessions.parent_session_id.
+		parentUUID := adapter.SubagentParentUUID(path)
+		if parentUUID == "" {
+			parentUUID = session.ID
+		}
+		agentID := adapter.SubagentAgentID(path)
+		sessionID = adapter.SubagentSessionID(a.Name(), parentUUID, agentID)
+
+		metadata["is_sidechain"] = true
+		if agentID != "" {
+			metadata["agent_id"] = agentID
+		}
+		if parentUUID != "" {
+			// Claude Code stores top-level sessions under their bare uuid,
+			// so that is the parent's id in the sessions table.
+			metadata["parent_session_id"] = parentUUID
+		}
+		if meta := adapter.ReadSubagentMeta(path); meta.AgentType != "" {
+			metadata["agent_type"] = meta.AgentType
+		}
+	}
+
 	parsed := &adapter.ParsedSession{
-		ID:          session.ID,
+		ID:          sessionID,
 		ProjectPath: session.ProjectPath,
 		DisplayName: parser.GetDisplayName(session.ProjectPath),
 		Turns:       parsedTurns,

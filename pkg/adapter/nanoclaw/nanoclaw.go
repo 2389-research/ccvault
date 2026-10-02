@@ -19,9 +19,6 @@ import (
 const (
 	sessionIDPrefix     = "nanoclaw:"
 	scheduledTaskPrefix = "[SCHEDULED TASK - "
-	subagentDirName     = "subagents"
-	subagentFilePrefix  = "agent-"
-	subagentMetaSuffix  = ".meta.json"
 )
 
 func init() {
@@ -99,47 +96,23 @@ func (a *Adapter) Discover(root string) ([]adapter.SessionFile, error) {
 	return files, nil
 }
 
-// discoverSubagents walks a .claude/projects/ tree collecting every
-// */subagents/agent-*.jsonl file. Missing trees are treated as empty.
+// discoverSubagents collects every */subagents/agent-*.jsonl file under a
+// .claude/projects/ tree, re-labelled with nanoclaw's group project path
+// (the shared walker derives a project path from the encoded directory name,
+// which is not how nanoclaw names its projects). Missing trees are empty.
 func discoverSubagents(projectsDir, projectPath string) ([]adapter.SessionFile, error) {
-	info, err := os.Stat(projectsDir)
+	parserFiles, err := parser.ScanSubagentFiles(projectsDir)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("stat nanoclaw projects dir: %w", err)
-	}
-	if !info.IsDir() {
-		return nil, nil
+		return nil, fmt.Errorf("nanoclaw subagents: %w", err)
 	}
 
-	var files []adapter.SessionFile
-	walkErr := filepath.WalkDir(projectsDir, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			return nil
-		}
-		if filepath.Base(filepath.Dir(path)) != subagentDirName {
-			return nil
-		}
-		name := d.Name()
-		if !strings.HasPrefix(name, subagentFilePrefix) || !strings.HasSuffix(name, ".jsonl") {
-			return nil
-		}
-		sf := adapter.SessionFile{
-			Path:        path,
+	files := make([]adapter.SessionFile, 0, len(parserFiles))
+	for _, pf := range parserFiles {
+		files = append(files, adapter.SessionFile{
+			Path:        pf.Path,
 			ProjectPath: projectPath,
-		}
-		if fi, err := d.Info(); err == nil {
-			sf.ModTime = fi.ModTime()
-		}
-		files = append(files, sf)
-		return nil
-	})
-	if walkErr != nil {
-		return nil, fmt.Errorf("walk nanoclaw subagents: %w", walkErr)
+			ModTime:     pf.ModTime,
+		})
 	}
 	return files, nil
 }
@@ -159,7 +132,7 @@ func nanoclawProjectPath(group string) (projectPath, display string) {
 // Dispatches to the subagent branch when the path lives under a subagents/ directory,
 // otherwise treats it as a parent session.
 func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
-	if isSubagentPath(path) {
+	if adapter.IsSubagentPath(path) {
 		return parseSubagent(path)
 	}
 	return parseParent(path)
@@ -212,9 +185,9 @@ func parseSubagent(path string) (*adapter.ParsedSession, error) {
 	}
 
 	group := extractGroup(path)
-	parentUUID := extractParentUUID(path)
-	agentID := extractAgentID(path)
-	agentType := readAgentType(path)
+	parentUUID := adapter.SubagentParentUUID(path)
+	agentID := adapter.SubagentAgentID(path)
+	agentType := adapter.ReadSubagentMeta(path).AgentType
 
 	parsedTurns, meta := buildTurnsAndMetadata(turns, false)
 	meta["is_sidechain"] = true
@@ -241,19 +214,15 @@ func parseSubagent(path string) (*adapter.ParsedSession, error) {
 		meta["parent_session_id"] = sessionIDPrefix + session.ID
 	}
 
-	// Unique ID: <prefix><parent-uuid>:<agent-id> — falls back sensibly when
-	// either component is missing so we never emit an empty ID for a real file.
-	id := sessionIDPrefix
-	switch {
-	case parentUUID != "" && agentID != "":
-		id += parentUUID + ":" + agentID
-	case session.ID != "" && agentID != "":
-		id += session.ID + ":" + agentID
-	case agentID != "":
-		id += agentID
-	default:
-		id += session.ID
+	// Unique ID: <source>:<parent-uuid>:<agent-id>, minted by the shared
+	// helper so claude-code and nanoclaw cannot drift onto two spellings of
+	// the same composite id. Falls back to the in-band sessionId when the
+	// path yields no parent, so a real file never gets an empty id.
+	parentForID := parentUUID
+	if parentForID == "" {
+		parentForID = session.ID
 	}
+	id := adapter.SubagentSessionID("nanoclaw", parentForID, agentID)
 
 	projectPath, display := nanoclawProjectPath(group)
 
@@ -341,17 +310,6 @@ func buildTurnsAndMetadata(turns []models.Turn, reclassifyScheduled bool) ([]ada
 	return parsedTurns, metadata
 }
 
-// isSubagentPath reports whether a path lives under a subagents/ directory.
-func isSubagentPath(path string) bool {
-	dir := filepath.ToSlash(filepath.Dir(path))
-	for _, p := range strings.Split(dir, "/") {
-		if p == subagentDirName {
-			return true
-		}
-	}
-	return false
-}
-
 // extractGroup parses the group name from a nanoclaw session path.
 // Path pattern: .../sessions/{group}/.claude/...
 func extractGroup(path string) string {
@@ -362,58 +320,6 @@ func extractGroup(path string) string {
 		}
 	}
 	return ""
-}
-
-// extractParentUUID returns the parent session UUID for a subagent path.
-// Path pattern: .../projects/<encoded>/<parent-uuid>/subagents/agent-*.jsonl
-func extractParentUUID(path string) string {
-	parts := strings.Split(filepath.ToSlash(path), "/")
-	for i, p := range parts {
-		if p == subagentDirName && i >= 1 {
-			return parts[i-1]
-		}
-	}
-	return ""
-}
-
-// extractAgentID pulls the agent id out of a subagent filename like
-// "agent-a7ae9e5a676a18b62.jsonl" → "agent-a7ae9e5a676a18b62". Keeping the
-// full stem (prefix included) means the ID lines up with the sibling meta.json
-// filename and any other on-disk artifacts.
-func extractAgentID(path string) string {
-	base := filepath.Base(path)
-	if !strings.HasSuffix(base, ".jsonl") {
-		return ""
-	}
-	return strings.TrimSuffix(base, ".jsonl")
-}
-
-// readAgentType reads the agentType field from the sibling meta.json alongside
-// a subagent JSONL. Missing files or malformed JSON return an empty string —
-// meta.json is optional context, not a hard requirement for ingestion.
-func readAgentType(subagentPath string) string {
-	stem := extractAgentID(subagentPath)
-	if stem == "" {
-		return ""
-	}
-	metaPath := filepath.Join(filepath.Dir(subagentPath), stem+subagentMetaSuffix)
-	data, err := os.ReadFile(metaPath)
-	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			// Non-missing read errors are still non-fatal — the session parses
-			// fine without the type — but we surface nothing rather than a
-			// misleading value.
-			return ""
-		}
-		return ""
-	}
-	var meta struct {
-		AgentType string `json:"agentType"`
-	}
-	if err := json.Unmarshal(data, &meta); err != nil {
-		return ""
-	}
-	return meta.AgentType
 }
 
 // turnHasError reports whether the raw turn carries a tool_result with is_error: true.
