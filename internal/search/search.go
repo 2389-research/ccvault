@@ -147,6 +147,15 @@ func (s *Searcher) buildQuery(q *Query, limit int) (string, []interface{}) {
 	// make the planner scan all 965,000 turns. UNION also collapses a turn
 	// whose content and several of whose payloads all matched down to the one
 	// row the caller asked for.
+	//
+	// It is not free. Measured on a copy of the author's 965,061-turn archive,
+	// against the same binary minus this change: "git commit" 0.56s -> 1.67s,
+	// "deploy" 0.38s -> 0.87s, a query matching nothing unchanged at 0.03s. A
+	// UNION has to materialise both hit sets where the single-index form could
+	// stream one. "the", which matches almost every turn, was 17.0s before and
+	// 15.5s after — that query's cost is the sort, not the match. Searching
+	// two indexes for roughly twice the time of searching one is the trade;
+	// the absolute numbers stay inside a second for a query anyone would type.
 	prefix := ""
 	matchArg := 0
 
