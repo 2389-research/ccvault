@@ -17,6 +17,11 @@ ALTER TABLE tool_uses ADD COLUMN tool_use_id TEXT;
 
 -- The call's arguments, stored whole and never truncated. Measured across the
 -- author's 259,836 calls: 78.6 MB in total, p50 72 bytes, largest 99,792.
+--
+-- Not guaranteed to parse as JSON, despite the name — which follows the column
+-- agentsview established. It holds the arguments as the source recorded them,
+-- and codex's custom_tool_call records a plain-text body (that is how
+-- apply_patch sends a diff). Check json_valid before json_extract.
 ALTER TABLE tool_uses ADD COLUMN input_json TEXT;
 ALTER TABLE tool_uses ADD COLUMN input_length INTEGER;
 

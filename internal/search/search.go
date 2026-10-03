@@ -174,10 +174,22 @@ func (s *Searcher) buildQuery(q *Query, limit int) (string, []interface{}) {
 		argNum++
 	}
 
+	// A query with no text has no payload to attribute a match to, and takes
+	// the two trailing columns as literals so Search scans one row shape
+	// either way. Selected here rather than by wrapping the finished query in
+	// an outer SELECT: the wrap would put this query's ORDER BY inside a
+	// subquery, and SQLite does not promise that order survives into the
+	// enclosing SELECT. The ordering is load-bearing — see the comment on it
+	// below.
+	matchedToolCols := ""
+	if q.Text == "" {
+		matchedToolCols = ", NULL, NULL"
+	}
+
 	// Base query with joins
 	baseQuery := `
 		SELECT DISTINCT t.id, t.session_id, t.type, t.timestamp, t.ordinal, t.content,
-			p.path as project_path, s.model, s.source, s.parent_session_id
+			p.path as project_path, s.model, s.source, s.parent_session_id` + matchedToolCols + `
 		FROM turns t
 		JOIN sessions s ON t.session_id = s.id
 		JOIN projects p ON s.project_id = p.id`
@@ -267,9 +279,7 @@ func (s *Searcher) buildQuery(q *Query, limit int) (string, []interface{}) {
 	baseQuery += fmt.Sprintf(" LIMIT %d", limit)
 
 	if q.Text == "" {
-		// No text, so no payload to attribute a match to. The two trailing
-		// columns are still selected so Search scans one row shape.
-		return "SELECT *, NULL, NULL FROM (" + baseQuery + ")", args
+		return baseQuery, args
 	}
 
 	// The page is computed first and the payload lookup applied to it, not the

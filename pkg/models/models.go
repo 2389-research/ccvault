@@ -123,6 +123,13 @@ type ToolUse struct {
 	// InputJSON is the call's arguments, stored whole. Inputs are never
 	// omitted: 259,836 of them total 78.6 MB across the author's archive, p50
 	// 72 bytes, largest 99,792.
+	//
+	// Not guaranteed to parse as JSON, despite the name — which follows the
+	// column agentsview established. It holds the arguments exactly as the
+	// source recorded them, and one source does not record JSON: codex's
+	// custom_tool_call carries a plain-text body in `input`, which is how
+	// apply_patch sends a diff. Treat it as text; json_extract it only after
+	// checking json_valid.
 	InputJSON string `json:"input_json,omitempty"`
 
 	// InputLength is len(InputJSON). Stored rather than derived so a consumer

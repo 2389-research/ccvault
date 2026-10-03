@@ -74,7 +74,6 @@ type toolRequestData struct {
 type toolResultData struct {
 	ToolID        string `json:"tool_id"`
 	OutputPreview string `json:"output_preview"`
-	Success       bool   `json:"success"`
 }
 
 // Discover scans the Jeff sessions directory for JSONL session files and returns

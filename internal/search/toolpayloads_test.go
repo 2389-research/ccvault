@@ -239,3 +239,33 @@ func TestSearch_ProjectFilterStillComposes(t *testing.T) {
 		t.Errorf("got %v, want none for a non-matching project", resultIDs(results))
 	}
 }
+
+// TestSearch_NonTextQueryKeepsItsOrdering guards the shape of the no-text
+// branch. Adding the two match-attribution columns must not push this query's
+// ORDER BY inside a subquery: SQLite does not promise a subquery's order
+// survives into the enclosing SELECT, and the ordering is what keeps which
+// rows fall inside LIMIT stable between runs over the same data.
+func TestSearch_NonTextQueryKeepsItsOrdering(t *testing.T) {
+	searcher := New(setupPayloadSearchDB(t).DB)
+
+	// tool: with no text is the branch that selects NULL for the match columns.
+	results, err := searcher.Search(Parse("tool:Bash"), 10)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(results) < 2 {
+		t.Fatalf("got %d results, want at least 2 to have an order worth checking", len(results))
+	}
+	for i := 1; i < len(results); i++ {
+		prev, cur := results[i-1].Turn.Timestamp, results[i].Turn.Timestamp
+		if cur.After(prev) {
+			t.Errorf("result %d (%s) is newer than result %d (%s); the query is meant to be timestamp DESC",
+				i, cur, i-1, prev)
+		}
+	}
+	for _, r := range results {
+		if r.MatchedToolName != "" {
+			t.Errorf("MatchedToolName = %q, want empty for a query with no text", r.MatchedToolName)
+		}
+	}
+}
