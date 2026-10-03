@@ -245,7 +245,13 @@ func TestMigrator_BootstrapPartial(t *testing.T) {
 	db := openMemoryDB(t)
 	defer func() { _ = db.Close() }()
 
-	// Simulate a database with only the initial schema (no has_error/has_subagent)
+	// Simulate a database with only the initial schema (no has_error/has_subagent).
+	//
+	// The tables here have to carry what migration 001 actually creates, not a
+	// subset of it. detectExistingState bootstraps this database to version 1,
+	// which asserts "everything 001 creates is present", and every later
+	// migration is entitled to rely on that. turns.raw_json and the tool_uses
+	// table were missing until migration 009 — which reads both — needed them.
 	stmts := []string{
 		`CREATE TABLE projects (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -263,7 +269,16 @@ func TestMigrator_BootstrapPartial(t *testing.T) {
 			session_id TEXT,
 			type TEXT NOT NULL,
 			timestamp DATETIME NOT NULL,
-			content TEXT
+			content TEXT,
+			raw_json TEXT
+		)`,
+		`CREATE TABLE tool_uses (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			turn_id TEXT,
+			session_id TEXT,
+			tool_name TEXT NOT NULL,
+			file_path TEXT,
+			timestamp DATETIME NOT NULL
 		)`,
 	}
 	for _, stmt := range stmts {
