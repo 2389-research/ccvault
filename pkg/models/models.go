@@ -108,6 +108,46 @@ type ToolUse struct {
 	ToolName  string    `json:"tool_name"`
 	FilePath  string    `json:"file_path,omitempty"` // For file-related tools
 	Timestamp time.Time `json:"timestamp"`
+
+	// ToolUseID is the id the source gave this call, verbatim — toolu_… for
+	// Claude Code and nanoclaw, call_… for codex, jeff's tool_id (empty on 85%
+	// of real jeff requests). Empty for a source that mints no id.
+	//
+	// The provider's own id rather than a surrogate, because its job is to be
+	// joinable against ids recorded elsewhere. A subagent transcript's
+	// meta.json carries a toolUseId naming the exact call that dispatched it
+	// (#31, resolving for 87 of 95 real subagents), and that link had nowhere
+	// to land until this column existed.
+	ToolUseID string `json:"tool_use_id,omitempty"`
+
+	// InputJSON is the call's arguments, stored whole. Inputs are never
+	// omitted: 259,836 of them total 78.6 MB across the author's archive, p50
+	// 72 bytes, largest 99,792.
+	InputJSON string `json:"input_json,omitempty"`
+
+	// InputLength is len(InputJSON). Stored rather than derived so a consumer
+	// reading a row can size the payload without fetching it.
+	InputLength int `json:"input_length,omitempty"`
+
+	// HasResult reports whether the source recorded a result for this call. It
+	// separates "the tool answered with nothing" from "no answer was ever
+	// recorded" — an interrupted call, which the empty string cannot express.
+	HasResult bool `json:"has_result"`
+
+	// ResultContent is the result text, empty when the content was left out
+	// (see ResultOmittedReason) or when the tool genuinely returned nothing.
+	ResultContent string `json:"result_content,omitempty"`
+
+	// ResultLength is the result's size as the transcript carries it,
+	// recorded whether or not the content was stored. See
+	// toolpayload.Result.Length for the exact definition.
+	ResultLength int `json:"result_length,omitempty"`
+
+	// ResultOmittedReason names why ResultContent was left out — one of
+	// toolpayload's Omit* values, empty when the content is stored. A consumer
+	// reads this instead of re-deriving the classification from tool_name and
+	// ResultLength.
+	ResultOmittedReason string `json:"result_omitted_reason,omitempty"`
 }
 
 // RawTurn represents the raw JSONL entry from Claude Code

@@ -437,13 +437,7 @@ func (s *Syncer) processSession(ctx context.Context, sf adapter.SessionFile, adp
 
 		// Convert tool uses
 		for _, ptu := range pt.ToolUses {
-			toolUses = append(toolUses, models.ToolUse{
-				TurnID:    pt.ID,
-				SessionID: parsed.ID,
-				ToolName:  ptu.ToolName,
-				FilePath:  ptu.FilePath,
-				Timestamp: pt.Timestamp,
-			})
+			toolUses = append(toolUses, adapter.ToolUseFromParsed(ptu, pt.ID, parsed.ID, pt.Timestamp))
 		}
 	}
 

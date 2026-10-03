@@ -284,10 +284,7 @@ func buildTurnsAndMetadata(turns []models.Turn, reclassifyScheduled bool) ([]ada
 
 		if tus, ok := toolUsesByTurn[t.ID]; ok {
 			for _, tu := range tus {
-				pt.ToolUses = append(pt.ToolUses, adapter.ParsedToolUse{
-					ToolName: tu.ToolName,
-					FilePath: tu.FilePath,
-				})
+				pt.ToolUses = append(pt.ToolUses, adapter.ParsedToolUseFromModel(tu))
 				if tu.ToolName == "Task" || tu.ToolName == "Agent" {
 					hasSubagent = true
 				}
