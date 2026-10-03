@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/2389-research/ccvault/pkg/models"
+	"github.com/2389-research/ccvault/pkg/toolpayload"
 )
 
 // ParseStats reports counts of anomalies the parser handled while reading a
@@ -396,8 +397,18 @@ func parseTimestamp(s string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("unknown timestamp format: %s", s)
 }
 
-// ExtractToolUses extracts tool usage information from turns
+// ExtractToolUses extracts tool usage information from turns, including each
+// call's provider id, its input, and the result it produced.
+//
+// Two passes, because a call and its result live in different turns: Claude
+// Code writes the tool_use into an assistant message and the tool_result into
+// a later user message, joined by tool_use_id. The first pass indexes the
+// results by that id, the second walks the calls and attaches them. Pairing by
+// position would be wrong — a turn can issue several calls and their results
+// come back in whatever order they finish, which they demonstrably do.
 func ExtractToolUses(turns []models.Turn) []models.ToolUse {
+	results := collectToolResults(turns)
+
 	var toolUses []models.ToolUse
 
 	for _, turn := range turns {
@@ -424,12 +435,23 @@ func ExtractToolUses(turns []models.Turn) []models.ToolUse {
 				TurnID:    turn.ID,
 				SessionID: turn.SessionID,
 				ToolName:  content.Name,
+				ToolUseID: content.ID,
 				Timestamp: turn.Timestamp,
 			}
 
 			// Extract file path for file-related tools
 			if content.Input != nil {
 				toolUse.FilePath = extractFilePath(content.Name, content.Input)
+				toolUse.InputJSON = string(content.Input)
+				toolUse.InputLength = len(content.Input)
+			}
+
+			if rawResult, ok := results[content.ID]; ok && content.ID != "" {
+				decided := toolpayload.ResultFromJSON(content.Name, rawResult)
+				toolUse.HasResult = true
+				toolUse.ResultContent = decided.Content
+				toolUse.ResultLength = decided.Length
+				toolUse.ResultOmittedReason = decided.OmitReason
 			}
 
 			toolUses = append(toolUses, toolUse)
@@ -437,6 +459,63 @@ func ExtractToolUses(turns []models.Turn) []models.ToolUse {
 	}
 
 	return toolUses
+}
+
+// rawToolResultBlock is a tool_result content block as the transcripts write
+// it. Content is left raw because the sources use both shapes: a JSON string
+// (129,296 of the author's results) and an array of content blocks (130,516).
+//
+// Deliberately separate from models.UserContentBlock, whose Content is typed
+// as a string. Retyping that field would change what extractUserContent
+// produces for every turn carrying an array-valued result, and so rewrite
+// turns.content — and turns_fts behind it — for a third of the archive. That
+// is a real bug (see the note on TestExtractUserContent_IgnoresImageBlocks)
+// but it is not this change's bug, and the new payloads reach search through
+// their own index rather than by disturbing that one.
+type rawToolResultBlock struct {
+	Type      string          `json:"type"`
+	ToolUseID string          `json:"tool_use_id"`
+	Content   json.RawMessage `json:"content"`
+}
+
+// collectToolResults indexes every tool_result block in the session by the
+// tool_use_id it names. Walks all turn types rather than only "user": the
+// result's home is the user message today, and keying on the block's own type
+// costs nothing and does not assume that.
+func collectToolResults(turns []models.Turn) map[string]json.RawMessage {
+	results := make(map[string]json.RawMessage)
+
+	for _, turn := range turns {
+		var raw models.RawTurn
+		if err := json.Unmarshal(turn.RawJSON, &raw); err != nil || raw.Message == nil {
+			continue
+		}
+
+		var msg models.RawUserMessage
+		if err := json.Unmarshal(raw.Message, &msg); err != nil {
+			continue
+		}
+
+		var blocks []rawToolResultBlock
+		if err := json.Unmarshal(msg.Content, &blocks); err != nil {
+			// A plain-string message content, which carries no tool results.
+			continue
+		}
+
+		for _, block := range blocks {
+			if block.Type != "tool_result" || block.ToolUseID == "" {
+				continue
+			}
+			// First result wins. A repeated id would mean the transcript
+			// answered one call twice; keeping the first keeps the mapping
+			// stable regardless of which turn order a re-parse sees.
+			if _, seen := results[block.ToolUseID]; !seen {
+				results[block.ToolUseID] = block.Content
+			}
+		}
+	}
+
+	return results
 }
 
 // extractUserContent extracts text from user message content

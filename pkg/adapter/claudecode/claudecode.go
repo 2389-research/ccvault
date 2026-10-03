@@ -104,10 +104,7 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 		// Convert tool uses for this turn
 		if tus, ok := toolUsesByTurn[t.ID]; ok {
 			for _, tu := range tus {
-				pt.ToolUses = append(pt.ToolUses, adapter.ParsedToolUse{
-					ToolName: tu.ToolName,
-					FilePath: tu.FilePath,
-				})
+				pt.ToolUses = append(pt.ToolUses, adapter.ParsedToolUseFromModel(tu))
 				// Subagent detection: any tool use with ToolName == "Task"
 				if tu.ToolName == "Task" {
 					hasSubagent = true

@@ -376,8 +376,13 @@ func (m *SearchModel) View() string {
 				}
 				b.WriteString("\n")
 
-				// Snippet (indented)
+				// Snippet (indented). A hit found through a stored tool
+				// payload is labelled, because the text below is command
+				// output or tool arguments rather than conversation.
 				snippet := r.Snippet
+				if r.MatchedToolName != "" {
+					snippet = "[" + r.MatchedToolName + "] " + snippet
+				}
 				maxSnippetLen := m.width - 6
 				if maxSnippetLen < 20 {
 					maxSnippetLen = 20

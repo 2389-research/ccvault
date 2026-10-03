@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/2389-research/ccvault/pkg/adapter"
+	"github.com/2389-research/ccvault/pkg/toolpayload"
 )
 
 func init() {
@@ -62,10 +63,34 @@ type messagePayload struct {
 	} `json:"content"`
 }
 
-// functionCallPayload holds the fields from a response_item function_call payload.
+// functionCallPayload holds the fields from a response_item tool-call payload.
+//
+// Codex writes two shapes. `function_call` carries its arguments as a JSON
+// string in `arguments`; `custom_tool_call` — which is how apply_patch, the
+// edit tool, arrives — carries a plain-text body in `input`. Both identify the
+// call with `call_id`, and both are answered by a matching `*_output` payload
+// carrying the same id.
 type functionCallPayload struct {
-	Type string `json:"type"`
-	Name string `json:"name"`
+	Type      string `json:"type"`
+	Name      string `json:"name"`
+	CallID    string `json:"call_id"`
+	Arguments string `json:"arguments"`
+	Input     string `json:"input"`
+}
+
+// payload returns the call's arguments, whichever field the shape used.
+func (p functionCallPayload) payload() string {
+	if p.Arguments != "" {
+		return p.Arguments
+	}
+	return p.Input
+}
+
+// functionCallOutputPayload holds the fields from a response_item
+// function_call_output or custom_tool_call_output payload.
+type functionCallOutputPayload struct {
+	CallID string `json:"call_id"`
+	Output string `json:"output"`
 }
 
 // turnContextPayload holds the fields from a turn_context payload.
@@ -186,6 +211,14 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 		// Track last total token counts to compute per-turn deltas
 		prevInputTokens  int64
 		prevOutputTokens int64
+
+		// A call and the output answering it are separate lines joined by
+		// call_id, so both halves are collected as they come and matched after
+		// the file is read. Resolving inline would only work while outputs
+		// follow their calls, which is true of the files on disk today and is
+		// not something the format promises.
+		outputs   = make(map[string]string)
+		callSites []codexCallSite
 	)
 
 	turnCounter := 0
@@ -288,7 +321,7 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 					lastAssistantIdx = len(turns) - 1
 				}
 
-			case "function_call":
+			case "function_call", "custom_tool_call":
 				var fc functionCallPayload
 				if err := json.Unmarshal(line.Payload, &fc); err != nil {
 					continue
@@ -296,14 +329,36 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 
 				// Attach to the last assistant turn
 				if lastAssistantIdx >= 0 && lastAssistantIdx < len(turns) {
+					input := fc.payload()
 					turns[lastAssistantIdx].ToolUses = append(
 						turns[lastAssistantIdx].ToolUses,
-						adapter.ParsedToolUse{ToolName: fc.Name},
+						adapter.ParsedToolUse{
+							ToolName:    fc.Name,
+							ToolUseID:   fc.CallID,
+							InputJSON:   input,
+							InputLength: len(input),
+						},
 					)
+					if fc.CallID != "" {
+						callSites = append(callSites, codexCallSite{
+							callID:  fc.CallID,
+							turnIdx: lastAssistantIdx,
+							useIdx:  len(turns[lastAssistantIdx].ToolUses) - 1,
+						})
+					}
 				}
 
-			case "reasoning", "function_call_output":
-				// Skip reasoning blocks and function call outputs
+			case "function_call_output", "custom_tool_call_output":
+				var out functionCallOutputPayload
+				if err := json.Unmarshal(line.Payload, &out); err != nil {
+					continue
+				}
+				if out.CallID != "" {
+					outputs[out.CallID] = out.Output
+				}
+
+			case "reasoning":
+				// Skip reasoning blocks
 				continue
 			}
 
@@ -333,6 +388,8 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 		}
 	}
 
+	attachCodexOutputs(turns, callSites, outputs)
+
 	return &adapter.ParsedSession{
 		ID:          sessionID,
 		ProjectPath: projectPath,
@@ -345,6 +402,31 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 		SourceName:  "codex",
 		Metadata:    make(map[string]any),
 	}, nil
+}
+
+// codexCallSite records where a tool use landed so the output answering it can
+// be attached once the whole file has been read.
+type codexCallSite struct {
+	callID  string
+	turnIdx int
+	useIdx  int
+}
+
+// attachCodexOutputs matches each recorded call to the output carrying its
+// call_id and applies the storage policy to it.
+func attachCodexOutputs(turns []adapter.ParsedTurn, sites []codexCallSite, outputs map[string]string) {
+	for _, site := range sites {
+		output, ok := outputs[site.callID]
+		if !ok {
+			continue
+		}
+		tu := &turns[site.turnIdx].ToolUses[site.useIdx]
+		decided := toolpayload.ResultFromText(tu.ToolName, output)
+		tu.HasResult = true
+		tu.ResultContent = decided.Content
+		tu.ResultLength = decided.Length
+		tu.ResultOmittedReason = decided.OmitReason
+	}
 }
 
 // displayNameFromPath returns a shortened display name from a project path.

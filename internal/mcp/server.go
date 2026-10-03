@@ -658,9 +658,17 @@ func (s *Server) searchConversations(args map[string]interface{}) (interface{}, 
 			// hit can sit in a transcript list_sessions doesn't show. The
 			// parent id is how an agent walks back to the conversation.
 			"parent_session_id": nil,
+			// Set when the query matched a stored tool input or result rather
+			// than the turn's own text. Without it an agent cannot tell a
+			// conversational hit from a tool-payload hit, and the snippet for
+			// the latter is command output rather than anything anyone said.
+			"matched_tool_name": nil,
 		}
 		if r.ParentSessionID != "" {
 			result["parent_session_id"] = r.ParentSessionID
+		}
+		if r.MatchedToolName != "" {
+			result["matched_tool_name"] = r.MatchedToolName
 		}
 		compactResults = append(compactResults, result)
 	}
