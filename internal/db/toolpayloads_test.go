@@ -178,6 +178,165 @@ func seedPre009(t *testing.T, fixtures []payloadFixture) string {
 	return dir
 }
 
+// seedPre009TwoSessionsSharingAnID builds a pre-009 archive where two
+// different sessions each made a call carrying the SAME provider id, each
+// answered by its own result.
+//
+// Not reachable on the claude-code and nanoclaw data in the author's archive —
+// checked, no id there appears in more than one session — but the archive
+// holds no codex sessions at all, and whether codex's call_… ids are globally
+// unique or merely unique within one conversation is the provider's choice,
+// not ccvault's. idx_tool_uses_tool_use_id is deliberately non-unique, so
+// nothing in the schema prevents this either.
+//
+// The failure it guards against is the worst shape available here: no error,
+// one session's tool output written onto another session's row, and indexed
+// into the wrong FTS document so it comes back as a search hit attributed to
+// the wrong conversation.
+func seedPre009TwoSessionsSharingAnID(t *testing.T) string {
+	t.Helper()
+
+	dir := t.TempDir()
+	raw, err := sql.Open("sqlite", filepath.Join(dir, "ccvault.db"))
+	if err != nil {
+		t.Fatalf("open raw: %v", err)
+	}
+
+	migrations, err := loadMigrations()
+	if err != nil {
+		t.Fatalf("load migrations: %v", err)
+	}
+	if _, err := raw.Exec(`CREATE TABLE IF NOT EXISTS schema_version (
+		version INTEGER NOT NULL,
+		applied_at TEXT NOT NULL DEFAULT (datetime('now')))`); err != nil {
+		t.Fatalf("schema_version: %v", err)
+	}
+	for _, m := range migrations {
+		if m.version >= 9 {
+			continue
+		}
+		if err := applyMigration(raw, m); err != nil {
+			t.Fatalf("apply %03d: %v", m.version, err)
+		}
+	}
+	if columnExists(t, raw, "tool_uses", "result_content") {
+		t.Fatal("tool_uses.result_content exists below migration 009, so this test proves nothing")
+	}
+
+	ts := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
+
+	// The shared id. Sequential, because that is the shape a provider using
+	// per-conversation numbering would produce.
+	const sharedID = "call_1"
+
+	for _, s := range []struct{ session, output string }{
+		{"sess-alpha", "alpha-only-output"},
+		{"sess-beta", "beta-only-output"},
+	} {
+		if _, err := raw.Exec(`INSERT INTO sessions (id, started_at, source_file, source, model, git_branch)
+			VALUES (?, ?, ?, 'codex', '', '')`, s.session, ts, "/fake/"+s.session+".jsonl"); err != nil {
+			t.Fatalf("seed session %s: %v", s.session, err)
+		}
+
+		callTurn := s.session + "-call"
+		resultTurn := s.session + "-result"
+
+		assistantRaw := `{"uuid":"` + callTurn + `","sessionId":"` + s.session + `","type":"assistant",` +
+			`"timestamp":"2026-10-01T10:00:00.000Z","message":{"role":"assistant","content":[` +
+			`{"type":"tool_use","id":"` + sharedID + `","name":"exec_command","input":{"cmd":"` + s.session + `"}}]}}`
+		userRaw := `{"uuid":"` + resultTurn + `","sessionId":"` + s.session + `","type":"user",` +
+			`"timestamp":"2026-10-01T10:00:01.000Z","message":{"role":"user","content":[` +
+			`{"type":"tool_result","tool_use_id":"` + sharedID + `","content":"` + s.output + `"}]}}`
+
+		if _, err := raw.Exec(
+			`INSERT INTO turns (id, session_id, type, timestamp, content, raw_json, ordinal)
+			 VALUES (?, ?, 'assistant', ?, '', ?, 0)`,
+			callTurn, s.session, ts, assistantRaw); err != nil {
+			t.Fatalf("seed call turn %s: %v", callTurn, err)
+		}
+		if _, err := raw.Exec(
+			`INSERT INTO turns (id, session_id, type, timestamp, content, raw_json, ordinal)
+			 VALUES (?, ?, 'user', ?, '', ?, 1)`,
+			resultTurn, s.session, ts.Add(time.Second), userRaw); err != nil {
+			t.Fatalf("seed result turn %s: %v", resultTurn, err)
+		}
+		if _, err := raw.Exec(
+			`INSERT INTO tool_uses (turn_id, session_id, tool_name, timestamp)
+			 VALUES (?, ?, 'exec_command', ?)`,
+			callTurn, s.session, ts); err != nil {
+			t.Fatalf("seed tool use for %s: %v", s.session, err)
+		}
+	}
+
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw: %v", err)
+	}
+	return dir
+}
+
+// TestMigration009KeepsResultsWithinTheirSession is the cross-session
+// contamination guard. Both sessions' calls carry the id "call_1"; each must
+// come out holding its own session's output and nothing of the other's.
+func TestMigration009KeepsResultsWithinTheirSession(t *testing.T) {
+	dir := seedPre009TwoSessionsSharingAnID(t)
+
+	database, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+
+	want := map[string]string{
+		"sess-alpha": "alpha-only-output",
+		"sess-beta":  "beta-only-output",
+	}
+
+	rows, err := database.Query(
+		`SELECT session_id, COALESCE(result_content, '') FROM tool_uses ORDER BY session_id`)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	got := make(map[string]string)
+	for rows.Next() {
+		var session, result string
+		if err := rows.Scan(&session, &result); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		got[session] = result
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+
+	if len(got) != 2 {
+		t.Fatalf("got %d tool_uses rows, want 2: %v", len(got), got)
+	}
+	for session, wantResult := range want {
+		if got[session] != wantResult {
+			t.Errorf("session %s has result_content %q, want %q — a result crossed sessions",
+				session, got[session], wantResult)
+		}
+	}
+
+	// And the wrong text must not be reachable through the wrong session's
+	// FTS document either, which is where a crossed result does real damage.
+	for session, wantResult := range want {
+		var n int
+		if err := database.QueryRow(`
+			SELECT COUNT(*) FROM tool_uses_fts
+			JOIN tool_uses tu ON tu.id = tool_uses_fts.rowid
+			WHERE tool_uses_fts MATCH ? AND tu.session_id = ?`,
+			`"`+wantResult+`"`, session).Scan(&n); err != nil {
+			t.Fatalf("fts probe: %v", err)
+		}
+		if n != 1 {
+			t.Errorf("%q matched %d rows in session %s, want 1", wantResult, n, session)
+		}
+	}
+}
+
 func tableExists(t *testing.T, raw *sql.DB, name string) bool {
 	t.Helper()
 	var count int

@@ -137,29 +137,43 @@ type jeffCallSite struct {
 }
 
 // attachJeffResult links a tool_result to the call it answers and removes that
-// call from the pending list.
+// call from the pending list. A result it cannot place is dropped.
 //
-// Prefers an exact tool_id match, which is right when jeff recorded one. Falls
-// back to the oldest unanswered call, which is what the data forces: tool_id
-// is the empty string on 85% of real tool_requests, so matching on it would
-// make every one of those the same call. Jeff's own files pair requests and
-// results one for one — 742 of each across the author's sessions — so order is
-// a sound fallback rather than a guess.
+// Two rules, picked by whether jeff identified the result, and deliberately
+// not allowed to fall through into each other:
+//
+//   - A result carrying a tool_id is matched on that id alone. If no pending
+//     call has it, the result is dropped. Falling back to order here would
+//     attach one tool's output to a different tool's row — which happens
+//     whenever the request preceded any assistant turn, so no row exists for
+//     it, or the call was already answered — and the damage is silent: the
+//     wrong text is stored and then made searchable under the wrong tool name.
+//
+//   - A result carrying no tool_id falls back to order, which is what the data
+//     forces: tool_id is the empty string on 633 of 742 real tool_requests, so
+//     matching on it would make every one of those the same call. Jeff's files
+//     pair requests and results one for one, so the oldest unanswered call is
+//     sound rather than a guess — but only among the calls jeff also left
+//     unidentified. An identified call's own result is still coming, and
+//     letting an id-less result take its slot mislabels both of them.
 func attachJeffResult(turns []adapter.ParsedTurn, pending *[]jeffCallSite, res toolResultData) {
 	idx := -1
-	if res.ToolID != "" {
-		for i, site := range *pending {
+	for i, site := range *pending {
+		if res.ToolID != "" {
 			if site.toolID == res.ToolID {
 				idx = i
 				break
 			}
+			continue
+		}
+		if site.toolID == "" {
+			idx = i
+			break
 		}
 	}
 	if idx < 0 {
-		if len(*pending) == 0 {
-			return
-		}
-		idx = 0
+		// Nothing this result can be placed against.
+		return
 	}
 
 	site := (*pending)[idx]

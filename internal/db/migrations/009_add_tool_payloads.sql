@@ -106,14 +106,19 @@ WHERE t.type = 'assistant'
 -- guard fired on nothing, so no row was saved from a mislabel — but nothing
 -- else would have caught one.
 --
--- 1,302 rows come out of this with a NULL id, and all of them for the same
--- reason: 1,288 turns in that archive carry duplicate tool_uses rows (1,281
--- turns hold two rows for one tool_use block, 7 hold four), left behind by the
--- recovery import in #30. The position rule fills the first row of each turn
--- and leaves the extras alone, which is the right outcome — giving two rows
--- the same provider id would make the id useless as a join key. The
--- duplicates are a data-hygiene problem of their own, not this migration's to
--- fix.
+-- 1,302 rows came out of this with a NULL id on the author's archive, measured
+-- on the migrated copy. The cause is duplicate tool_uses rows left by the
+-- recovery import in #30: turns carrying more tool_uses rows than their
+-- message has tool_use blocks. The position rule fills the first row of each
+-- turn and leaves the extras alone, which is the right outcome — giving two
+-- rows the same provider id would make the id useless as a join key.
+--
+-- How those duplicates are distributed is deliberately not stated here. Three
+-- counts of it disagree (two query shapes of mine, and an independent one that
+-- found a longer tail), and the difference turns on whether turns with no
+-- parseable tool_use block are folded in. Pinning it down belongs to the
+-- data-hygiene issue the duplicates need, not to this migration, which behaves
+-- the same either way.
 UPDATE tool_uses
 SET tool_use_id  = src.tool_use_id,
     input_json   = src.input_json,
@@ -133,17 +138,35 @@ FROM (
 WHERE tool_uses.rowid = src.rid
   AND tool_uses.tool_use_id IS NULL;
 
--- Every tool_result block, keyed by the call it answers.
+-- Every tool_result block, keyed by the session it happened in and the call it
+-- answers.
+--
+-- The session is half the key, not decoration. A provider id is only ever
+-- promised to be unique within the conversation that issued it: claude-code's
+-- toolu_… are random enough that no id in the author's archive appears in two
+-- sessions, but the archive holds no codex sessions at all, and whether
+-- codex's call_… are globally unique or numbered per conversation is the
+-- provider's choice. Keyed on the id alone, two sessions sharing one would
+-- have the GROUP BY collapse them and write one session's output onto the
+-- other's row — silently, and into the wrong FTS document, so it would come
+-- back as a search hit attributed to the wrong conversation.
+--
+-- tool_uses already carries session_id, so scoping the join costs nothing.
+-- idx_tool_uses_tool_use_id is deliberately non-unique (see above), which is
+-- the right call and also means nothing in the schema would catch this.
+--
+-- A tool result is always recorded in the same transcript as its call, so
+-- scoping to the session cannot lose a legitimate match.
 --
 -- Not filtered to user turns. That is where Claude Code puts them, and keying
 -- on the block's own type costs nothing and does not depend on it staying
--- true. GROUP BY keeps one row per id: 259,812 results across the archive all
--- name distinct calls, and a transcript that answered one call twice should not
--- make the join multiply rows.
+-- true. GROUP BY keeps one row per call: a transcript that answered the same
+-- call twice should not make the join multiply rows.
 DROP TABLE IF EXISTS temp.migration_009_results;
 
 CREATE TEMP TABLE migration_009_results AS
-SELECT json_extract(je.value, '$.tool_use_id')       AS tool_use_id,
+SELECT t.session_id                                  AS session_id,
+       json_extract(je.value, '$.tool_use_id')       AS tool_use_id,
        json_type(je.value, '$.content')              AS content_type,
        json_extract(je.value, '$.content')           AS content,
        octet_length(json_extract(je.value, '$.content')) AS content_len
@@ -154,7 +177,7 @@ FROM turns t,
                     ELSE '[]' END) je
 WHERE json_extract(je.value, '$.type') = 'tool_result'
   AND json_extract(je.value, '$.tool_use_id') IS NOT NULL
-GROUP BY tool_use_id;
+GROUP BY t.session_id, tool_use_id;
 
 -- The structured half: whether the content holds an image block, and the text
 -- blocks concatenated. 130,516 of the archive's results use this shape and
@@ -163,7 +186,8 @@ GROUP BY tool_use_id;
 DROP TABLE IF EXISTS temp.migration_009_result_blocks;
 
 CREATE TEMP TABLE migration_009_result_blocks AS
-SELECT r.tool_use_id,
+SELECT r.session_id,
+       r.tool_use_id,
        MAX(CASE WHEN json_extract(e.value, '$.type') = 'image' THEN 1 ELSE 0 END) AS has_image,
        group_concat(CASE WHEN json_extract(e.value, '$.type') = 'text'
                           AND json_extract(e.value, '$.text') <> ''
@@ -171,7 +195,7 @@ SELECT r.tool_use_id,
                     char(10) ORDER BY e.key) AS text_content
 FROM migration_009_results r,
      json_each(CASE WHEN r.content_type = 'array' THEN r.content ELSE '[]' END) e
-GROUP BY r.tool_use_id;
+GROUP BY r.session_id, r.tool_use_id;
 
 -- Apply the storage policy. The order of the CASE arms is the order in
 -- pkg/toolpayload.decide, and the two have to stay in step: the same
@@ -199,13 +223,14 @@ SET result_length = COALESCE(src.content_len, 0),
              WHEN src.content_type = 'array'                         THEN NULLIF(src.text_content, '')
              ELSE NULL END
 FROM (
-    SELECT r.tool_use_id, r.content_type, r.content, r.content_len,
+    SELECT r.session_id, r.tool_use_id, r.content_type, r.content, r.content_len,
            COALESCE(b.has_image, 0) AS has_image,
            b.text_content
     FROM migration_009_results r
-    LEFT JOIN migration_009_result_blocks b USING (tool_use_id)
+    LEFT JOIN migration_009_result_blocks b USING (session_id, tool_use_id)
 ) AS src
 WHERE tool_uses.tool_use_id = src.tool_use_id
+  AND tool_uses.session_id = src.session_id
   AND tool_uses.result_length IS NULL;
 
 DROP TABLE IF EXISTS temp.migration_009_calls;
