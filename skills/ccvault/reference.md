@@ -25,8 +25,8 @@ Pagination is uniform across `search_conversations`, `get_turns`, `list_sessions
 | Model | `model:name` | `model:opus` | Partial match (opus, sonnet, haiku) |
 | Tool | `tool:Name` | `tool:Bash` | Filters to **sessions** that used the tool, not to turns that called it. Case-insensitive, must match the full tool name (e.g., `Bash`, `Read`, `Edit`, `Write`, `Grep`, `Glob`, `Task`, `WebFetch`; MCP tools are stored under their full prefixed names like `mcp__ccvault__search_conversations`) |
 | File | `file:path` | `file:auth.py` | Matches file paths mentioned in session |
-| Before | `before:DATE` | `before:2026-02-01` | See date formats below |
-| After | `after:DATE` | `after:thisweek` | See date formats below |
+| Before | `before:DATE` | `before:2026-02-01` | **Exclusive** of `DATE` — stops at midnight starting it. To include a day, name the day after. See date formats below |
+| After | `after:DATE` | `after:thisweek` | **Inclusive** of `DATE` — starts at midnight starting it. See date formats below |
 | Has error | `has:error` | `has:error` | Filters to sessions flagged with tool errors during sync |
 | Has subagent | `has:subagent` | `has:agent` | Filters to sessions using Task (subagent) tool — `has:subagent` and `has:agent` both accepted |
 | Exact phrase | `"phrase"` | `"deploy script"` | Quoted exact phrase matching |
@@ -46,6 +46,18 @@ Operators combine freely: `project:myapp tool:Bash "deploy" after:thisweek`
 | Short month | `Jan 15, 2026` |
 | Full month | `January 15, 2026` |
 | Relative | `today`, `yesterday`, `week`/`thisweek` (last 7 days), `month`/`thismonth` (last 30 days) |
+
+A bound always lands on midnight starting the named day, never on the end of
+it. `after:` includes that day and `before:` excludes it, so a range written
+`after:2026-01-01 before:2026-01-31` returns the 1st through the 30th. Name
+the following day to include the last one: `before:2026-02-01`.
+
+The two kinds of date resolve in different zones, which matters when reporting
+a count back to someone. A written-out date is a UTC calendar day, because
+turns are stored with UTC timestamps and the comparison is made against them.
+The relative forms resolve on the caller's local calendar, so `after:today`
+tracks the machine's own date — late in the evening in a negative offset, that
+is the previous UTC day.
 
 ## 4. MCP Prompts
 
