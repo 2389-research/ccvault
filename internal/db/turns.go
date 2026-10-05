@@ -371,21 +371,54 @@ func (db *DB) InsertToolUses(toolUses []models.ToolUse) error {
 // InsertToolUsesTx inserts tool usage records within a transaction
 func (db *DB) InsertToolUsesTx(tx *sql.Tx, toolUses []models.ToolUse) error {
 	stmt, err := tx.Prepare(`
-		INSERT INTO tool_uses (turn_id, session_id, tool_name, file_path, timestamp)
-		VALUES (?, ?, ?, ?, ?)`)
+		INSERT INTO tool_uses (turn_id, session_id, tool_name, file_path, timestamp,
+			tool_use_id, input_json, input_length,
+			result_content, result_length, result_omitted_reason)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return fmt.Errorf("prepare insert tool_uses: %w", err)
 	}
 	defer func() { _ = stmt.Close() }()
 
 	for _, tu := range toolUses {
-		_, err := stmt.Exec(tu.TurnID, tu.SessionID, tu.ToolName, tu.FilePath, tu.Timestamp)
+		_, err := stmt.Exec(tu.TurnID, tu.SessionID, tu.ToolName, tu.FilePath, tu.Timestamp,
+			nullIfEmpty(tu.ToolUseID), nullIfEmpty(tu.InputJSON), nullIfZero(tu.InputLength),
+			nullIfEmpty(tu.ResultContent), resultLengthValue(tu), nullIfEmpty(tu.ResultOmittedReason))
 		if err != nil {
 			return fmt.Errorf("insert tool_use: %w", err)
 		}
 	}
 
 	return nil
+}
+
+// nullIfEmpty stores an unrecorded string as NULL rather than as the empty
+// string. Migration 008 set the precedent for last_entry_uuid: a column
+// holding both NULL and the empty string makes every read path treat the
+// empty string as a third state.
+func nullIfEmpty(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+// nullIfZero is the same discipline for a length that was never measured.
+func nullIfZero(n int) any {
+	if n == 0 {
+		return nil
+	}
+	return n
+}
+
+// resultLengthValue encodes "was there a result at all" into the column, which
+// is where that fact lives: NULL means nothing answered this call, 0 means it
+// answered with nothing. Both are real and they are different.
+func resultLengthValue(tu models.ToolUse) any {
+	if !tu.HasResult {
+		return nil
+	}
+	return tu.ResultLength
 }
 
 // DeleteToolUsesForSession removes tool uses for a session

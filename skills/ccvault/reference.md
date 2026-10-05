@@ -4,7 +4,7 @@
 
 | Tool | Required Params | Optional Params | Returns | Notes |
 |------|----------------|-----------------|---------|-------|
-| `search_conversations` | `query` (string) | `limit` (number, default 10, max 50), `offset` (number) | Paginated results with 200-char snippets | Check `has_more` / `next_offset` for pagination. Each result carries `project_name` (the adapter-provided label, or the path basename as fallback) alongside `project_path`. An empty result for a `tool:` query adds `similar_tool_names` with close matches; both that lookup and the project-name enrichment are enrichment queries — if one fails, its field is omitted and a `warnings` entry (`similar_tool_names unavailable: …` / `project enrichment unavailable: …`) appears instead. Search is **never** filtered by the subagent listing default, so a hit can sit in a transcript `list_sessions` does not show: each result carries `parent_session_id` (null when the hit is in a top-level session) |
+| `search_conversations` | `query` (string) | `limit` (number, default 10, max 50), `offset` (number) | Paginated results with 200-char snippets | Check `has_more` / `next_offset` for pagination. Each result carries `project_name` (the adapter-provided label, or the path basename as fallback) alongside `project_path`. An empty result for a `tool:` query adds `similar_tool_names` with close matches; both that lookup and the project-name enrichment are enrichment queries — if one fails, its field is omitted and a `warnings` entry (`similar_tool_names unavailable: …` / `project enrichment unavailable: …`) appears instead. Search is **never** filtered by the subagent listing default, so a hit can sit in a transcript `list_sessions` does not show: each result carries `parent_session_id` (null when the hit is in a top-level session). A query also matches **stored tool inputs and results**, not only turn text — so a command you ran or an error a tool printed is findable. Such a hit carries `matched_tool_name` (the tool whose payload matched; null when the match was in the turn's own content) and its `snippet` is drawn from that payload rather than from the conversation |
 | `get_session_summary` | `session_id` (string) | — | Metadata, turn counts by type, top 10 tools used, first/last user messages (500 chars each) | Most cost-effective entry point for any session |
 | `get_turns` | `session_id` (string) | `offset` (number, default 0), `limit` (number, default 20, max 50), `type` (user/assistant/tool_result) | Paginated turns, content truncated at 1000 chars | Includes tool names; `has_thinking` flag on assistant turns. Accepts a subagent session id with no extra parameter |
 | `get_session` | `session_id` (string) | — | Full session as markdown | Sessions over 100 turns come back without `markdown`: the response carries `session_id`, `turn_count`, `hint`, and a `markdown unavailable: large session with N turns...` entry in the top-level `warnings[]` array — there is no singular `warning` field. Markdown truncates at 50K chars. Prefer summary + turns for large sessions |
@@ -23,7 +23,7 @@ Pagination is uniform across `search_conversations`, `get_turns`, `list_sessions
 |----------|--------|---------|-------|
 | Project | `project:name` | `project:myapp` | Partial match on path or display name |
 | Model | `model:name` | `model:opus` | Partial match (opus, sonnet, haiku) |
-| Tool | `tool:Name` | `tool:Bash` | Case-insensitive, must match the full tool name (e.g., `Bash`, `Read`, `Edit`, `Write`, `Grep`, `Glob`, `Task`, `WebFetch`; MCP tools are stored under their full prefixed names like `mcp__ccvault__search_conversations`) |
+| Tool | `tool:Name` | `tool:Bash` | Filters to **sessions** that used the tool, not to turns that called it. Case-insensitive, must match the full tool name (e.g., `Bash`, `Read`, `Edit`, `Write`, `Grep`, `Glob`, `Task`, `WebFetch`; MCP tools are stored under their full prefixed names like `mcp__ccvault__search_conversations`) |
 | File | `file:path` | `file:auth.py` | Matches file paths mentioned in session |
 | Before | `before:DATE` | `before:2026-02-01` | See date formats below |
 | After | `after:DATE` | `after:thisweek` | See date formats below |
@@ -31,6 +31,8 @@ Pagination is uniform across `search_conversations`, `get_turns`, `list_sessions
 | Has subagent | `has:subagent` | `has:agent` | Filters to sessions using Task (subagent) tool — `has:subagent` and `has:agent` both accepted |
 | Exact phrase | `"phrase"` | `"deploy script"` | Quoted exact phrase matching |
 | Free text | `terms` | `authentication bug` | FTS5 full-text search on unquoted terms |
+
+Text matching covers two indexes: the conversation (`turns.content`) and the stored tool payloads (`tool_uses.input_json`, `tool_uses.result_content`). What is **not** matchable is content the storage policy leaves out: the body of a `Read`/`NotebookRead` result, and any result carrying an image. Those rows still exist and are still findable through their input and `file_path` — only the returned bytes are absent, and `result_length` plus `result_omitted_reason` say so on the row. A result over 128 KB is left out the same way, though nothing in the measured archive reaches that.
 
 Operators combine freely: `project:myapp tool:Bash "deploy" after:thisweek`
 
@@ -96,6 +98,24 @@ tool:Edit project:myapp after:month
 | Turn content | 1,000 chars |
 | Full session markdown | 50,000 chars |
 | Tools list in summary | Top 10 |
+
+Tool payloads are **not** truncated. A stored tool input or result is stored
+whole or not at all — never as a prefix — because `turns.raw_json` keeps the
+full original regardless, so a prefix would cost storage without preserving
+anything. What is omitted is omitted completely and says so:
+
+| `result_omitted_reason` | Means |
+|---|---|
+| `null` | The content is stored whole in `result_content` |
+| `bulk_read` | A `Read`/`NotebookRead` result. `file_path` on the row says what was read |
+| `image` | The result carried an image block, detected by content shape rather than tool name |
+| `oversize` | Over 128 KB. Fires on nothing in the measured archive; it is there for unclassified future tools |
+| `undecodable` | The content was not a shape the extractor reads |
+
+`result_length` is always recorded, so a short result (`result_length` small,
+`result_content` present) is distinguishable from an omitted one without
+guessing. `result_length IS NULL` is a third thing again: nothing ever
+answered that call.
 
 ## 7. Subagent Sessions
 

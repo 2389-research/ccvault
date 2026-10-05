@@ -715,6 +715,12 @@ Supports Gmail-like query syntax:
 			if r.Model != "" {
 				fmt.Printf("   Model: %s\n", r.Model)
 			}
+			// A hit found through a stored tool payload rather than the turn's
+			// own text needs saying, because the snippet below it is command
+			// output or tool arguments, not something anyone wrote.
+			if r.MatchedToolName != "" {
+				fmt.Printf("   Matched in %s payload\n", r.MatchedToolName)
+			}
 			fmt.Printf("   %s\n\n", r.Snippet)
 		}
 

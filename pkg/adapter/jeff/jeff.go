@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/2389-research/ccvault/pkg/adapter"
+	"github.com/2389-research/ccvault/pkg/toolpayload"
 )
 
 // sessionIDPrefix namespaces Jeff session IDs to prevent collisions with other
@@ -61,8 +62,18 @@ type messageData struct {
 
 // toolRequestData holds the fields from a tool_request entry's data.
 type toolRequestData struct {
-	ToolName string `json:"tool_name"`
-	ToolID   string `json:"tool_id"`
+	ToolName string          `json:"tool_name"`
+	ToolID   string          `json:"tool_id"`
+	Params   json.RawMessage `json:"params"`
+}
+
+// toolResultData holds the fields from a tool_result entry's data. Jeff
+// records only a preview of its tool output — the field is named
+// output_preview and is already shortened upstream, so what lands in the
+// archive is the most jeff kept, not the most ccvault would store.
+type toolResultData struct {
+	ToolID        string `json:"tool_id"`
+	OutputPreview string `json:"output_preview"`
 }
 
 // Discover scans the Jeff sessions directory for JSONL session files and returns
@@ -117,6 +128,65 @@ func projectPathForRoot(root string) string {
 	return "jeff:" + root
 }
 
+// jeffCallSite records a tool call that has not been answered yet, and where
+// on the turn slice its row sits.
+type jeffCallSite struct {
+	toolID  string
+	turnIdx int
+	useIdx  int
+}
+
+// attachJeffResult links a tool_result to the call it answers and removes that
+// call from the pending list. A result it cannot place is dropped.
+//
+// Two rules, picked by whether jeff identified the result, and deliberately
+// not allowed to fall through into each other:
+//
+//   - A result carrying a tool_id is matched on that id alone. If no pending
+//     call has it, the result is dropped. Falling back to order here would
+//     attach one tool's output to a different tool's row — which happens
+//     whenever the request preceded any assistant turn, so no row exists for
+//     it, or the call was already answered — and the damage is silent: the
+//     wrong text is stored and then made searchable under the wrong tool name.
+//
+//   - A result carrying no tool_id falls back to order, which is what the data
+//     forces: tool_id is the empty string on 633 of 742 real tool_requests, so
+//     matching on it would make every one of those the same call. Jeff's files
+//     pair requests and results one for one, so the oldest unanswered call is
+//     sound rather than a guess — but only among the calls jeff also left
+//     unidentified. An identified call's own result is still coming, and
+//     letting an id-less result take its slot mislabels both of them.
+func attachJeffResult(turns []adapter.ParsedTurn, pending *[]jeffCallSite, res toolResultData) {
+	idx := -1
+	for i, site := range *pending {
+		if res.ToolID != "" {
+			if site.toolID == res.ToolID {
+				idx = i
+				break
+			}
+			continue
+		}
+		if site.toolID == "" {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		// Nothing this result can be placed against.
+		return
+	}
+
+	site := (*pending)[idx]
+	*pending = append((*pending)[:idx], (*pending)[idx+1:]...)
+
+	tu := &turns[site.turnIdx].ToolUses[site.useIdx]
+	decided := toolpayload.ResultFromText(tu.ToolName, res.OutputPreview)
+	tu.HasResult = true
+	tu.ResultContent = decided.Content
+	tu.ResultLength = decided.Length
+	tu.ResultOmittedReason = decided.OmitReason
+}
+
 // Parse reads a Jeff JSONL session file and converts it to adapter.ParsedSession.
 func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 	f, err := os.Open(path)
@@ -138,6 +208,11 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 
 		// Track the current assistant turn so we can attach tool uses
 		lastAssistantIdx = -1
+
+		// Tool calls still waiting for their result, oldest first. Jeff writes
+		// tool_id on both halves but leaves it empty on 633 of 742 real
+		// requests, so an id alone cannot link them — see attachJeffResult.
+		pending []jeffCallSite
 	)
 
 	turnCounter := 0
@@ -233,9 +308,26 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 			if lastAssistantIdx >= 0 && lastAssistantIdx < len(turns) {
 				turns[lastAssistantIdx].ToolUses = append(
 					turns[lastAssistantIdx].ToolUses,
-					adapter.ParsedToolUse{ToolName: tr.ToolName},
+					adapter.ParsedToolUse{
+						ToolName:    tr.ToolName,
+						ToolUseID:   tr.ToolID,
+						InputJSON:   string(tr.Params),
+						InputLength: len(tr.Params),
+					},
 				)
+				pending = append(pending, jeffCallSite{
+					toolID:  tr.ToolID,
+					turnIdx: lastAssistantIdx,
+					useIdx:  len(turns[lastAssistantIdx].ToolUses) - 1,
+				})
 			}
+
+		case "tool_result":
+			var tres toolResultData
+			if err := json.Unmarshal(line.Data, &tres); err != nil {
+				continue
+			}
+			attachJeffResult(turns, &pending, tres)
 
 		case "error":
 			hasError = true

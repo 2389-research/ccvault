@@ -79,12 +79,31 @@ CREATE TABLE IF NOT EXISTS tool_uses (
     session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
     tool_name TEXT NOT NULL,
     file_path TEXT,
-    timestamp DATETIME NOT NULL
+    timestamp DATETIME NOT NULL,
+    -- The id the source gave this call, verbatim, so it can be joined against
+    -- ids recorded elsewhere. NULL when the source recorded none.
+    tool_use_id TEXT,
+    -- The call's arguments, stored whole and indexed.
+    input_json TEXT,
+    input_length INTEGER,
+    -- The result text, NULL when omitted by policy or when the tool returned
+    -- nothing. result_length is the size as the transcript carried it and is
+    -- recorded either way; result_length IS NULL means nothing answered the
+    -- call at all. See pkg/toolpayload.
+    result_content TEXT,
+    result_length INTEGER,
+    result_omitted_reason TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_tool_uses_session ON tool_uses(session_id);
 CREATE INDEX IF NOT EXISTS idx_tool_uses_tool_name ON tool_uses(tool_name);
 CREATE INDEX IF NOT EXISTS idx_tool_uses_file_path ON tool_uses(file_path);
+
+-- Not unique: the same transcript ingested under two sources legitimately
+-- repeats a provider id, and INSERT OR REPLACE resolves a unique conflict by
+-- silently deleting the conflicting row.
+CREATE INDEX IF NOT EXISTS idx_tool_uses_tool_use_id ON tool_uses(tool_use_id)
+    WHERE tool_use_id IS NOT NULL;
 
 -- Full-text search virtual table
 CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(
@@ -117,6 +136,41 @@ END;
 CREATE TRIGGER IF NOT EXISTS turns_au AFTER UPDATE OF content ON turns BEGIN
     INSERT INTO turns_fts(turns_fts, rowid, content) VALUES('delete', old.rowid, old.content);
     INSERT INTO turns_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
+
+-- Full-text search over the tool payloads.
+--
+-- Its own index rather than folded into turns_fts, because the material
+-- belongs to a tool_uses row and there is no turns column it could live in
+-- without duplicating it. Only the two stored columns are indexed;
+-- result_content is NULL for every omitted result, so file dumps and base64
+-- contribute nothing.
+CREATE VIRTUAL TABLE IF NOT EXISTS tool_uses_fts USING fts5(
+    input_json,
+    result_content,
+    content='tool_uses',
+    content_rowid='id'
+);
+
+-- Same recursive_triggers dependency as turns_ad. Triggers are scoped to
+-- exactly the two indexed columns: an UPDATE that leaves them alone leaves the
+-- index correct, and a wider scope is what cost migration 008's backfill
+-- 377 MB of dead segments before it was narrowed.
+CREATE TRIGGER IF NOT EXISTS tool_uses_ai AFTER INSERT ON tool_uses BEGIN
+    INSERT INTO tool_uses_fts(rowid, input_json, result_content)
+    VALUES (new.id, new.input_json, new.result_content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS tool_uses_ad AFTER DELETE ON tool_uses BEGIN
+    INSERT INTO tool_uses_fts(tool_uses_fts, rowid, input_json, result_content)
+    VALUES ('delete', old.id, old.input_json, old.result_content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS tool_uses_au AFTER UPDATE OF input_json, result_content ON tool_uses BEGIN
+    INSERT INTO tool_uses_fts(tool_uses_fts, rowid, input_json, result_content)
+    VALUES ('delete', old.id, old.input_json, old.result_content);
+    INSERT INTO tool_uses_fts(rowid, input_json, result_content)
+    VALUES (new.id, new.input_json, new.result_content);
 END;
 
 -- Sync state table

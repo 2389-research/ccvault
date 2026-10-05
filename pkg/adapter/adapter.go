@@ -51,10 +51,25 @@ type ParsedTurn struct {
 	HasError     bool
 }
 
-// ParsedToolUse captures a single tool invocation within a turn.
+// ParsedToolUse captures a single tool invocation within a turn, including the
+// payloads it carried. See models.ToolUse for what each field means and
+// pkg/toolpayload for the policy that decides whether a result's content is
+// stored or reduced to its length.
+//
+// A source that records none of a field leaves it zero — hex has no tool calls
+// at all, and jeff records no usable id for 85% of its requests.
 type ParsedToolUse struct {
 	ToolName string
 	FilePath string
+
+	ToolUseID   string
+	InputJSON   string
+	InputLength int
+
+	HasResult           bool
+	ResultContent       string
+	ResultLength        int
+	ResultOmittedReason string
 }
 
 // SourceAdapter is the interface that all conversation source backends must implement.
