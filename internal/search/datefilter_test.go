@@ -377,3 +377,66 @@ func TestSearch_DateFilterKeepsAnUnreadableTimestamp(t *testing.T) {
 		t.Errorf("the date-filtered expression matches %d turns, want both — the dated one, and the one whose period the column could not read", got)
 	}
 }
+
+// TestSearch_PayloadAttributionDrivesFromTheTurn pins the query plan of the two
+// subqueries that label a payload hit with its tool name and its snippet.
+//
+// They are correlated to one turn, so their work ought to be bounded by that
+// turn's tool uses. Written the other way round — the FTS table first and
+// turn_id as a filter on its output — SQLite walks the whole all-time match set
+// looking for a row belonging to this turn. That measured 1.08s of a 1.19s
+// date-filtered search on the author's archive, and it does not shrink when the
+// window does, so it is the half of issue #80 that pruning the index cannot
+// reach.
+//
+// A plan assertion rather than a timing one, because the defect is invisible in
+// everything except the wall clock: both shapes return identical rows, and the
+// difference is 1.08s against 0.001s on a real archive and nothing at all on a
+// fixture. What the plan has to show is the index on turn_id driving each
+// subquery, which is what makes the lookup a seek instead of a scan. Dropping
+// either the index or the CROSS JOIN that pins the join order puts the scan
+// back, and SQLite picks the scan on its own when left to choose.
+func TestSearch_PayloadAttributionDrivesFromTheTurn(t *testing.T) {
+	fixture := setupWindowFixture(t)
+	searcher := New(fixture.database.DB)
+
+	q := Parse("windowneedle after:" + windowFirstDay)
+	periods, err := searcher.periodTermsFor(q)
+	if err != nil {
+		t.Fatalf("resolve period terms: %v", err)
+	}
+	query, args := searcher.buildQuery(q, 20, periods)
+
+	plan := queryPlan(t, fixture.database, query, args)
+
+	const idx = "idx_tool_uses_turn_id"
+	if got := strings.Count(plan, idx); got != 2 {
+		t.Errorf("plan uses %s %d times, want 2 — one per attribution subquery.\nplan:\n%s", idx, got, plan)
+	}
+}
+
+// queryPlan returns EXPLAIN QUERY PLAN's detail column, one line per step.
+func queryPlan(t *testing.T, database *db.DB, query string, args []interface{}) string {
+	t.Helper()
+
+	rows, err := database.Query("EXPLAIN QUERY PLAN "+query, args...)
+	if err != nil {
+		t.Fatalf("explain: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var plan strings.Builder
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatalf("scan plan row: %v", err)
+		}
+		plan.WriteString(detail)
+		plan.WriteString("\n")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate plan: %v", err)
+	}
+	return plan.String()
+}

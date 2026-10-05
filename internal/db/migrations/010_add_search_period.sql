@@ -25,6 +25,22 @@
 -- rows than the predicate keeps, never fewer.
 -- ---------------------------------------------------------------------------
 
+-- The index the payload attribution needs.
+--
+-- tool_uses already had four indexes and none of them was turn_id, so "the
+-- tool uses of this turn" was a table scan. Search asks it twice per returned
+-- row, to label a payload hit with the tool whose input or result matched and
+-- to cut the snippet, and without this index SQLite answers by walking the
+-- whole all-time FTS match set looking for a row that belongs to the turn. On
+-- the author's archive that was 1.08s of a 1.19s date-filtered search — a cost
+-- per returned row, so pruning the index could not touch it.
+--
+-- 5 MB over 264,199 rows, measured.
+--
+-- Not unique: a turn issues as many calls as it issues, and #30's recovery
+-- import left turns with duplicate tool_uses rows besides.
+CREATE INDEX IF NOT EXISTS idx_tool_uses_turn_id ON tool_uses(turn_id);
+
 -- The period tokens for a row, derived rather than stored.
 --
 -- A VIRTUAL generated column costs no bytes in the table and cannot drift from

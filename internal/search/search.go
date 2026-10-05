@@ -342,14 +342,29 @@ func (s *Searcher) buildQuery(q *Query, limit int, periods []string) (string, []
 	//
 	// LIMIT 1 on each: a turn may have several matching calls, and the snippet
 	// shows one of them.
+	//
+	// Each subquery starts from the turn's tool uses and probes the index for
+	// one document, rather than starting from the index's match set and
+	// filtering it down to this turn. Both answer identically; the second costs
+	// a walk of every all-time match looking for a row that belongs to this
+	// turn, which measured 1.08s of a 1.19s date-filtered search on the
+	// author's archive — and does not shrink when the window does, because it
+	// is per returned row rather than per match.
+	//
+	// CROSS JOIN is load-bearing, not decoration. It is how SQLite is told not
+	// to reorder the join, and left to choose it puts the virtual table first:
+	// it has no row estimate for an fts5 MATCH that would tell it a seek on
+	// idx_tool_uses_turn_id is the cheaper end to start from.
+	// TestSearch_PayloadAttributionDrivesFromTheTurn asserts the plan, because
+	// the wrong plan is invisible in the rows.
 	return fmt.Sprintf(`WITH %s, page AS (%s)
 		SELECT page.*,
-			(SELECT mtu.tool_name FROM tool_uses_fts
-			 JOIN tool_uses mtu ON mtu.id = tool_uses_fts.rowid
-			 WHERE tool_uses_fts MATCH $%d AND mtu.turn_id = page.id LIMIT 1),
-			(SELECT snippet(tool_uses_fts, -1, '', '', '…', 24) FROM tool_uses_fts
-			 JOIN tool_uses mtu ON mtu.id = tool_uses_fts.rowid
-			 WHERE tool_uses_fts MATCH $%d AND mtu.turn_id = page.id LIMIT 1)
+			(SELECT mtu.tool_name FROM tool_uses mtu
+			 CROSS JOIN tool_uses_fts ON tool_uses_fts.rowid = mtu.id
+			 WHERE mtu.turn_id = page.id AND tool_uses_fts MATCH $%d LIMIT 1),
+			(SELECT snippet(tool_uses_fts, -1, '', '', '…', 24) FROM tool_uses mtu
+			 CROSS JOIN tool_uses_fts ON tool_uses_fts.rowid = mtu.id
+			 WHERE mtu.turn_id = page.id AND tool_uses_fts MATCH $%d LIMIT 1)
 		FROM page
 		ORDER BY page.timestamp DESC, page.id ASC`,
 		prefix, baseQuery, snippetMatchArg, snippetMatchArg), args

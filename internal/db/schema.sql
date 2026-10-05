@@ -118,6 +118,11 @@ CREATE TABLE IF NOT EXISTS tool_uses (
 );
 
 CREATE INDEX IF NOT EXISTS idx_tool_uses_session ON tool_uses(session_id);
+
+-- "The tool uses of this turn", which search asks twice per returned row to
+-- label a payload hit with its tool and its snippet. Without it SQLite answers
+-- by walking the whole FTS match set looking for a row belonging to the turn.
+CREATE INDEX IF NOT EXISTS idx_tool_uses_turn_id ON tool_uses(turn_id);
 CREATE INDEX IF NOT EXISTS idx_tool_uses_tool_name ON tool_uses(tool_name);
 CREATE INDEX IF NOT EXISTS idx_tool_uses_file_path ON tool_uses(file_path);
 
