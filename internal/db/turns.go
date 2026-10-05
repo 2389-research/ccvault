@@ -211,6 +211,19 @@ func (db *DB) DeleteTurnsForSessionTx(tx *sql.Tx, sessionID string) error {
 	return err
 }
 
+// contentScoped confines a caller's FTS5 expression to turns_fts's content
+// column.
+//
+// turns_fts also indexes search_period, which holds the day and month tokens a
+// date filter intersects with (migration 010). An unscoped expression is
+// matched against every column, so a caller searching for the literal text of
+// one of those tokens would get back every turn of that month instead of the
+// turns whose text holds it. Scoping is what keeps the period column
+// answering only to internal/search's own period terms.
+func contentScoped(expr string) string {
+	return "{content} : (" + expr + ")"
+}
+
 // SearchTurns performs full-text search on turn content
 func (db *DB) SearchTurns(query string, limit int) ([]models.Turn, error) {
 	if limit <= 0 {
@@ -226,7 +239,7 @@ func (db *DB) SearchTurns(query string, limit int) ([]models.Turn, error) {
 		ORDER BY rank, t.id
 		LIMIT ?`
 
-	rows, err := db.Query(sqlQuery, query, limit)
+	rows, err := db.Query(sqlQuery, contentScoped(query), limit)
 	if err != nil {
 		return nil, fmt.Errorf("search turns: %w", err)
 	}
@@ -289,7 +302,7 @@ func (db *DB) SearchTurnsWithFilters(textQuery string, projectID int64, model st
 	if textQuery != "" {
 		baseQuery += ` JOIN turns_fts fts ON t.rowid = fts.rowid`
 		conditions = append(conditions, "turns_fts MATCH ?")
-		args = append(args, textQuery)
+		args = append(args, contentScoped(textQuery))
 	}
 
 	// Project filter
