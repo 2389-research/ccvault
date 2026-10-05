@@ -8,8 +8,9 @@
 -- every all-time match from both indexes into a temp B-tree. So the cost of
 -- "what did I do last week" tracks the size of the archive rather than the
 -- size of the week. Measured on the author's 951,548-turn archive: `git`
--- all-time 1.90s, `git after:2026-10-01` 1.17s — the narrow query pays 62% of
--- the wide one for 0.6% of the rows.
+-- all-time 2.04s, `git after:2026-10-01` 1.21s — the narrow query pays 59% of
+-- the wide one for 0.6% of the rows, and pays the same 1.21s for a five-day
+-- window as for a thirty-five-day one.
 --
 -- FTS5 intersects postings lists, so an additional selective MATCH term prunes
 -- inside the index, before any row reaches the UNION. This migration stores
@@ -36,8 +37,8 @@
 -- per returned row, so pruning the index could not touch it.
 --
 -- Measured on the author's archive: 0.3s to build, 2,940 pages of 4 KB — 12 MB
--- over 264,199 rows. The file grows by less than that, because the index
--- rebuild above leaves free pages behind for it to take.
+-- over 264,199 rows. The file grows by less than that, because the two index
+-- rebuilds below leave free pages behind for it to take.
 --
 -- Not unique: a turn issues as many calls as it issues, and #30's recovery
 -- import left turns with duplicate tool_uses rows besides.
