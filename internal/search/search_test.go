@@ -4,6 +4,7 @@
 package search
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -78,12 +79,13 @@ func TestParse_DateFilters(t *testing.T) {
 		t.Error("Before date should not be zero")
 	}
 
-	expectedAfter := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
+	expectedAfter := time.Date(2024, 1, 15, 0, 0, 0, 0, time.Local)
 	if !q.After.Equal(expectedAfter) {
 		t.Errorf("Expected after date %v, got %v", expectedAfter, q.After)
 	}
 
-	expectedBefore := time.Date(2024, 2, 1, 0, 0, 0, 0, time.UTC)
+	// before:2024-02-01 is exclusive of Feb 1, so the bound is local Feb 1 midnight
+	expectedBefore := time.Date(2024, 2, 1, 0, 0, 0, 0, time.Local)
 	if !q.Before.Equal(expectedBefore) {
 		t.Errorf("Expected before date %v, got %v", expectedBefore, q.Before)
 	}
@@ -222,8 +224,8 @@ func TestParseDate_Formats(t *testing.T) {
 		input    string
 		expected time.Time
 	}{
-		{"2024-01-15", time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)},
-		{"2024/01/15", time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)},
+		{"2024-01-15", time.Date(2024, 1, 15, 0, 0, 0, 0, time.Local)},
+		{"2024/01/15", time.Date(2024, 1, 15, 0, 0, 0, 0, time.Local)},
 	}
 
 	for _, tt := range tests {
@@ -292,5 +294,100 @@ func TestEscapeFTS5Query_InternalQuotes(t *testing.T) {
 	// The hyphen triggers quoting, and internal quotes should be escaped
 	if result != `"say-""hello"""` {
 		t.Errorf("escapeFTS5Query with internal quotes = %q, expected %q", result, `"say-""hello"""`)
+	}
+}
+
+func TestParseDate_TodayIsLocalMidnight(t *testing.T) {
+	got := parseDate("today")
+	now := time.Now()
+	y, m, d := now.Date()
+	want := time.Date(y, m, d, 0, 0, 0, 0, time.Local)
+	if !got.Equal(want) {
+		t.Fatalf("parseDate(today) = %v, want local midnight %v", got, want)
+	}
+	if got.Location() != time.Local {
+		t.Fatalf("parseDate(today) location = %v, want Local", got.Location())
+	}
+}
+
+func TestParseDate_YesterdayIsPreviousLocalDay(t *testing.T) {
+	got := parseDate("yesterday")
+	now := time.Now()
+	y, m, d := now.Date()
+	want := time.Date(y, m, d, 0, 0, 0, 0, time.Local).AddDate(0, 0, -1)
+	if !got.Equal(want) {
+		t.Fatalf("parseDate(yesterday) = %v, want %v", got, want)
+	}
+}
+
+// TestParse_BeforeBoundIsLocalMidnightOfNamedDay pins both halves of what a
+// bare before: date means, because each half is surprising on its own.
+//
+// Local, which is what issue #86 asked for: the bound is midnight in the
+// caller's zone rather than in UTC. That is what carries the relative tokens,
+// where the zone moves the calendar day itself — "today" during the evening in
+// Chicago is already tomorrow in UTC, and the old UTC truncation named the
+// wrong one.
+//
+// And midnight of the named day rather than of the day after, which makes
+// before:DATE exclusive of DATE itself. That reading is the one the timestamp
+// predicate has always had, and the FTS terms that prune the index are derived
+// from this same bound so the two cannot disagree. Widening it to include DATE
+// would be a change to what the operator means, not a fix, so it is pinned
+// here rather than left to be inferred from the predicate.
+func TestParse_BeforeBoundIsLocalMidnightOfNamedDay(t *testing.T) {
+	q := Parse("before:2024-01-15")
+	want := time.Date(2024, 1, 15, 0, 0, 0, 0, time.Local)
+	if !q.Before.Equal(want) {
+		t.Fatalf("before:2024-01-15 bound = %v, want local midnight of the named day %v", q.Before, want)
+	}
+	if q.Before.Location() != time.Local {
+		t.Fatalf("before:2024-01-15 bound location = %v, want Local", q.Before.Location())
+	}
+}
+
+// TestBuildQuery_DateFiltersCompareStrictly pins the two comparisons the date
+// filters are built from, which is where the inclusivity of each bound is
+// actually decided — Parse only says where the bounds sit.
+//
+// Both strict. Paired with a before: bound at the named day's own midnight,
+// that is what makes before:DATE exclude DATE; and after: stays strict so the
+// operator keeps the meaning it has always had. Asserted on the built SQL
+// because no fixture row can land exactly on a bound, so a round trip through
+// the database cannot tell > from >=.
+func TestBuildQuery_DateFiltersCompareStrictly(t *testing.T) {
+	s := New(nil)
+	// nil period terms: the predicates are what is under test here, and they
+	// are built the same either way.
+	query, _ := s.buildQuery(Parse("after:2024-01-15 before:2024-02-01"), 20, nil)
+
+	for _, want := range []string{"t.timestamp < $", "t.timestamp > $"} {
+		if !strings.Contains(query, want) {
+			t.Errorf("built SQL has no %q predicate:\n%s", want, query)
+		}
+	}
+}
+
+func TestCoerceTimestamp_TimePassthrough(t *testing.T) {
+	want := time.Date(2026, 9, 30, 13, 33, 35, 0, time.UTC)
+	if got := coerceTimestamp(want); !got.Equal(want) {
+		t.Fatalf("got %v want %v", got, want)
+	}
+}
+
+func TestCoerceTimestamp_UnparseableStringIsZero(t *testing.T) {
+	if got := coerceTimestamp("not-a-timestamp"); !got.IsZero() {
+		t.Fatalf("unparseable should be zero, got %v", got)
+	}
+}
+
+func TestCoerceTimestamp_TimeStringFormat(t *testing.T) {
+	raw := "2026-09-30 13:33:35.575 +0000 UTC"
+	got := coerceTimestamp(raw)
+	if got.IsZero() {
+		t.Fatal("expected parse of time.Time.String() form")
+	}
+	if got.Year() != 2026 || got.Month() != 9 || got.Day() != 30 {
+		t.Fatalf("unexpected parse: %v", got)
 	}
 }

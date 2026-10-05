@@ -367,8 +367,8 @@ Use --json for machine-readable output.`,
 				"model:<name>":     "Filter by model",
 				"tool:<name>":      "Filter by tool used",
 				"source:<name>":    "Filter by source",
-				"after:<date>":     "Sessions after date",
-				"before:<date>":    "Sessions before date",
+				"after:<date>":     "From the start of date, including that date",
+				"before:<date>":    "Before date, excluding that date itself",
 				"\"exact phrase\"": "Exact phrase match",
 			},
 		}
@@ -645,9 +645,17 @@ Supports Gmail-like query syntax:
   project:name     Filter by project
   model:opus       Filter by model
   tool:Bash        Sessions using specific tool
-  before:date      Date filters
-  after:date
-  "exact phrase"   Exact match`,
+  before:date      Before date, excluding that date itself
+  after:date       From the start of date, including that date
+  "exact phrase"   Exact match
+
+Both date bounds land on midnight starting the day they name, so
+"after:2026-01-01 before:2026-01-31" covers the 1st through the 30th. Name
+the day after to include the last one: "before:2026-02-01".
+
+A written-out date (2026-01-15, 2026/01/15, "Jan 15, 2026") is a UTC calendar
+day, matching how turns are stamped. today, yesterday, week and month are
+resolved on this machine's own calendar instead.`,
 	Args: cobra.MinimumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		queryStr := strings.Join(args, " ")

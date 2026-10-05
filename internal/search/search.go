@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/2389-research/ccvault/pkg/models"
 )
@@ -76,11 +77,12 @@ func (s *Searcher) Search(q *Query, limit int) ([]Result, error) {
 		var content sql.NullString
 		var parentSessionID sql.NullString
 		var matchedTool, matchedPayload sql.NullString
+		var rawTS any
 		err := rows.Scan(
 			&r.Turn.ID,
 			&r.SessionID,
 			&r.Turn.Type,
-			&r.Turn.Timestamp,
+			&rawTS,
 			&r.Turn.Ordinal,
 			&content,
 			&r.ProjectPath,
@@ -93,6 +95,7 @@ func (s *Searcher) Search(q *Query, limit int) ([]Result, error) {
 		if err != nil {
 			return nil, fmt.Errorf("scan result: %w", err)
 		}
+		r.Turn.Timestamp = coerceTimestamp(rawTS)
 		r.ParentSessionID = parentSessionID.String
 		if content.Valid {
 			r.Turn.Content = content.String
@@ -442,6 +445,44 @@ func (s *Searcher) turnDate(query string) (string, error) {
 		return "", fmt.Errorf("read the archive's date range: %w", err)
 	}
 	return date.String, nil
+}
+
+// coerceTimestamp turns a driver value into a time.Time without failing the
+// whole Search when one row holds an unparseable timestamp string (#85).
+func coerceTimestamp(v any) time.Time {
+	switch t := v.(type) {
+	case nil:
+		return time.Time{}
+	case time.Time:
+		return t
+	case string:
+		return parseStoredTimestamp(t)
+	case []byte:
+		return parseStoredTimestamp(string(t))
+	default:
+		return time.Time{}
+	}
+}
+
+func parseStoredTimestamp(s string) time.Time {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}
+	}
+	formats := []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02 15:04:05.999999999 -0700 MST", // time.Time.String()
+		"2006-01-02 15:04:05.999999999 -0700",
+		"2006-01-02 15:04:05",
+		"2006-01-02",
+	}
+	for _, f := range formats {
+		if t, err := time.Parse(f, s); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
 }
 
 // makeSnippet creates a snippet from content with the search term highlighted

@@ -182,12 +182,22 @@ project:name     Filter by project path/name
 model:opus       Filter by model (partial match)
 tool:Bash        Sessions using specific tool
 file:path        Filter by file path
-before:date      Sessions before date (YYYY-MM-DD)
-after:date       Sessions after date
+before:date      Turns before date, excluding that date itself (YYYY-MM-DD)
+after:date       Turns from the start of date, including that date
 has:error        Sessions with errors
 has:subagent     Sessions with subagent usage
 "exact phrase"   Exact phrase match
 ```
+
+The two date filters are not symmetric, which is worth knowing before reading
+a result count. `before:` stops at the named date without reaching it, so
+`after:2026-01-01 before:2026-01-31` covers the 1st through the 30th and not
+the 31st. To include a day, name the one after it: `before:2026-02-01`.
+
+A written-out date is a UTC calendar day, because that is the zone turns are
+stamped in. The relative forms — `today`, `yesterday`, `week`, `month` — are
+resolved on your own calendar instead, so `after:today` means the day it is
+where you are.
 
 Examples:
 ```bash

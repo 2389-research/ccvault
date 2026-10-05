@@ -16,8 +16,8 @@ type Query struct {
 	Model    string    // model: filter
 	Tool     string    // tool: filter
 	File     string    // file: filter
-	Before   time.Time // before: filter
-	After    time.Time // after: filter
+	Before   time.Time // before: filter (upper bound, exclusive; a bare date is local midnight of that day)
+	After    time.Time // after: filter (lower bound, exclusive; a bare date is local midnight of that day)
 	HasError bool      // has:error filter
 	HasAgent bool      // has:subagent filter
 	Source   string    // source: filter
@@ -67,8 +67,10 @@ func Parse(input string) *Query {
 	return q
 }
 
-// parseDate parses a date string in various formats
+// parseDate parses a date string as the caller's local midnight for that day.
+// Relative tokens (today, yesterday, …) use the local calendar, not UTC Truncate.
 func parseDate(s string) time.Time {
+	loc := time.Local
 	formats := []string{
 		"2006-01-02",
 		"2006/01/02",
@@ -78,21 +80,24 @@ func parseDate(s string) time.Time {
 	}
 
 	for _, format := range formats {
-		if t, err := time.Parse(format, s); err == nil {
+		if t, err := time.ParseInLocation(format, s, loc); err == nil {
 			return t
 		}
 	}
 
-	// Try relative dates
+	now := time.Now().In(loc)
+	y, m, d := now.Date()
+	today := time.Date(y, m, d, 0, 0, 0, 0, loc)
+
 	switch strings.ToLower(s) {
 	case "today":
-		return time.Now().Truncate(24 * time.Hour)
+		return today
 	case "yesterday":
-		return time.Now().Truncate(24 * time.Hour).Add(-24 * time.Hour)
+		return today.AddDate(0, 0, -1)
 	case "week", "thisweek":
-		return time.Now().Truncate(24 * time.Hour).Add(-7 * 24 * time.Hour)
+		return today.AddDate(0, 0, -7)
 	case "month", "thismonth":
-		return time.Now().Truncate(24 * time.Hour).Add(-30 * 24 * time.Hour)
+		return today.AddDate(0, 0, -30)
 	}
 
 	return time.Time{}

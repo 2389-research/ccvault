@@ -28,6 +28,37 @@ type windowFixture struct {
 // what the date filter under test asks for.
 const windowFirstDay = "2026-09-28"
 
+// boundaryZone is the zone the bare dates in a query are parsed in while the
+// boundary test runs.
+//
+// Pinned, because a bare before:/after: date is parsed in the caller's zone
+// while the fixtures below stamp their turns in UTC — so left to the machine's
+// own zone, these assertions would be answering a slightly different question
+// on every developer's laptop and in CI.
+//
+// Deliberately not UTC. Pinning to UTC would make the two sides agree by
+// construction and the test would stop saying anything about the zone at all;
+// an offset is what makes it assert that a locally-parsed bound and a
+// UTC-stamped row still land on the same side of a boundary. A half-hour
+// offset rather than a whole-hour one because it also catches an arithmetic
+// slip that rounds to the hour.
+//
+// A fixed offset rather than a named zone so the test does not depend on the
+// machine carrying a zoneinfo database.
+var boundaryZone = time.FixedZone("UTC+05:30", 5*60*60+30*60)
+
+// pinLocalZone fixes time.Local for the duration of one test.
+//
+// Assigning it is safe here: nothing in this package runs its tests in
+// parallel, and the original is put back before the next test starts.
+func pinLocalZone(t *testing.T, loc *time.Location) {
+	t.Helper()
+
+	original := time.Local
+	time.Local = loc
+	t.Cleanup(func() { time.Local = original })
+}
+
 func setupWindowFixture(t *testing.T) windowFixture {
 	t.Helper()
 
@@ -212,6 +243,8 @@ func TestSearch_DateFilterScopesItsTermsToThePeriodColumn(t *testing.T) {
 // month and one at the first instant of the next belong to different tokens
 // but can belong to the same window.
 func TestSearch_DateFilterReturnsTheSameRowsAtPeriodBoundaries(t *testing.T) {
+	pinLocalZone(t, boundaryZone)
+
 	database, err := db.Open(t.TempDir())
 	if err != nil {
 		t.Fatalf("open db: %v", err)
@@ -333,11 +366,11 @@ func TestSearch_DateFilterReturnsTheSameRowsAtPeriodBoundaries(t *testing.T) {
 // exactly as it did before the period column existed. Dropping it inside the
 // index would be a wrong answer rather than a slow one.
 //
-// Asserted on the index rather than through Search, because Search cannot
-// return such a row at all: scanning turns.timestamp into a time.Time fails
-// for text no date format parses, and the whole query errors with it. That is
-// pre-existing and left alone here — and it is also why the sentinel has to be
-// checked where it lives.
+// Asserted on the index, because that is where the sentinel lives, and then
+// through Search, because the row now survives the trip back out. Scanning
+// turns.timestamp straight into a time.Time used to fail for text no date
+// format parses and take the whole query down with it — one bad row made every
+// search that reached it an error, which is issue #85.
 func TestSearch_DateFilterKeepsAnUnreadableTimestamp(t *testing.T) {
 	database, err := db.Open(t.TempDir())
 	if err != nil {
@@ -371,10 +404,32 @@ func TestSearch_DateFilterKeepsAnUnreadableTimestamp(t *testing.T) {
 		t.Fatalf("insert undated turn: %v", err)
 	}
 
-	filtered, _ := matchExprs(t, New(database.DB), Parse("unreadableneedle after:2026-09-30"))
+	searcher := New(database.DB)
+	filtered, _ := matchExprs(t, searcher, Parse("unreadableneedle after:2026-09-30"))
 
 	if got := matchCount(t, database, "turns_fts", filtered); got != 2 {
 		t.Errorf("the date-filtered expression matches %d turns, want both — the dated one, and the one whose period the column could not read", got)
+	}
+
+	// And the search completes rather than erroring on the way past the row.
+	// An unreadable date reads back as the zero time, which is the honest
+	// answer for a timestamp nothing can parse; losing every other result to it
+	// is not.
+	results, err := searcher.Search(Parse("unreadableneedle after:2026-09-30"), 50)
+	if err != nil {
+		t.Fatalf("search across the row with the unreadable timestamp: %v", err)
+	}
+	var undated *Result
+	for i := range results {
+		if results[i].Turn.ID == "turn-undated" {
+			undated = &results[i]
+		}
+	}
+	if undated == nil {
+		t.Fatalf("search returned %v, want the row with the unreadable timestamp among them", resultIDs(results))
+	}
+	if !undated.Turn.Timestamp.IsZero() {
+		t.Errorf("the unreadable timestamp read back as %v, want the zero time", undated.Turn.Timestamp)
 	}
 }
 
