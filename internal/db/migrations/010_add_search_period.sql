@@ -35,7 +35,9 @@
 -- the author's archive that was 1.08s of a 1.19s date-filtered search — a cost
 -- per returned row, so pruning the index could not touch it.
 --
--- 5 MB over 264,199 rows, measured.
+-- Measured on the author's archive: 0.3s to build, 2,940 pages of 4 KB — 12 MB
+-- over 264,199 rows. The file grows by less than that, because the index
+-- rebuild above leaves free pages behind for it to take.
 --
 -- Not unique: a turn issues as many calls as it issues, and #30's recovery
 -- import left turns with duplicate tool_uses rows besides.

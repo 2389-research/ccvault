@@ -295,11 +295,12 @@ func (s *Searcher) buildQuery(q *Query, limit int, periods []string) (string, []
 	// it is read after every filter above has claimed its parameter.
 	//
 	// The same text as the payload branch of text_hits, minus the period
-	// terms. Those subqueries are already scoped to one turn, so they have
-	// nothing to prune — and leaving the period terms out keeps snippet()'s
-	// automatic column choice looking at only the two columns that hold
-	// payload text, rather than at a third column whose single token would be
-	// competing with them for the best match.
+	// terms. Those subqueries look up one turn's own tool uses (see the shape
+	// below), so there is nothing left for a period term to prune — and
+	// leaving them out keeps snippet()'s automatic column choice looking at
+	// only the two columns that hold payload text, rather than at a third
+	// column whose single token would be competing with them for the best
+	// match.
 	if q.Text != "" {
 		snippetMatchArg = argNum
 		args = append(args, ftsMatchExpr(payloadFTSColumns, escaped, nil))
@@ -355,8 +356,13 @@ func (s *Searcher) buildQuery(q *Query, limit int, periods []string) (string, []
 	// to reorder the join, and left to choose it puts the virtual table first:
 	// it has no row estimate for an fts5 MATCH that would tell it a seek on
 	// idx_tool_uses_turn_id is the cheaper end to start from.
-	// TestSearch_PayloadAttributionDrivesFromTheTurn asserts the plan, because
-	// the wrong plan is invisible in the rows.
+	//
+	// Which makes that index a hard dependency of this shape rather than an
+	// optimisation of it. Pinning the order without an index to seek turns the
+	// lookup into a scan of all 264,199 tool uses per returned row — measured
+	// at 3.0s against the 1.2s the unpinned shape costs. Migration 010 creates
+	// the index and TestSearch_PayloadAttributionDrivesFromTheTurn asserts the
+	// plan still uses it, because a wrong plan here is invisible in the rows.
 	return fmt.Sprintf(`WITH %s, page AS (%s)
 		SELECT page.*,
 			(SELECT mtu.tool_name FROM tool_uses mtu
