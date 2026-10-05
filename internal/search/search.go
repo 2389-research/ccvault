@@ -246,7 +246,7 @@ func (s *Searcher) buildQuery(q *Query, limit int) (string, []interface{}) {
 		argNum++
 	}
 	if !q.After.IsZero() {
-		conditions = append(conditions, fmt.Sprintf("t.timestamp >= $%d", argNum))
+		conditions = append(conditions, fmt.Sprintf("t.timestamp > $%d", argNum))
 		args = append(args, q.After)
 		argNum++
 	}

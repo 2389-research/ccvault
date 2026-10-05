@@ -4,6 +4,7 @@
 package search
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -83,8 +84,8 @@ func TestParse_DateFilters(t *testing.T) {
 		t.Errorf("Expected after date %v, got %v", expectedAfter, q.After)
 	}
 
-	// before:2024-02-01 is inclusive of Feb 1, so the exclusive bound is local Feb 2 midnight
-	expectedBefore := time.Date(2024, 2, 2, 0, 0, 0, 0, time.Local)
+	// before:2024-02-01 is exclusive of Feb 1, so the bound is local Feb 1 midnight
+	expectedBefore := time.Date(2024, 2, 1, 0, 0, 0, 0, time.Local)
 	if !q.Before.Equal(expectedBefore) {
 		t.Errorf("Expected before date %v, got %v", expectedBefore, q.Before)
 	}
@@ -319,11 +320,46 @@ func TestParseDate_YesterdayIsPreviousLocalDay(t *testing.T) {
 	}
 }
 
-func TestParse_BeforeIncludesNamedLocalDay(t *testing.T) {
+// TestParse_BeforeBoundIsLocalMidnightOfNamedDay pins both halves of what a
+// bare before: date means, because each half is surprising on its own.
+//
+// Local, which is the correction issue #86 asked for: the bound is midnight in
+// the caller's zone, so a filter means the day the caller means.
+//
+// And midnight of the named day rather than of the day after, which makes
+// before:DATE exclusive of DATE itself. That reading is the one the timestamp
+// predicate has always had, and the FTS terms that prune the index are derived
+// from this same bound so the two cannot disagree. Widening it to include DATE
+// would be a change to what the operator means, not a fix, so it is pinned
+// here rather than left to be inferred from the predicate.
+func TestParse_BeforeBoundIsLocalMidnightOfNamedDay(t *testing.T) {
 	q := Parse("before:2024-01-15")
-	want := time.Date(2024, 1, 16, 0, 0, 0, 0, time.Local)
+	want := time.Date(2024, 1, 15, 0, 0, 0, 0, time.Local)
 	if !q.Before.Equal(want) {
-		t.Fatalf("before:2024-01-15 bound = %v, want next local midnight %v", q.Before, want)
+		t.Fatalf("before:2024-01-15 bound = %v, want local midnight of the named day %v", q.Before, want)
+	}
+	if q.Before.Location() != time.Local {
+		t.Fatalf("before:2024-01-15 bound location = %v, want Local", q.Before.Location())
+	}
+}
+
+// TestBuildQuery_DateFiltersCompareStrictly pins the two comparisons the date
+// filters are built from, which is where the inclusivity of each bound is
+// actually decided — Parse only says where the bounds sit.
+//
+// Both strict. Paired with a before: bound at the named day's own midnight,
+// that is what makes before:DATE exclude DATE; and after: stays strict so the
+// operator keeps the meaning it has always had. Asserted on the built SQL
+// because no fixture row can land exactly on a bound, so a round trip through
+// the database cannot tell > from >=.
+func TestBuildQuery_DateFiltersCompareStrictly(t *testing.T) {
+	s := New(nil)
+	query, _ := s.buildQuery(Parse("after:2024-01-15 before:2024-02-01"), 20)
+
+	for _, want := range []string{"t.timestamp < $", "t.timestamp > $"} {
+		if !strings.Contains(query, want) {
+			t.Errorf("built SQL has no %q predicate:\n%s", want, query)
+		}
 	}
 }
 

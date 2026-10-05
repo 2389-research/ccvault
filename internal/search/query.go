@@ -16,8 +16,8 @@ type Query struct {
 	Model    string    // model: filter
 	Tool     string    // tool: filter
 	File     string    // file: filter
-	Before   time.Time // before: filter (exclusive upper bound; bare dates cover the named local day)
-	After    time.Time // after: filter (inclusive lower bound at local midnight of the named day)
+	Before   time.Time // before: filter (upper bound, exclusive; a bare date is local midnight of that day)
+	After    time.Time // after: filter (lower bound, exclusive; a bare date is local midnight of that day)
 	HasError bool      // has:error filter
 	HasAgent bool      // has:subagent filter
 	Source   string    // source: filter
@@ -45,11 +45,7 @@ func Parse(input string) *Query {
 		case "file":
 			q.File = value
 		case "before":
-			// bare dates mean the caller's local calendar day; before:DATE is
-			// inclusive of DATE, so the exclusive bound is the next local midnight.
-			if t := parseDate(value); !t.IsZero() {
-				q.Before = t.AddDate(0, 0, 1)
-			}
+			q.Before = parseDate(value)
 		case "after":
 			q.After = parseDate(value)
 		case "source":
