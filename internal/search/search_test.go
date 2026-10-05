@@ -323,8 +323,11 @@ func TestParseDate_YesterdayIsPreviousLocalDay(t *testing.T) {
 // TestParse_BeforeBoundIsLocalMidnightOfNamedDay pins both halves of what a
 // bare before: date means, because each half is surprising on its own.
 //
-// Local, which is the correction issue #86 asked for: the bound is midnight in
-// the caller's zone, so a filter means the day the caller means.
+// Local, which is what issue #86 asked for: the bound is midnight in the
+// caller's zone rather than in UTC. That is what carries the relative tokens,
+// where the zone moves the calendar day itself — "today" during the evening in
+// Chicago is already tomorrow in UTC, and the old UTC truncation named the
+// wrong one.
 //
 // And midnight of the named day rather than of the day after, which makes
 // before:DATE exclusive of DATE itself. That reading is the one the timestamp
@@ -354,7 +357,9 @@ func TestParse_BeforeBoundIsLocalMidnightOfNamedDay(t *testing.T) {
 // the database cannot tell > from >=.
 func TestBuildQuery_DateFiltersCompareStrictly(t *testing.T) {
 	s := New(nil)
-	query, _ := s.buildQuery(Parse("after:2024-01-15 before:2024-02-01"), 20)
+	// nil period terms: the predicates are what is under test here, and they
+	// are built the same either way.
+	query, _ := s.buildQuery(Parse("after:2024-01-15 before:2024-02-01"), 20, nil)
 
 	for _, want := range []string{"t.timestamp < $", "t.timestamp > $"} {
 		if !strings.Contains(query, want) {
