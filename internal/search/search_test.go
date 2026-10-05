@@ -78,12 +78,13 @@ func TestParse_DateFilters(t *testing.T) {
 		t.Error("Before date should not be zero")
 	}
 
-	expectedAfter := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
+	expectedAfter := time.Date(2024, 1, 15, 0, 0, 0, 0, time.Local)
 	if !q.After.Equal(expectedAfter) {
 		t.Errorf("Expected after date %v, got %v", expectedAfter, q.After)
 	}
 
-	expectedBefore := time.Date(2024, 2, 1, 0, 0, 0, 0, time.UTC)
+	// before:2024-02-01 is inclusive of Feb 1, so the exclusive bound is local Feb 2 midnight
+	expectedBefore := time.Date(2024, 2, 2, 0, 0, 0, 0, time.Local)
 	if !q.Before.Equal(expectedBefore) {
 		t.Errorf("Expected before date %v, got %v", expectedBefore, q.Before)
 	}
@@ -222,8 +223,8 @@ func TestParseDate_Formats(t *testing.T) {
 		input    string
 		expected time.Time
 	}{
-		{"2024-01-15", time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)},
-		{"2024/01/15", time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)},
+		{"2024-01-15", time.Date(2024, 1, 15, 0, 0, 0, 0, time.Local)},
+		{"2024/01/15", time.Date(2024, 1, 15, 0, 0, 0, 0, time.Local)},
 	}
 
 	for _, tt := range tests {
@@ -292,5 +293,60 @@ func TestEscapeFTS5Query_InternalQuotes(t *testing.T) {
 	// The hyphen triggers quoting, and internal quotes should be escaped
 	if result != `"say-""hello"""` {
 		t.Errorf("escapeFTS5Query with internal quotes = %q, expected %q", result, `"say-""hello"""`)
+	}
+}
+
+func TestParseDate_TodayIsLocalMidnight(t *testing.T) {
+	got := parseDate("today")
+	now := time.Now()
+	y, m, d := now.Date()
+	want := time.Date(y, m, d, 0, 0, 0, 0, time.Local)
+	if !got.Equal(want) {
+		t.Fatalf("parseDate(today) = %v, want local midnight %v", got, want)
+	}
+	if got.Location() != time.Local {
+		t.Fatalf("parseDate(today) location = %v, want Local", got.Location())
+	}
+}
+
+func TestParseDate_YesterdayIsPreviousLocalDay(t *testing.T) {
+	got := parseDate("yesterday")
+	now := time.Now()
+	y, m, d := now.Date()
+	want := time.Date(y, m, d, 0, 0, 0, 0, time.Local).AddDate(0, 0, -1)
+	if !got.Equal(want) {
+		t.Fatalf("parseDate(yesterday) = %v, want %v", got, want)
+	}
+}
+
+func TestParse_BeforeIncludesNamedLocalDay(t *testing.T) {
+	q := Parse("before:2024-01-15")
+	want := time.Date(2024, 1, 16, 0, 0, 0, 0, time.Local)
+	if !q.Before.Equal(want) {
+		t.Fatalf("before:2024-01-15 bound = %v, want next local midnight %v", q.Before, want)
+	}
+}
+
+func TestCoerceTimestamp_TimePassthrough(t *testing.T) {
+	want := time.Date(2026, 9, 30, 13, 33, 35, 0, time.UTC)
+	if got := coerceTimestamp(want); !got.Equal(want) {
+		t.Fatalf("got %v want %v", got, want)
+	}
+}
+
+func TestCoerceTimestamp_UnparseableStringIsZero(t *testing.T) {
+	if got := coerceTimestamp("not-a-timestamp"); !got.IsZero() {
+		t.Fatalf("unparseable should be zero, got %v", got)
+	}
+}
+
+func TestCoerceTimestamp_TimeStringFormat(t *testing.T) {
+	raw := "2026-09-30 13:33:35.575 +0000 UTC"
+	got := coerceTimestamp(raw)
+	if got.IsZero() {
+		t.Fatal("expected parse of time.Time.String() form")
+	}
+	if got.Year() != 2026 || got.Month() != 9 || got.Day() != 30 {
+		t.Fatalf("unexpected parse: %v", got)
 	}
 }
