@@ -53,8 +53,16 @@ func (s *Searcher) Search(q *Query, limit int) ([]Result, error) {
 		limit = 20
 	}
 
+	// The terms that bound the index scan to the window the caller asked for.
+	// Resolved before the statement is built because a one-sided filter takes
+	// its other side from the archive's own date range.
+	periods, err := s.periodTermsFor(q)
+	if err != nil {
+		return nil, err
+	}
+
 	// Build the query
-	query, args := s.buildQuery(q, limit)
+	query, args := s.buildQuery(q, limit, periods)
 
 	rows, err := s.db.Query(query, args...)
 	if err != nil {
@@ -128,8 +136,14 @@ func flattenWhitespace(s string) string {
 	return strings.Join(strings.Fields(strings.ReplaceAll(s, "\n", " ")), " ")
 }
 
-// buildQuery constructs the SQL query from parsed search
-func (s *Searcher) buildQuery(q *Query, limit int) (string, []interface{}) {
+// buildQuery constructs the SQL query from parsed search.
+//
+// periods are the FTS5 terms that bound the text match to the window the date
+// filters ask for, empty for a search that has no date filter or whose range
+// is too wide to be worth compiling. They narrow the scan; they never decide
+// an answer — the timestamp predicate below does that, and it stays whether or
+// not the terms are there.
+func (s *Searcher) buildQuery(q *Query, limit int, periods []string) (string, []interface{}) {
 	var conditions []string
 	var args []interface{}
 	argNum := 1
@@ -156,11 +170,23 @@ func (s *Searcher) buildQuery(q *Query, limit int) (string, []interface{}) {
 	// 15.5s after — that query's cost is the sort, not the match. Searching
 	// two indexes for roughly twice the time of searching one is the trade;
 	// the absolute numbers stay inside a second for a query anyone would type.
+	//
+	// Both branches carry the period terms when there is a date filter, which
+	// is what keeps that materialisation proportional to the window rather
+	// than to the archive (issue #80). Both, not just the payload index that
+	// showed up in the measurements: the UNION is only as bounded as its
+	// looser branch.
 	prefix := ""
-	matchArg := 0
+	snippetMatchArg := 0
+	escaped := ""
 
 	if q.Text != "" {
-		matchArg = argNum
+		// Escape the search text for FTS5 to handle special characters like hyphens
+		escaped = escapeFTS5Query(q.Text)
+		turnsMatchArg := argNum
+		argNum++
+		payloadMatchArg := argNum
+		argNum++
 		prefix = fmt.Sprintf(`text_hits AS (
 			SELECT rowid AS turn_rowid FROM turns_fts WHERE turns_fts MATCH $%d
 			UNION
@@ -168,10 +194,10 @@ func (s *Searcher) buildQuery(q *Query, limit int) (string, []interface{}) {
 			JOIN tool_uses htu ON htu.id = tool_uses_fts.rowid
 			JOIN turns ht ON ht.id = htu.turn_id
 			WHERE tool_uses_fts MATCH $%d
-		)`, matchArg, matchArg)
-		// Escape the search text for FTS5 to handle special characters like hyphens
-		args = append(args, escapeFTS5Query(q.Text))
-		argNum++
+		)`, turnsMatchArg, payloadMatchArg)
+		args = append(args,
+			ftsMatchExpr(turnsFTSColumns, escaped, periods),
+			ftsMatchExpr(payloadFTSColumns, escaped, periods))
 	}
 
 	// A query with no text has no payload to attribute a match to, and takes
@@ -262,7 +288,23 @@ func (s *Searcher) buildQuery(q *Query, limit int) (string, []interface{}) {
 	if q.Source != "" {
 		conditions = append(conditions, fmt.Sprintf("s.source = $%d", argNum))
 		args = append(args, q.Source)
-		argNum++ //nolint:ineffassign // keep argNum consistent for future filters
+		argNum++
+	}
+
+	// The expression the match-attribution subqueries use, bound last because
+	// it is read after every filter above has claimed its parameter.
+	//
+	// The same text as the payload branch of text_hits, minus the period
+	// terms. Those subqueries look up one turn's own tool uses (see the shape
+	// below), so there is nothing left for a period term to prune — and
+	// leaving them out keeps snippet()'s automatic column choice looking at
+	// only the two columns that hold payload text, rather than at a third
+	// column whose single token would be competing with them for the best
+	// match.
+	if q.Text != "" {
+		snippetMatchArg = argNum
+		args = append(args, ftsMatchExpr(payloadFTSColumns, escaped, nil))
+		argNum++ //nolint:ineffassign // keep argNum consistent for future parameters
 	}
 
 	// Build final query
@@ -301,17 +343,105 @@ func (s *Searcher) buildQuery(q *Query, limit int) (string, []interface{}) {
 	//
 	// LIMIT 1 on each: a turn may have several matching calls, and the snippet
 	// shows one of them.
+	//
+	// Each subquery starts from the turn's tool uses and probes the index for
+	// one document, rather than starting from the index's match set and
+	// filtering it down to this turn. Both answer identically; the second costs
+	// a walk of every all-time match looking for a row that belongs to this
+	// turn, which measured 1.08s of a 1.19s date-filtered search on the
+	// author's archive — and does not shrink when the window does, because it
+	// is per returned row rather than per match.
+	//
+	// CROSS JOIN is load-bearing, not decoration. It is how SQLite is told not
+	// to reorder the join, and left to choose it puts the virtual table first:
+	// it has no row estimate for an fts5 MATCH that would tell it a seek on
+	// idx_tool_uses_turn_id is the cheaper end to start from.
+	//
+	// Which makes that index a hard dependency of this shape rather than an
+	// optimisation of it. Pinning the order without an index to seek turns the
+	// lookup into a scan of all 264,199 tool uses per returned row — measured
+	// at 3.0s against the 1.2s the unpinned shape costs. Migration 010 creates
+	// the index and TestSearch_PayloadAttributionDrivesFromTheTurn asserts the
+	// plan still uses it, because a wrong plan here is invisible in the rows.
 	return fmt.Sprintf(`WITH %s, page AS (%s)
 		SELECT page.*,
-			(SELECT mtu.tool_name FROM tool_uses_fts
-			 JOIN tool_uses mtu ON mtu.id = tool_uses_fts.rowid
-			 WHERE tool_uses_fts MATCH $%d AND mtu.turn_id = page.id LIMIT 1),
-			(SELECT snippet(tool_uses_fts, -1, '', '', '…', 24) FROM tool_uses_fts
-			 JOIN tool_uses mtu ON mtu.id = tool_uses_fts.rowid
-			 WHERE tool_uses_fts MATCH $%d AND mtu.turn_id = page.id LIMIT 1)
+			(SELECT mtu.tool_name FROM tool_uses mtu
+			 CROSS JOIN tool_uses_fts ON tool_uses_fts.rowid = mtu.id
+			 WHERE mtu.turn_id = page.id AND tool_uses_fts MATCH $%d LIMIT 1),
+			(SELECT snippet(tool_uses_fts, -1, '', '', '…', 24) FROM tool_uses mtu
+			 CROSS JOIN tool_uses_fts ON tool_uses_fts.rowid = mtu.id
+			 WHERE mtu.turn_id = page.id AND tool_uses_fts MATCH $%d LIMIT 1)
 		FROM page
 		ORDER BY page.timestamp DESC, page.id ASC`,
-		prefix, baseQuery, matchArg, matchArg), args
+		prefix, baseQuery, snippetMatchArg, snippetMatchArg), args
+}
+
+// FTS5 column names as the query builder sees them, one list per index. The
+// caller's text is scoped to these so that a search for a period token finds
+// the rows whose text holds it rather than the rows that belong to that
+// period — see the note on the token namespace in period.go.
+var (
+	turnsFTSColumns   = []string{"content"}
+	payloadFTSColumns = []string{"input_json", "result_content"}
+)
+
+// The oldest and newest calendar date the archive holds, as two separate
+// single-aggregate queries. SQLite answers each with a seek on
+// idx_turns_timestamp; one query selecting both aggregates would scan the
+// table instead.
+//
+// substr in SQL rather than in Go so the value arrives as the text SQLite
+// compares, not as a time.Time the driver has reinterpreted. The date filter
+// is a lexicographic comparison of that text and the period token is sliced
+// out of it, so a bound taken anywhere else could name a different day than
+// the comparison uses.
+const (
+	oldestTurnDateQuery = `SELECT substr(MIN(timestamp), 1, 10) FROM turns`
+	newestTurnDateQuery = `SELECT substr(MAX(timestamp), 1, 10) FROM turns`
+)
+
+// periodTermsFor resolves a query's date filters into the period terms that
+// bound its text match, or nil for a query that cannot or should not be pruned.
+//
+// A one-sided filter takes its other side from the archive itself. after: with
+// no before: is the common case and has no upper bound of its own; using "now"
+// for it would drop any row stamped in the future, and a clock-skewed
+// transcript is a thing that happens. The newest row in the archive is both an
+// honest bound and a cheap one.
+func (s *Searcher) periodTermsFor(q *Query) ([]string, error) {
+	if q.Text == "" || (q.After.IsZero() && q.Before.IsZero()) {
+		return nil, nil
+	}
+
+	from := periodFilterDate(q.After)
+	if from == "" {
+		date, err := s.turnDate(oldestTurnDateQuery)
+		if err != nil {
+			return nil, err
+		}
+		from = date
+	}
+
+	to := periodFilterDate(q.Before)
+	if to == "" {
+		date, err := s.turnDate(newestTurnDateQuery)
+		if err != nil {
+			return nil, err
+		}
+		to = date
+	}
+
+	return periodTerms(from, to), nil
+}
+
+// turnDate runs one of the bound queries above, returning "" for an archive
+// with no turns in it.
+func (s *Searcher) turnDate(query string) (string, error) {
+	var date sql.NullString
+	if err := s.db.QueryRow(query).Scan(&date); err != nil {
+		return "", fmt.Errorf("read the archive's date range: %w", err)
+	}
+	return date.String, nil
 }
 
 // makeSnippet creates a snippet from content with the search term highlighted
