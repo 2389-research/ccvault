@@ -203,7 +203,8 @@ func (db *DB) GetSession(id string) (*models.Session, error) {
 			COALESCE(model, ''), COALESCE(git_branch, ''),
 			COALESCE(turn_count, 0), COALESCE(input_tokens, 0), COALESCE(output_tokens, 0),
 			COALESCE(cache_read_tokens, 0), COALESCE(cache_write_tokens, 0),
-			source_file, source, parent_session_id, last_entry_uuid,
+			source_file, COALESCE(has_error, 0), COALESCE(has_subagent, 0),
+			source, parent_session_id, last_entry_uuid,
 			(SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = sessions.id)
 		FROM sessions WHERE id = ?`
 
@@ -229,6 +230,8 @@ func (db *DB) GetSession(id string) (*models.Session, error) {
 		&s.CacheReadTokens,
 		&s.CacheWriteTokens,
 		&s.SourceFile,
+		&s.HasError,
+		&s.HasSubagent,
 		&s.Source,
 		&parentSessionID,
 		&lastEntryUUID,
@@ -311,14 +314,36 @@ type SessionQuery struct {
 // correlated subagent_count is what earns the default filtering: a surface
 // that hides subagent rows still reports how many it hid, per parent.
 //
+// has_error and has_subagent are in the list because they were missing from it
+// for the whole life of this query (#73). Both are written correctly by every
+// adapter and neither was ever read back, so every session arrived at a
+// consumer holding Go's zero value and `list-sessions --json` reported
+// `has_error: false` for all 46,061 of them — including the 7,985 that really
+// do carry a tool error. A field whose presence implies it was computed is
+// worse than no field: a script filtering on it found nothing, ever, and could
+// not distinguish that from an archive with no errors in it.
+//
+// has_subagent stays rather than being replaced by `subagent_count > 0`, which
+// #31 added and which really is populated. They answer different questions and
+// come apart in both directions — on the author's archive, 9 sessions are
+// flagged with no child rows and 9 have child rows without the flag. The flag
+// says this transcript dispatched work; the count says how many of those
+// transcripts this archive holds. Dropping the flag would stop reporting a
+// dispatch whose subagent transcript was never ingested, which is the case a
+// reader most needs told.
+//
 // The COALESCEs on the nullable metadata columns are #64 — see GetSession for
-// why they are here rather than at the scan.
+// why they are here rather than at the scan. The two flags get one each for
+// the same reason: they are nullable with a DEFAULT 0 that applies to an
+// omitted column and not to an explicit NULL, and selecting them for the first
+// time is also the first chance to scan a NULL out of them.
 const sessionListSelect = `
 		SELECT s.id, s.project_id, s.started_at, s.ended_at,
 			COALESCE(s.model, ''), COALESCE(s.git_branch, ''),
 			COALESCE(s.turn_count, 0), COALESCE(s.input_tokens, 0), COALESCE(s.output_tokens, 0),
 			COALESCE(s.cache_read_tokens, 0), COALESCE(s.cache_write_tokens, 0),
-			s.source_file, COALESCE(p.path, '') as project_path, s.source,
+			s.source_file, COALESCE(p.path, '') as project_path,
+			COALESCE(s.has_error, 0), COALESCE(s.has_subagent, 0), s.source,
 			s.parent_session_id,
 			(SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = s.id) as subagent_count
 		FROM sessions s
@@ -413,6 +438,8 @@ func (db *DB) QuerySessions(q SessionQuery) ([]models.Session, error) {
 			&s.CacheWriteTokens,
 			&s.SourceFile,
 			&s.ProjectPath,
+			&s.HasError,
+			&s.HasSubagent,
 			&s.Source,
 			&parentSessionID,
 			&s.SubagentCount,
