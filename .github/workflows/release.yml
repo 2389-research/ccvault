@@ -22,7 +22,9 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          # Release with the toolchain go.mod declares, not a hardcoded
+          # version that the auto-download then replaces.
+          go-version-file: go.mod
           cache: true
 
       - name: Run GoReleaser
@@ -48,7 +50,9 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          # Release with the toolchain go.mod declares, not a hardcoded
+          # version that the auto-download then replaces.
+          go-version-file: go.mod
           cache: true
 
       - name: Build Linux binary

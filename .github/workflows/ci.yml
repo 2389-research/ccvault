@@ -1,5 +1,5 @@
 # ABOUTME: GitHub Actions CI workflow for ccvault
-# ABOUTME: Runs tests, linting, and builds on multiple Go versions
+# ABOUTME: Runs tests, linting, and builds on the Go versions go.mod supports
 name: CI
 
 on:
@@ -8,13 +8,24 @@ on:
   pull_request:
     branches: [ main ]
 
+# GOTOOLCHAIN=local is what makes every go-version below mean what it says.
+# Left unset, the toolchain silently downloads whatever go.mod asks for and
+# runs that instead, so a job labelled with one version can be compiling with
+# another. With it set, a version too old for go.mod fails the job.
+env:
+  GOTOOLCHAIN: local
+
 jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        go-version: ['1.21', '1.22', '1.23']
+        # go.mod declares `go 1.25.5`, so that is the supported floor and the
+        # only version this project claims to build on. `stable` runs beside
+        # it as forward warning: it catches a new Go release breaking the
+        # build before a contributor on current Go hits it.
+        go-version: ['1.25.5', 'stable']
     steps:
       - name: Check out code
         uses: actions/checkout@v4
@@ -26,6 +37,12 @@ jobs:
         with:
           go-version: ${{ matrix.go-version }}
           cache: true
+
+      - name: Verify the toolchain is the one this job names
+        run: |
+          go version
+          echo "GOTOOLCHAIN=$(go env GOTOOLCHAIN)"
+          test "$(go env GOTOOLCHAIN)" = local
 
       - name: Cache Go modules
         uses: actions/cache@v4
@@ -41,12 +58,14 @@ jobs:
       - name: Run tests
         run: make test-race
 
+      # Coverage comes from the floor job: one upload, from the version the
+      # project supports rather than whatever `stable` happens to be.
       - name: Run tests with coverage
-        if: matrix.go-version == '1.23'
+        if: matrix.go-version == '1.25.5'
         run: make test-coverage
 
       - name: Upload coverage to Codecov
-        if: matrix.go-version == '1.23'
+        if: matrix.go-version == '1.25.5'
         uses: codecov/codecov-action@v4
         with:
           file: ./coverage.out
@@ -63,7 +82,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version-file: go.mod
           cache: true
 
       - name: Run golangci-lint
@@ -83,7 +102,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version-file: go.mod
           cache: true
 
       - name: Build binary
