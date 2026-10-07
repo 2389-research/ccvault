@@ -122,10 +122,9 @@ func parseSessionReaderWithLimits(r io.Reader, sourcePath string, maxLine, maxRa
 		session.ID = turns[0].SessionID
 	}
 
-	// Set end time from last turn
-	if len(turns) > 0 {
-		session.EndedAt = turns[len(turns)-1].Timestamp
-	}
+	// StartedAt and EndedAt are maintained as running extrema inside
+	// updateSessionMetadata, not taken from the ends of the file. See the note
+	// there for why.
 
 	session.TurnCount = len(turns)
 
@@ -346,9 +345,32 @@ func updateSessionMetadata(session *models.Session, turn *models.Turn, raw *mode
 		session.ID = turn.SessionID
 	}
 
-	// Set start time from first turn
-	if session.StartedAt.IsZero() {
+	// The session's time bounds are the extrema of its turn timestamps, kept as
+	// a running min and max over the walk the parser already does.
+	//
+	// Not the first and last turns in file order, which is what they used to
+	// be. #29 measured the clock skew that makes those different things: on the
+	// author's archive 6,597 adjacent turn pairs carry a timestamp earlier than
+	// the turn written before them, so a session's ended_at could precede a
+	// turn belonging to it (12 sessions did) and its started_at could follow
+	// one (15 did). db.MergeFrom decides which copy of a duplicated session
+	// wins by comparing ended_at, so a skewed final turn kept the wrong copy;
+	// stats and orient report date ranges from the pair; and a duration
+	// computed from them could come out negative.
+	//
+	// This is not an argument against #29's ordering decision and does not
+	// touch it. File order reproduced the source .jsonl sequence 1,412 times
+	// out of 1,413 where timestamp-first ordering managed 1,336, so file order
+	// is the correct sequence. MAX is the correct extremum. Different
+	// questions, and the skew affects them differently.
+	//
+	// IsZero is the "not set yet" sentinel for both, so the first turn seen
+	// establishes the pair regardless of where it sits in time.
+	if session.StartedAt.IsZero() || turn.Timestamp.Before(session.StartedAt) {
 		session.StartedAt = turn.Timestamp
+	}
+	if session.EndedAt.IsZero() || turn.Timestamp.After(session.EndedAt) {
+		session.EndedAt = turn.Timestamp
 	}
 
 	// Accumulate tokens
