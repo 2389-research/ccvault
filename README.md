@@ -254,6 +254,29 @@ ccvault uses sensible defaults but can be configured via environment variables:
 |----------|---------|-------------|
 | `CCVAULT_CLAUDE_HOME` | `~/.claude` | Claude Code data directory |
 | `CCVAULT_DATA_DIR` | `~/.ccvault` | ccvault data directory |
+| `GLAMOUR_STYLE` | `dark` | Markdown colour scheme the TUI renders conversations with |
+
+### Markdown colours in the TUI (`GLAMOUR_STYLE`)
+
+The TUI renders conversation Markdown with [glamour](https://github.com/charmbracelet/glamour),
+and **defaults to the dark colour scheme regardless of your terminal's actual
+background**. On a light-background terminal, set:
+
+```bash
+export GLAMOUR_STYLE=light
+```
+
+The value is glamour's own: a builtin style name (`dark`, `light`, `dracula`,
+`notty`, `ascii`, …) or a path to a style JSON file. ccvault reads the same
+variable glamour does, so a setting you already have for other glamour-based
+tools is picked up as-is. There is deliberately no `config.toml` equivalent.
+
+Why this isn't auto-detected: asking the terminal for its background colour
+means an OSC 11 query, and the library that answers it waits up to five seconds
+*per byte* of the reply. Over mosh or tmux the reply can simply never arrive —
+the archive owner saw 60+ seconds of blank screen before the dashboard drew its
+first frame. A wrong-but-instant colour scheme beats a correct one that hangs,
+so the query is gone and the style comes from this variable instead.
 
 ### Pointing ccvault at another archive
 

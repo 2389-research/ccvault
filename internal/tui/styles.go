@@ -62,6 +62,10 @@ var (
 			Bold(true).
 			Foreground(secondaryColor)
 
+	helpNoteStyle = lipgloss.NewStyle().
+			Italic(true).
+			Foreground(mutedColor)
+
 	// Box styles
 	boxStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
