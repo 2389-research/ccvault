@@ -20,11 +20,25 @@ repos:
   - repo: https://github.com/dnephin/pre-commit-golang
     rev: v0.5.1
     hooks:
+      # gofmt reformats doc comments as well as code, and that includes the
+      # legacy godoc typographic convention: inside a comment attached to a
+      # declaration, `` becomes a left double quote and '' becomes a right
+      # double quote. It is upstream Go behaviour with no flag to disable it,
+      # so -d is here to make it visible — the hook prints the diff it wrote
+      # back instead of only naming the file. Free-floating comments and
+      # single quotes such as '%' are untouched; only the paired forms are
+      # rewritten, and a doc comment that needs them should put them in a
+      # backquoted code span.
       - id: go-fmt
+        args: ['-d']
       - id: go-imports
       - id: go-mod-tidy
+      # --allow-parallel-runners: golangci-lint takes an exclusive lock by
+      # default and fails with "parallel golangci-lint is running" rather
+      # than waiting, so two concurrent commits in this repo turn one commit
+      # into a spurious hook failure.
       - id: golangci-lint
-        args: ['--timeout=10m', '--fix']
+        args: ['--timeout=10m', '--fix', '--allow-parallel-runners']
       - id: go-unit-tests
         args: ['-race', '-count=1', './...']  # -count=1 disables test caching
 
