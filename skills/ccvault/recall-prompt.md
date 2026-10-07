@@ -36,7 +36,7 @@ For each promising hit (judge by snippet relevance):
 ```
 get_session_summary session_id:<hit_session_id>
 ```
-Verify the session actually covers the topic. Check `first_user_msg` and `tools_used` to rule out false positives before spending context on full turns.
+Verify the session actually covers the topic. Check `first_user_msg` and `tools_used` to rule out false positives before spending context on full turns. One caveat on `tools_used`: when the response carries `unreadable_turns`, the tool counts are an undercount, so a tool missing from the list is not grounds to rule the session out — fall back to `first_user_msg` and the snippet.
 
 ### Step 4: Extract the Solution
 
