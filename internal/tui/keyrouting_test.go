@@ -1,4 +1,4 @@
-// ABOUTME: Tests for TUI key routing — printable runes belong to a focused text input.
+// ABOUTME: Tests for TUI key routing — printable runes, editing keys, and the help overlay.
 // ABOUTME: Also pins every view's footer help text to the bindings that view actually honours.
 
 package tui
@@ -86,6 +86,194 @@ func TestSearchViewEscStillPops(t *testing.T) {
 	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	if m.view != DashboardView {
 		t.Fatalf("esc in the search view should pop to DashboardView, got %v", m.view)
+	}
+}
+
+// TestSearchInputOwnsCursorAndEditingKeys covers the second half of issue #59:
+// home, end, ctrl+u and ctrl+d were claimed by the results-list switch and
+// never forwarded to the query box, so editing a long query was impossible.
+func TestSearchInputOwnsCursorAndEditingKeys(t *testing.T) {
+	database := openTUITestDB(t)
+	m := New(database, t.TempDir(), nil)
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m.pushView(SearchView, nil)
+	typeText(m, "sqlite")
+
+	if got := m.search.input.Position(); got != 6 {
+		t.Fatalf("setup: cursor at %d after typing 6 runes, want 6", got)
+	}
+
+	m.Update(tea.KeyMsg{Type: tea.KeyHome})
+	if got := m.search.input.Position(); got != 0 {
+		t.Errorf("home left the cursor at %d, want 0", got)
+	}
+
+	m.Update(tea.KeyMsg{Type: tea.KeyEnd})
+	if got := m.search.input.Position(); got != 6 {
+		t.Errorf("end left the cursor at %d, want 6", got)
+	}
+
+	// ctrl+d deletes forward, so park the cursor where there is something
+	// ahead of it.
+	m.Update(tea.KeyMsg{Type: tea.KeyHome})
+	m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+	if got := m.search.input.Value(); got != "qlite" {
+		t.Errorf("ctrl+d gave %q, want %q", got, "qlite")
+	}
+
+	m.Update(tea.KeyMsg{Type: tea.KeyCtrlE})
+	m.Update(tea.KeyMsg{Type: tea.KeyCtrlU})
+	if got := m.search.input.Value(); got != "" {
+		t.Errorf("ctrl+u gave %q, want the line cleared", got)
+	}
+
+	if m.view != SearchView {
+		t.Errorf("editing keys navigated away: view is %v, want SearchView", m.view)
+	}
+}
+
+// TestSearchEscLeavesTheViewFromEitherFocus records the #59 decision on the
+// unreachable esc-refocus branch: esc keeps the same meaning it has in every
+// other view — back out — and the way back to the query box is "/", which the
+// results footer advertises.
+func TestSearchEscLeavesTheViewFromEitherFocus(t *testing.T) {
+	database := openTUITestDB(t)
+
+	for _, focusResults := range []bool{false, true} {
+		m := New(database, t.TempDir(), nil)
+		m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+		m.pushView(SearchView, nil)
+
+		if focusResults {
+			m.search.Update(searchResultsMsg{results: []search.Result{
+				{Turn: models.Turn{ID: "t1"}},
+			}})
+			if m.search.InputFocused() {
+				t.Fatal("setup: results should hold focus after a search returns rows")
+			}
+		}
+
+		m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		if m.view != DashboardView {
+			t.Errorf("esc with focusResults=%v should pop to DashboardView, got %v",
+				focusResults, m.view)
+		}
+	}
+}
+
+// TestSearchSlashReturnsFocusToQueryBox pins the documented way back from the
+// results list to the query box (#59).
+func TestSearchSlashReturnsFocusToQueryBox(t *testing.T) {
+	database := openTUITestDB(t)
+	m := New(database, t.TempDir(), nil)
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m.pushView(SearchView, nil)
+	m.search.Update(searchResultsMsg{results: []search.Result{
+		{Turn: models.Turn{ID: "t1"}},
+	}})
+	if m.search.InputFocused() {
+		t.Fatal("setup: results should hold focus after a search returns rows")
+	}
+
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	if m.view != SearchView {
+		t.Fatalf("/ in the search view navigated away: now %v", m.view)
+	}
+	if !m.search.InputFocused() {
+		t.Error("/ with results focused should return focus to the query box")
+	}
+	if got := m.search.input.Value(); got != "" {
+		t.Errorf("/ was inserted as text: input value %q", got)
+	}
+}
+
+// TestHelpOverlayOpensClosesAndIsModal covers issue #60: "?" was declared in
+// the key map and handled by no Update at all.
+func TestHelpOverlayOpensClosesAndIsModal(t *testing.T) {
+	database := openTUITestDB(t)
+	m := New(database, t.TempDir(), nil)
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 40})
+	m.dashboard.Update(m.dashboard.loadStats())
+
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
+	if !m.showHelp {
+		t.Fatal("? did not open the help overlay")
+	}
+	overlay := stripANSI(m.View())
+	for _, want := range []string{"Keyboard help", "ctrl+c", "?"} {
+		if !strings.Contains(overlay, want) {
+			t.Errorf("help overlay is missing %q:\n%s", want, overlay)
+		}
+	}
+
+	// The overlay is modal: the key that dismisses it must not also act on the
+	// view underneath. q on the dashboard would otherwise quit.
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	if m.showHelp {
+		t.Error("q did not close the help overlay")
+	}
+	if cmd != nil {
+		if _, ok := cmd().(tea.QuitMsg); ok {
+			t.Error("the key that closed the help overlay also quit")
+		}
+	}
+
+	// ctrl+c is the one exception: it quits even with help open.
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
+	_, cmd = m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	if cmd == nil {
+		t.Fatal("ctrl+c with help open returned no command")
+	}
+	if _, ok := cmd().(tea.QuitMsg); !ok {
+		t.Errorf("ctrl+c with help open should quit, got %T", cmd())
+	}
+}
+
+// TestHelpOverlayIsPerViewAndFitsEightyColumns checks that every view has an
+// overlay naming its own bindings, and that the overlay respects the same
+// 80-column budget the footers do — the reason #60 wanted an overlay at all.
+func TestHelpOverlayIsPerViewAndFitsEightyColumns(t *testing.T) {
+	cases := []struct {
+		view View
+		want []string
+	}{
+		{DashboardView, []string{"Dashboard", "r"}},
+		{ProjectsView, []string{"Projects", "r"}},
+		{SessionsView, []string{"Sessions", "r"}},
+		// x as an alias for e, and r, are the bindings #60 found undocumented.
+		{ConversationView, []string{"Conversation", "e or x", "a", "r"}},
+		{SearchView, []string{"Search", "shift+tab"}},
+		{AnalyticsView, []string{"Analytics", "1-4"}},
+		{SyncingView, []string{"Sync", "esc"}},
+	}
+
+	for _, tc := range cases {
+		overlay := stripANSI(helpView(tc.view))
+		for _, want := range tc.want {
+			if !strings.Contains(overlay, want) {
+				t.Errorf("help overlay for view %v is missing %q:\n%s", tc.view, want, overlay)
+			}
+		}
+		if got := widestRowVisible(overlay); got > 80 {
+			t.Errorf("help overlay for view %v is %d cols, want <= 80:\n%s", tc.view, got, overlay)
+		}
+	}
+}
+
+// TestHelpKeyIsTextInTheSearchInput keeps the #60 binding from re-breaking the
+// #50 fix: "?" is a character while the query box has focus.
+func TestHelpKeyIsTextInTheSearchInput(t *testing.T) {
+	database := openTUITestDB(t)
+	m := New(database, t.TempDir(), nil)
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m.pushView(SearchView, nil)
+
+	typeText(m, "what?")
+	if m.showHelp {
+		t.Error("? opened the help overlay while the query box had focus")
+	}
+	if got := m.search.input.Value(); got != "what?" {
+		t.Errorf("search input value = %q, want %q", got, "what?")
 	}
 }
 
@@ -179,12 +367,15 @@ func TestFootersMatchActualBindings(t *testing.T) {
 		{"analytics", renderAnalytics, []string{"esc/q: back", "ctrl+c: quit"}, nil},
 		{"analytics error", renderAnalyticsError, []string{"esc/q: back", "ctrl+c: quit"}, nil},
 		{"syncing", renderSyncing, []string{"esc/q: back", "ctrl+c: quit"}, nil},
-		// The dashboard is the one view where q really does quit.
-		{"dashboard", renderDashboard, []string{"q: quit"}, []string{"esc/q: back"}},
+		// The dashboard is the one view where q really does quit. It is also
+		// the one footer with room to advertise the help overlay (#60).
+		{"dashboard", renderDashboard, []string{"q: quit", "?: help"}, []string{"esc/q: back"}},
 		// While the query input holds focus, q is a character — so the footer
 		// must not offer it as back.
 		{"search typing", renderSearchTyping, []string{"esc: back", "ctrl+c: quit"}, []string{"esc/q: back"}},
-		{"search results", renderSearchResults, []string{"esc/q: back", "ctrl+c: quit"}, nil},
+		// With results focused, "/" is the advertised way back to the query
+		// box — the undocumented gap issue #59 reported.
+		{"search results", renderSearchResults, []string{"/: query", "esc/q: back", "ctrl+c: quit"}, nil},
 	}
 
 	for _, tc := range cases {

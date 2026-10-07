@@ -51,6 +51,17 @@ var (
 			Foreground(mutedColor).
 			MarginTop(1)
 
+	// Help overlay styles. No padding or margins on either: the overlay lays
+	// its own columns out and measures them against an 80-column budget, so a
+	// style that silently adds columns would break the arithmetic.
+	helpSectionStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(primaryColor)
+
+	helpKeyStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(secondaryColor)
+
 	// Box styles
 	boxStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).

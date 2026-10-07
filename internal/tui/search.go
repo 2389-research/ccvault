@@ -50,6 +50,25 @@ func (m *SearchModel) InputFocused() bool {
 	return m.focused
 }
 
+// focusInput moves keyboard focus from the results list to the query box.
+func (m *SearchModel) focusInput() {
+	m.focused = true
+	m.input.Focus()
+}
+
+// updateInput hands a key to the query box.
+//
+// The switch in Update claims several key names for results navigation that
+// the input also wants — home, end, ctrl+u, ctrl+d — so those have to be
+// forwarded explicitly from the branch that claimed them. Without it,
+// cursor-to-start, cursor-to-end and line editing did nothing while typing
+// (#59).
+func (m *SearchModel) updateInput(msg tea.Msg) tea.Cmd {
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	return cmd
+}
+
 // Init initializes the search model
 func (m *SearchModel) Init() tea.Cmd {
 	m.input.Focus()
@@ -79,24 +98,17 @@ func (m *SearchModel) Update(msg tea.Msg) tea.Cmd {
 		// some of them — "/" refocuses the input, so it was untypable, and the
 		// vim keys g/G belong to results browsing only.
 		if m.focused && isTextRune(msg) {
-			var cmd tea.Cmd
-			m.input, cmd = m.input.Update(msg)
-			return cmd
+			return m.updateInput(msg)
 		}
 
 		switch msg.String() {
 		case "ctrl+c":
 			return nil // Let parent handle quit
 
-		case "esc":
-			if !m.focused && len(m.results) > 0 {
-				// Go back to input
-				m.focused = true
-				m.input.Focus()
-				return nil
-			}
-			// Let parent handle back navigation
-			return nil
+		// esc is deliberately absent: it means "back out of this view" here
+		// exactly as it does everywhere else in the app, and app.go pops the
+		// view before delegating. The way back from the results list to the
+		// query box is "/", which the results footer advertises (#59).
 
 		case "enter":
 			if m.focused {
@@ -136,27 +148,27 @@ func (m *SearchModel) Update(msg tea.Msg) tea.Cmd {
 					m.cursor--
 					m.ensureVisible()
 				} else {
-					// Go back to input
-					m.focused = true
-					m.input.Focus()
+					m.focusInput()
 				}
 			}
 
 		case "shift+tab":
 			if !m.focused {
-				m.focused = true
-				m.input.Focus()
+				m.focusInput()
 			}
 
 		case "/":
 			if !m.focused {
-				m.focused = true
-				m.input.Focus()
+				m.focusInput()
 				return nil
 			}
 
 		case "pgup", "ctrl+u":
-			if !m.focused && len(m.results) > 0 {
+			if m.focused {
+				// ctrl+u clears the query back to the cursor.
+				return m.updateInput(msg)
+			}
+			if len(m.results) > 0 {
 				m.cursor -= m.visibleRows()
 				if m.cursor < 0 {
 					m.cursor = 0
@@ -165,7 +177,11 @@ func (m *SearchModel) Update(msg tea.Msg) tea.Cmd {
 			}
 
 		case "pgdown", "ctrl+d":
-			if !m.focused && len(m.results) > 0 {
+			if m.focused {
+				// ctrl+d deletes the character under the cursor.
+				return m.updateInput(msg)
+			}
+			if len(m.results) > 0 {
 				m.cursor += m.visibleRows()
 				if m.cursor >= len(m.results) {
 					m.cursor = len(m.results) - 1
@@ -174,22 +190,28 @@ func (m *SearchModel) Update(msg tea.Msg) tea.Cmd {
 			}
 
 		case "home":
-			if !m.focused && len(m.results) > 0 {
+			if m.focused {
+				// Cursor to the start of the query.
+				return m.updateInput(msg)
+			}
+			if len(m.results) > 0 {
 				m.cursor = 0
 				m.offset = 0
 			}
 
 		case "end":
-			if !m.focused && len(m.results) > 0 {
+			if m.focused {
+				// Cursor to the end of the query.
+				return m.updateInput(msg)
+			}
+			if len(m.results) > 0 {
 				m.cursor = len(m.results) - 1
 				m.ensureVisible()
 			}
 
 		default:
 			if m.focused {
-				var cmd tea.Cmd
-				m.input, cmd = m.input.Update(msg)
-				return cmd
+				return m.updateInput(msg)
 			}
 			// vim-style navigation when not typing
 			switch msg.String() {
@@ -439,7 +461,10 @@ func (m *SearchModel) View() string {
 		// No "q: back" here: while the input has focus, q is a character.
 		b.WriteString(helpStyle.Render("enter: search │ tab/↓: results │ esc: back │ ctrl+c: quit"))
 	} else {
-		b.WriteString(helpStyle.Render("enter: open │ ↑/↓/pgup/pgdn: nav │ /: search │ esc/q: back │ ctrl+c: quit"))
+		// "/: query" is the way back to the query box. shift+tab and up-from-
+		// the-top-row do it too, but there is no room for them at 80 columns —
+		// the help overlay carries those.
+		b.WriteString(helpStyle.Render("enter: open │ ↑/↓/pgup/pgdn: nav │ /: query │ esc/q: back │ ctrl+c: quit"))
 	}
 
 	return b.String()

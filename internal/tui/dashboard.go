@@ -232,7 +232,9 @@ func (m *DashboardModel) View() string {
 	}
 
 	// Help
-	b.WriteString(helpStyle.Render("↑/↓: navigate • enter: select • /: search • r: refresh • q: quit"))
+	// The dashboard is the one footer with room left for "?: help", and it is
+	// where a new user lands — so this is where the overlay gets advertised.
+	b.WriteString(helpStyle.Render("↑/↓: navigate • enter: select • /: search • r: refresh • ?: help • q: quit"))
 
 	return b.String()
 }
