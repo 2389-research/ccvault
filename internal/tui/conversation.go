@@ -23,33 +23,74 @@ import (
 
 // ConversationModel holds conversation view state
 type ConversationModel struct {
-	db          *db.DB
-	width       int
-	height      int
-	sessionID   string
-	session     *models.Session
-	turns       []models.Turn
-	viewport    viewport.Model
-	loading     bool
-	ready       bool
+	db        *db.DB
+	width     int
+	height    int
+	sessionID string
+	session   *models.Session
+	turns     []models.Turn
+	viewport  viewport.Model
+	loading   bool
+	ready     bool
+	// mdRenderer is built on first use by markdownRenderer, not in the
+	// constructor — see the comment there. mdWrapWidth is the width it was
+	// built for, so a resize rebuilds it and nothing else does.
 	mdRenderer  *glamour.TermRenderer
+	mdWrapWidth int
 	statusMsg   string
 	statusClear time.Time
 }
 
 // NewConversationModel creates a new conversation model
 func NewConversationModel(database *db.DB) *ConversationModel {
-	// Create markdown renderer with dark style
-	renderer, _ := glamour.NewTermRenderer(
-		glamour.WithAutoStyle(),
-		glamour.WithWordWrap(80),
-	)
-
 	return &ConversationModel{
-		db:         database,
-		loading:    true,
-		mdRenderer: renderer,
+		db:      database,
+		loading: true,
 	}
+}
+
+// markdownWrapWidth is the column the markdown renderer wraps at, derived from
+// the terminal width with room for the view's indentation.
+func (m *ConversationModel) markdownWrapWidth() int {
+	wrapWidth := m.width - 4
+	if wrapWidth < 20 {
+		wrapWidth = 20 // Minimum reasonable wrap width
+	}
+	return wrapWidth
+}
+
+// markdownRenderer returns the renderer for the current wrap width, building
+// it on first use.
+//
+// Construction is deferred because it is the one thing the conversation view
+// does that touches terminal state, and it used to happen twice before the
+// dashboard drew its first frame: once in the constructor, once in the
+// SetSize that the startup WindowSizeMsg triggers. The dashboard needs no
+// markdown renderer to draw itself, so nothing should build one until the
+// conversation view is actually opened (#49). See markdownStyleName for what
+// that construction can cost.
+//
+// Deferring it moves the construction onto the Update path, which Bubble Tea
+// requires not to block — so the style must stay one that resolves without
+// asking the terminal anything. Do not reach for glamour.WithAutoStyle() here.
+func (m *ConversationModel) markdownRenderer() *glamour.TermRenderer {
+	wrapWidth := m.markdownWrapWidth()
+	if m.mdRenderer != nil && m.mdWrapWidth == wrapWidth {
+		return m.mdRenderer
+	}
+
+	renderer, err := glamour.NewTermRenderer(
+		markdownStyleOption(),
+		glamour.WithWordWrap(wrapWidth),
+	)
+	if err != nil {
+		// Keep whatever renderer we already had; renderMarkdown falls back to
+		// plain wrapped text when there is none.
+		return m.mdRenderer
+	}
+	m.mdRenderer = renderer
+	m.mdWrapWidth = wrapWidth
+	return renderer
 }
 
 // SetSession sets the session to display
@@ -271,19 +312,10 @@ func (m *ConversationModel) SetSize(width, height int) {
 	m.width = width
 	m.height = height
 
-	// Update markdown renderer with new width
-	wrapWidth := width - 4
-	if wrapWidth < 20 {
-		wrapWidth = 20 // Minimum reasonable wrap width
-	}
-	renderer, err := glamour.NewTermRenderer(
-		glamour.WithAutoStyle(),
-		glamour.WithWordWrap(wrapWidth),
-	)
-	if err == nil {
-		m.mdRenderer = renderer
-	}
-
+	// The renderer is not rebuilt here. markdownRenderer notices that the wrap
+	// width moved and rebuilds on the next render — which keeps renderer
+	// construction off the startup path, where the first WindowSizeMsg lands
+	// before the dashboard's first frame (#49).
 	if m.ready {
 		m.initViewport()
 	}
@@ -617,12 +649,17 @@ func (m *ConversationModel) renderToolResult(t models.Turn) string {
 
 // renderMarkdown renders markdown text with glamour
 func (m *ConversationModel) renderMarkdown(text string) string {
-	if m.mdRenderer == nil || text == "" {
+	if text == "" {
+		return wrapText(text, m.width-4)
+	}
+
+	renderer := m.markdownRenderer()
+	if renderer == nil {
 		return wrapText(text, m.width-4)
 	}
 
 	// Render markdown
-	rendered, err := m.mdRenderer.Render(text)
+	rendered, err := renderer.Render(text)
 	if err != nil {
 		return wrapText(text, m.width-4)
 	}

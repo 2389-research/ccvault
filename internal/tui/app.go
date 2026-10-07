@@ -131,6 +131,7 @@ type Model struct {
 	width    int
 	height   int
 	err      error
+	showHelp bool
 
 	// View-specific state
 	dashboard    *DashboardModel
@@ -244,6 +245,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 
+		// The help overlay is modal: it swallows whatever key dismisses it, so
+		// closing it can't also act on the view underneath.
+		if m.showHelp {
+			m.showHelp = false
+			return m, nil
+		}
+
 		// If syncing is done and has error, any key continues
 		if m.view == SyncingView && m.syncing.IsDone() {
 			m.dashboard = NewDashboardModel(m.db)
@@ -264,6 +272,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Global key handling
 		switch {
+		case key.Matches(msg, keys.Help):
+			// Reached only when no text input claimed the rune above, so "?"
+			// stays typeable in the search box.
+			m.showHelp = true
+			return m, nil
+
 		case key.Matches(msg, keys.Quit):
 			if m.view == DashboardView {
 				return m, tea.Quit
@@ -335,6 +349,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m *Model) View() string {
 	if m.err != nil {
 		return errorStyle.Render(fmt.Sprintf("Error: %v\n\nPress q to quit.", m.err))
+	}
+
+	if m.showHelp {
+		return helpView(m.view)
 	}
 
 	switch m.view {
