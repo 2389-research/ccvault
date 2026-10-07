@@ -366,6 +366,56 @@ func TestCLI_ConfigFlagReadsNamedFile(t *testing.T) {
 	}
 }
 
+// TestCLI_ErrorsPrintOnce pins error output to one emission per failure.
+// Cobra's handler prints the error ahead of the usage block; a second print
+// anywhere else doubles the message on every failing command, which is easy
+// to reintroduce and invisible to every other test here.
+func TestCLI_ErrorsPrintOnce(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds the binary")
+	}
+	f := newCLIFixture(t)
+
+	// Each case fails on a different path: a RunE return, flag parsing, and
+	// command lookup. Cobra reports all three, and all three used to double.
+	cases := []struct {
+		name string
+		args []string
+		// needle appears exactly once per emission of the error.
+		needle string
+	}{
+		{
+			name:   "command error",
+			args:   []string{"--config", filepath.Join(f.Home, "absent.toml"), "stats"},
+			needle: "load config: read config",
+		},
+		{
+			name:   "unknown flag",
+			args:   []string{"stats", "--bogus-flag"},
+			needle: "unknown flag: --bogus-flag",
+		},
+		{
+			name:   "unknown command",
+			args:   []string{"nosuchcommand"},
+			needle: `unknown command "nosuchcommand"`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := f.TryRun(t, tc.args...)
+			if r.Err == nil {
+				t.Fatalf("expected a non-zero exit\nstdout:\n%s\nstderr:\n%s", r.Stdout, r.Stderr)
+			}
+			if got := strings.Count(r.Stderr, tc.needle); got != 1 {
+				t.Errorf("stderr names %q %d times, want exactly 1:\n%s", tc.needle, got, r.Stderr)
+			}
+			if strings.Contains(r.Stdout, tc.needle) {
+				t.Errorf("errors belong on stderr, but stdout carries %q:\n%s", tc.needle, r.Stdout)
+			}
+		})
+	}
+}
+
 // TestCLI_MissingConfigFileIsAnError keeps a typo'd --config from silently
 // falling back to defaults.
 func TestCLI_MissingConfigFileIsAnError(t *testing.T) {

@@ -1608,8 +1608,11 @@ func init() {
 }
 
 func main() {
+	// Cobra owns error output: Execute has already written "Error: <err>"
+	// to stderr, ahead of the usage block where it stays readable. All main
+	// contributes is the exit status — printing err here too would emit
+	// every message twice.
 	if err := rootCmd.Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
