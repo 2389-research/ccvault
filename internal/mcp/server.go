@@ -87,6 +87,10 @@ type rpcError struct {
 	Data    interface{} `json:"data,omitempty"`
 }
 
+// internalErrorCode is JSON-RPC 2.0's reserved code for a server-side
+// failure the caller cannot correct.
+const internalErrorCode = -32603
+
 // MCP types
 type serverInfo struct {
 	Name    string `json:"name"`
@@ -291,8 +295,11 @@ func (s *Server) handleToolsList(req *jsonRPCRequest) {
 			},
 		},
 		{
-			Name:        "get_session_summary",
-			Description: "Get a quick overview of a session: metadata, stats, tools used, and first/last messages. Use this first before get_turns.",
+			Name: "get_session_summary",
+			Description: "Get a quick overview of a session: metadata, stats, tools used, and first/last " +
+				"messages. Use this first before get_turns. tools_used is counted from each assistant " +
+				"turn's raw_json; when some turns cannot be read the count is incomplete, and the " +
+				"response says so with unreadable_turns and a 'tools_used incomplete' warnings[] entry.",
 			InputSchema: inputSchema{
 				Type: "object",
 				Properties: map[string]property{
@@ -309,7 +316,10 @@ func (s *Server) handleToolsList(req *jsonRPCRequest) {
 			Description: "Get paginated turns from a session, in conversation order. Every turn reports its " +
 				"ordinal — its position in the session, counting from 0, stable across calls. To walk a " +
 				"session, pass the response's next_after_ordinal back as after_ordinal; offset also works " +
-				"but counts rows in the last response rather than naming a turn.",
+				"but counts rows in the last response rather than naming a turn. An assistant turn whose " +
+				"raw_json could not be read carries raw_unavailable: true and omits tools and " +
+				"has_thinking — absence of tools on such a turn is not evidence it called none. The page " +
+				"reports how many in unreadable_turns plus one warnings[] entry.",
 			InputSchema: inputSchema{
 				Type: "object",
 				Properties: map[string]property{
@@ -747,6 +757,46 @@ func (s *Server) lookupProjectPathAndName(projectID int64) (path, name, warning 
 	}
 }
 
+// readTurnEnrichment pulls the tool names and the thinking flag out of an
+// assistant turn's raw_json. ok is false when raw_json cannot be read at
+// all — absent, because db.GetTurns dropped bytes that were not valid
+// JSON, or present in a shape these fields do not live in. Callers must
+// branch on ok rather than on an empty tool list: no tools and no answer
+// are different facts, and conflating them is the defect this returns ok
+// to prevent.
+//
+// The parse stays tolerant of unknown keys because raw_json's shape
+// differs across the source adapters; only a shape that cannot yield
+// these fields at all counts as a failure.
+func readTurnEnrichment(rawJSON []byte) (tools []string, hasThinking, ok bool) {
+	if len(rawJSON) == 0 {
+		return nil, false, false
+	}
+
+	var raw struct {
+		Message struct {
+			Content []struct {
+				Type     string `json:"type"`
+				Name     string `json:"name,omitempty"`
+				Thinking string `json:"thinking,omitempty"`
+			} `json:"content"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(rawJSON, &raw); err != nil {
+		return nil, false, false
+	}
+
+	for _, c := range raw.Message.Content {
+		switch c.Type {
+		case "tool_use":
+			tools = append(tools, c.Name)
+		case "thinking":
+			hasThinking = true
+		}
+	}
+	return tools, hasThinking, true
+}
+
 func (s *Server) getSessionSummary(args map[string]interface{}) (interface{}, error) {
 	sessionID, _ := args["session_id"].(string)
 	if sessionID == "" {
@@ -775,24 +825,24 @@ func (s *Server) getSessionSummary(args map[string]interface{}) (interface{}, er
 	toolCounts := make(map[string]int)
 	var firstUserMsg, lastUserMsg string
 
+	// tools_used aggregates tool calls over every assistant turn, so a turn
+	// whose raw_json cannot be read silently undercounts it — and an empty
+	// tools_used otherwise reads as a session that called no tools. Count
+	// the turns that did not contribute so the response can say so.
+	unreadableTurns := 0
+
 	for _, t := range turns {
 		turnTypeCounts[t.Type]++
 
 		// Track tool usage from raw JSON
-		if t.Type == "assistant" && len(t.RawJSON) > 0 {
-			var raw struct {
-				Message struct {
-					Content []struct {
-						Type string `json:"type"`
-						Name string `json:"name,omitempty"`
-					} `json:"content"`
-				} `json:"message"`
+		if t.Type == "assistant" {
+			tools, _, ok := readTurnEnrichment(t.RawJSON)
+			if !ok {
+				unreadableTurns++
 			}
-			if json.Unmarshal(t.RawJSON, &raw) == nil {
-				for _, c := range raw.Message.Content {
-					if c.Type == "tool_use" && c.Name != "" {
-						toolCounts[c.Name]++
-					}
+			for _, name := range tools {
+				if name != "" {
+					toolCounts[name]++
 				}
 			}
 		}
@@ -890,8 +940,25 @@ func (s *Server) getSessionSummary(args map[string]interface{}) (interface{}, er
 		result["last_entry_uuid"] = cursor.LastEntryUUID
 	}
 
+	// Both notices share the one top-level warnings array every other
+	// degraded response uses, so a caller has one field to check.
+	var warnings []string
 	if projectWarning != "" {
-		result["warnings"] = []string{projectWarning}
+		warnings = append(warnings, projectWarning)
+	}
+	// This warning names a field that is present but incomplete, not
+	// absent: dropping tools_used outright would cost a caller every tool
+	// the readable turns did report, which on a half-corrupt session is
+	// most of them.
+	if unreadableTurns > 0 {
+		result["unreadable_turns"] = unreadableTurns
+		warnings = append(warnings, fmt.Sprintf(
+			"tools_used incomplete: %d of %d assistant turns have unreadable raw_json, "+
+				"so the tools they called are not counted",
+			unreadableTurns, turnTypeCounts["assistant"]))
+	}
+	if len(warnings) > 0 {
+		result["warnings"] = warnings
 	}
 	return result, nil
 }
@@ -975,6 +1042,7 @@ func (s *Server) getTurns(args map[string]interface{}) (interface{}, error) {
 
 	// Transform to compact representation
 	compactTurns := make([]map[string]interface{}, 0, len(turns))
+	unreadableTurns := 0
 	for _, t := range turns {
 		content := t.Content
 		// Truncate long content
@@ -994,32 +1062,29 @@ func (s *Server) getTurns(args map[string]interface{}) (interface{}, error) {
 			"content":   content,
 		}
 
-		// Extract tool info for assistant turns
-		if t.Type == "assistant" && len(t.RawJSON) > 0 {
-			var raw struct {
-				Message struct {
-					Content []struct {
-						Type     string `json:"type"`
-						Name     string `json:"name,omitempty"`
-						Thinking string `json:"thinking,omitempty"`
-					} `json:"content"`
-				} `json:"message"`
-			}
-			if json.Unmarshal(t.RawJSON, &raw) == nil {
-				var tools []string
-				hasThinking := false
-				for _, c := range raw.Message.Content {
-					if c.Type == "tool_use" {
-						tools = append(tools, c.Name)
-					}
-					if c.Type == "thinking" {
-						hasThinking = true
-					}
-				}
+		// tools and has_thinking are read out of the turn's raw_json. When
+		// that cannot be read the fields are omitted, and the turn says so
+		// — otherwise a turn we could not read is indistinguishable from a
+		// turn that used no tools, and a caller has no way to know which
+		// of its results to distrust.
+		//
+		// Both failure routes are real. Measured over the 46k-session
+		// archive (493,908 assistant turns): 52,851 reach here with no
+		// raw_json at all, because db.GetTurns drops bytes that are not
+		// valid JSON, and those rows are the mid-document fragments left
+		// by claude-code syncs predating the oversized-line fix. Zero
+		// turns had valid raw_json in a shape this struct would not fit,
+		// so that route is guarded rather than observed.
+		if t.Type == "assistant" {
+			tools, hasThinking, ok := readTurnEnrichment(t.RawJSON)
+			if ok {
 				if len(tools) > 0 {
 					turn["tools"] = tools
 				}
 				turn["has_thinking"] = hasThinking
+			} else {
+				turn["raw_unavailable"] = true
+				unreadableTurns++
 			}
 		}
 
@@ -1033,6 +1098,19 @@ func (s *Server) getTurns(args map[string]interface{}) (interface{}, error) {
 		"limit":       limit,
 		"count":       len(compactTurns),
 		"turns":       compactTurns,
+	}
+
+	// One count and one warning for the page, rather than one warning per
+	// affected turn: at the measured rate a 50-turn page of a claude-code
+	// session can carry 25 of them, and 25 copies of the same sentence
+	// would bury the warnings a caller actually needs to read. Which turns
+	// are affected is on the turns themselves, as raw_unavailable.
+	if unreadableTurns > 0 {
+		response["unreadable_turns"] = unreadableTurns
+		response["warnings"] = []string{fmt.Sprintf(
+			"turn enrichment unavailable: %d of %d returned turns have unreadable raw_json, "+
+				"so tools and has_thinking are omitted for them; those turns carry raw_unavailable: true",
+			unreadableTurns, len(compactTurns))}
 	}
 
 	// next_after_ordinal is the resume point for the page just returned, and
@@ -1735,7 +1813,7 @@ func (s *Server) sendResult(id interface{}, result interface{}) {
 		ID:      id,
 		Result:  result,
 	}
-	s.send(resp)
+	s.send(id, resp)
 }
 
 func (s *Server) sendError(id interface{}, code int, message string, data interface{}) {
@@ -1748,15 +1826,70 @@ func (s *Server) sendError(id interface{}, code int, message string, data interf
 			Data:    data,
 		},
 	}
-	s.send(resp)
+	s.send(id, resp)
 }
 
-func (s *Server) send(v interface{}) {
+// send writes one JSON-RPC response to the transport.
+//
+// id is passed alongside the assembled response because a response that
+// will not marshal still has to be answered. The client is holding an
+// outstanding request id; dropping the write leaves it waiting for a
+// reply that never comes, which blocks the conversation until the client
+// times out — if it has a timeout at all. So a marshal failure answers
+// that id with a protocol error instead of silence.
+//
+// Notifications never reach here: handleRequest returns without sending
+// for every notifications/* method and for an unknown method with no id,
+// per JSON-RPC 2.0. Nothing is waiting on a notification, so there is
+// nothing to answer. The one response that legitimately carries a nil id
+// is the parse error, where the request's id could not be read.
+//
+// tools/call already catches an unserializable tool payload one layer up
+// — handleToolsCall marshals the payload into text itself and turns a
+// failure there into an isError result — so no tool response reaches this
+// fallback today. That is one handler's accident, not a protocol
+// guarantee: initialize, tools/list, prompts/* and ping all hand their
+// results straight here, and a future field of theirs could fail. The
+// guarantee belongs at the one place every response passes through.
+func (s *Server) send(id interface{}, v interface{}) {
 	data, err := json.Marshal(v)
 	if err != nil {
 		s.log("Marshal error: %v", err)
-		return
+		data = marshalFailureResponse(id)
 	}
 	s.log("Sending: %s", string(data))
 	_, _ = fmt.Fprintln(s.out, string(data))
+}
+
+// marshalFailureResponse builds the reply sent in place of a response that
+// would not marshal. It carries a fixed code and message and none of the
+// caller's payload, so it cannot fail for the reason the response it
+// replaces did — echoing the payload back would reproduce the failure and
+// hang the client anyway.
+//
+// If even the id will not marshal, the id is dropped rather than the
+// reply: a reply with a null id is still something the client can react
+// to, while silence is not. What remains is literals, which marshal.
+func marshalFailureResponse(id interface{}) []byte {
+	resp := jsonRPCResponse{
+		JSONRPC: "2.0",
+		ID:      id,
+		Error: &rpcError{
+			Code:    internalErrorCode,
+			Message: "Internal error",
+			Data:    "the response could not be serialized",
+		},
+	}
+	if data, err := json.Marshal(resp); err == nil {
+		return data
+	}
+
+	resp.ID = nil
+	data, err := json.Marshal(resp)
+	if err != nil {
+		// Unreachable: resp now holds only a string, an int and nil.
+		return []byte(`{"jsonrpc":"2.0","id":null,` +
+			`"error":{"code":-32603,"message":"Internal error"}}`)
+	}
+	return data
 }
