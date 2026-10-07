@@ -344,6 +344,63 @@ func TestMigration011NumbersSurvivingCallsWithinTheirTurn(t *testing.T) {
 	}
 }
 
+// TestMigration011NumbersTheWayTheWritePathDoes is the invariant the whole
+// design rests on: the positions the migration assigns have to be the positions
+// the write path would assign for the same transcript. If they disagree by even
+// one, the next sync's delete-then-insert misses the rows already there and the
+// turn ends up with both sets — which is #82 again.
+//
+// Proved by re-writing the surviving calls through InsertToolUses in transcript
+// order and asserting the table does not grow. Verified end to end as well:
+// `sync --full` over the fork-shaped fixture hands the writer four tool uses,
+// two from each transcript holding the shared turn, and the table stays at two
+// rows at ordinals 0 and 1.
+func TestMigration011NumbersTheWayTheWritePathDoes(t *testing.T) {
+	dir := seedPre011(t, integrityFixture())
+
+	database, err := Open(dir)
+	if err != nil {
+		t.Fatalf("open after migration: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+
+	before := readToolUses(t, database)
+
+	// The calls the transcripts record, in the order a parser reads them —
+	// which is what sync hands to InsertToolUses.
+	ts := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
+	reparsed := []models.ToolUse{
+		{TurnID: "turn-dup2", SessionID: "sess-new", ToolName: "Bash", Timestamp: ts,
+			ToolUseID: "toolu_dup2", InputJSON: `{"n":0}`},
+		{TurnID: "turn-dup4", SessionID: "sess-new", ToolName: "Grep", Timestamp: ts,
+			ToolUseID: "toolu_dup4", InputJSON: `{"n":0}`},
+		{TurnID: "turn-parallel", SessionID: "sess-new", ToolName: "Read", Timestamp: ts,
+			ToolUseID: "toolu_p1", InputJSON: `{"n":0}`},
+		{TurnID: "turn-parallel", SessionID: "sess-new", ToolName: "Read", Timestamp: ts,
+			ToolUseID: "toolu_p2", InputJSON: `{"n":1}`},
+		{TurnID: "turn-parallel", SessionID: "sess-new", ToolName: "Read", Timestamp: ts,
+			ToolUseID: "toolu_p3", InputJSON: `{"n":2}`},
+	}
+	if err := database.InsertToolUses(reparsed); err != nil {
+		t.Fatalf("re-write the migrated calls: %v", err)
+	}
+
+	after := readToolUses(t, database)
+	if len(after) != len(before) {
+		t.Fatalf("re-writing the same calls took tool_uses from %d rows to %d; the migration and "+
+			"the write path do not agree on where a call belongs", len(before), len(after))
+	}
+	for i := range after {
+		if after[i].turnID != before[i].turnID || after[i].ordinal != before[i].ordinal ||
+			after[i].toolUseID != before[i].toolUseID {
+			t.Errorf("row %d moved: %s@%d %q -> %s@%d %q", i,
+				before[i].turnID, before[i].ordinal, before[i].toolUseID.String,
+				after[i].turnID, after[i].ordinal, after[i].toolUseID.String)
+		}
+	}
+	assertFTSSound(t, database, "after re-writing the migrated calls")
+}
+
 // TestMigration011Replays guards the migrator's replay path: anything that
 // rewinds schema_version re-runs 011, and a second pass must not delete a row
 // or renumber one.
