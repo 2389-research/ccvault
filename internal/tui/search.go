@@ -102,8 +102,10 @@ func (m *SearchModel) Update(msg tea.Msg) tea.Cmd {
 		}
 
 		switch msg.String() {
-		case "ctrl+c":
-			return nil // Let parent handle quit
+		// ctrl+c is deliberately absent, for the same reason as esc: app.go
+		// matches keys.ForceQuit ahead of everything else and quits there, so a
+		// branch here could only ever be dead (#102). Nothing in this view may
+		// claim a key the parent already owns.
 
 		// esc is deliberately absent: it means "back out of this view" here
 		// exactly as it does everywhere else in the app, and app.go pops the

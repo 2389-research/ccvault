@@ -241,14 +241,17 @@ func TestHelpOverlayIsPerViewAndFitsEightyColumns(t *testing.T) {
 		{ProjectsView, []string{"Projects", "r"}},
 		{SessionsView, []string{"Sessions", "r"}},
 		// x as an alias for e, and r, are the bindings #60 found undocumented.
-		{ConversationView, []string{"Conversation", "e or x", "a", "r"}},
+		// GLAMOUR_STYLE is not a binding at all, but the conversation view is
+		// where its effect shows and the overlay is the only place in the app
+		// that mentions it (#102).
+		{ConversationView, []string{"Conversation", "e or x", "a", "r", "GLAMOUR_STYLE"}},
 		{SearchView, []string{"Search", "shift+tab"}},
 		{AnalyticsView, []string{"Analytics", "1-4"}},
 		{SyncingView, []string{"Sync", "esc"}},
 	}
 
 	for _, tc := range cases {
-		overlay := stripANSI(helpView(tc.view))
+		overlay := stripANSI(helpView(tc.view, 80))
 		for _, want := range tc.want {
 			if !strings.Contains(overlay, want) {
 				t.Errorf("help overlay for view %v is missing %q:\n%s", tc.view, want, overlay)
@@ -256,6 +259,51 @@ func TestHelpOverlayIsPerViewAndFitsEightyColumns(t *testing.T) {
 		}
 		if got := widestRowVisible(overlay); got > 80 {
 			t.Errorf("help overlay for view %v is %d cols, want <= 80:\n%s", tc.view, got, overlay)
+		}
+	}
+}
+
+// TestHelpOverlayFitsNarrowTerminals covers item 2 of issue #102. The overlay's
+// two-column table is 64 cells at its widest, so on anything narrower the rows
+// wrapped — and the overlay is denser than a footer, so it wrapped worse.
+func TestHelpOverlayFitsNarrowTerminals(t *testing.T) {
+	views := []View{
+		DashboardView, ProjectsView, SessionsView,
+		ConversationView, SearchView, AnalyticsView, SyncingView,
+	}
+	widths := []int{20, 24, 30, 40, 50, 60, 63, 64, 70, 80, 120}
+
+	for _, view := range views {
+		for _, width := range widths {
+			overlay := stripANSI(helpView(view, width))
+			if got := widestRowVisible(overlay); got > width {
+				t.Errorf("help overlay for view %v at %d cols is %d cols wide:\n%s",
+					view, width, got, overlay)
+			}
+			// Narrowing may re-flow the text but must not drop it: every
+			// binding still has to name its key and explain itself.
+			for _, s := range []helpSection{globalHelp, viewHelp[view]} {
+				for _, bd := range s.bindings {
+					if !strings.Contains(overlay, bd.keys) {
+						t.Errorf("overlay for %v at %d cols lost the keys %q:\n%s",
+							view, width, bd.keys, overlay)
+					}
+					for _, word := range strings.Fields(bd.what) {
+						if !strings.Contains(overlay, word) {
+							t.Errorf("overlay for %v at %d cols lost %q from %q:\n%s",
+								view, width, word, bd.what, overlay)
+						}
+					}
+				}
+				for _, note := range s.notes {
+					for _, word := range strings.Fields(note) {
+						if !strings.Contains(overlay, word) {
+							t.Errorf("overlay for %v at %d cols lost %q from a note:\n%s",
+								view, width, word, overlay)
+						}
+					}
+				}
+			}
 		}
 	}
 }

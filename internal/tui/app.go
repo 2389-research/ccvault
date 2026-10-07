@@ -220,6 +220,18 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// No sync needed, proceed to dashboard
 		return m, m.dashboard.Init()
 
+	case syncTickMsg:
+		// The tick belongs to the sync's lifecycle, not to whichever view holds
+		// the screen: it is the only thing that drains the progress channels,
+		// and nothing but its own handler schedules the next one. Delegating it
+		// by view killed the chain the moment "/" pushed the search view on top
+		// of a running sync — SearchModel has no case for it — after which
+		// progress stopped, doneCh was never drained, and the goroutine blocked
+		// forever on a full channel still holding the SQLite writer (#99).
+		// syncCompleteMsg has always been handled here; this is the same
+		// reasoning applied to the message that leads up to it.
+		return m, m.syncing.Update(msg)
+
 	case syncCompleteMsg:
 		// Sync is done, transition to dashboard
 		m.syncing.Update(msg)
@@ -231,6 +243,21 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case syncDoneTransitionMsg:
 		// Refresh dashboard with new data
 		m.dashboard = NewDashboardModel(m.db)
+
+		// Now that the tick survives a view change (#99), a sync can finish
+		// while the user is somewhere else — typing a query, say. Yanking them
+		// to the dashboard would throw that work away, so only the syncing view
+		// itself gets moved on. Either way the finished syncing view stops being
+		// what "back" returns to: it is the stack's root while a sync runs, and
+		// the dashboard takes its place.
+		for i, v := range m.viewStack {
+			if v == SyncingView {
+				m.viewStack[i] = DashboardView
+			}
+		}
+		if m.view != SyncingView {
+			return m, m.dashboard.Init()
+		}
 		m.view = DashboardView
 		m.viewStack = []View{DashboardView}
 		return m, m.dashboard.Init()
@@ -352,7 +379,7 @@ func (m *Model) View() string {
 	}
 
 	if m.showHelp {
-		return helpView(m.view)
+		return helpView(m.view, m.width)
 	}
 
 	switch m.view {

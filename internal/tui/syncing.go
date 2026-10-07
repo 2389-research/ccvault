@@ -76,11 +76,6 @@ func NewSyncingModel(database *db.DB, sources []config.SourceConfig) *SyncingMod
 	}
 }
 
-// syncProgressMsg is sent when sync progress updates
-type syncProgressMsg struct {
-	message string
-}
-
 // syncCompleteMsg is sent when sync completes
 type syncCompleteMsg struct {
 	stats *sync.Stats
@@ -201,12 +196,14 @@ func (m *SyncingModel) Update(msg tea.Msg) tea.Cmd {
 		default:
 		}
 
-		// Keep ticking while sync is running
+		// Keep ticking while the sync is running. The chain no longer dies when
+		// the user leaves the view (#99), so cancellation is what has to end it:
+		// a cancelled sync has nothing left to drain, and a tick every 200ms for
+		// the rest of the session would be the only thing still asking.
+		if m.ctx.Err() != nil {
+			return nil
+		}
 		return m.tick()
-
-	case syncProgressMsg:
-		m.progress = append(m.progress, msg.message)
-		return nil
 
 	case syncCompleteMsg:
 		m.done = true
