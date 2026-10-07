@@ -36,8 +36,11 @@ type Stats struct {
 	// rather than appended to, so the session's history was replaced with a
 	// different one rather than extended.
 	SessionsRewrittenUpstream int
-	Errors                    []error
-	Duration                  time.Duration
+	// SearchIndexRebuilt records that this run re-derived turns_fts from the
+	// turns table. True after any run that re-parsed every file.
+	SearchIndexRebuilt bool
+	Errors             []error
+	Duration           time.Duration
 }
 
 // Syncer handles syncing conversation data to ccvault
@@ -265,6 +268,7 @@ func (s *Syncer) Run(ctx context.Context) (*Stats, error) {
 	}
 
 	s.reconcileProjects(stats, projectsTouched)
+	s.rebuildSearchIndex(ctx, stats)
 
 	stats.ProjectsFound = len(projectsSeen)
 	stats.Duration = time.Since(start)
@@ -308,6 +312,48 @@ func (s *Syncer) reconcileProjects(stats *Stats, projectsTouched map[string]bool
 		stats.Errors = append(stats.Errors, fmt.Errorf("reconcile project aggregates: %w", err))
 		s.progress("Warning: could not reconcile project counts: %v", err)
 	}
+}
+
+// rebuildSearchIndex re-derives turns_fts from the turns table at the end of a
+// run that re-parsed everything.
+//
+// This exists because the write path cannot reach damage that was already
+// done. internal/db's deleteTurnConflictsSQL stops ccvault stranding index
+// entries, on a connection with recursive_triggers or without one, but an
+// archive that an older ccvault already shredded stays shredded until
+// something re-derives the index. Nothing else can: the triggers only fire on
+// changes to turns, and a stranded entry has no turns row left to change.
+//
+// Unconditional rather than gated on CheckFTSIntegrity, because the cheap
+// check cannot see the whole condition. It compares the %_docsize count
+// against the turns count, so it misses an entry whose rowid a later insert
+// has reused — which is the normal outcome of a re-parse, since every
+// re-parsed turn takes a fresh rowid from the end of the table. Measured on
+// the author's corpus with 2,000 stranded entries injected: a `--full` left
+// the docsize counts agreeing exactly while the index still answered for all
+// 2,000 and FTS5's strict integrity-check still called the file malformed.
+// FTS5's strict check does see it, but it costs 60% of a rebuild (0.6s against
+// 1.0s on 235,101 turns), so gating on it would cost more than it saves. The
+// rebuild runs in 18 seconds on the author's 1,014,942-turn archive, against
+// the two minutes the re-parse before it already takes.
+//
+// Only after a full re-parse: an incremental sync that touched four files has
+// no business spending a whole-index pass. Skipped on a cancelled run too —
+// the repair is not urgent, and the next complete --full will do it.
+func (s *Syncer) rebuildSearchIndex(ctx context.Context, stats *Stats) {
+	if !s.reparseAll() || ctx.Err() != nil {
+		return
+	}
+
+	s.progress("Rebuilding the search index from the turns just parsed...")
+	if err := s.db.RebuildTurnsFTSContext(ctx); err != nil {
+		// Non-fatal: the turns are committed and the index is no worse than it
+		// was. A stale entry costs recall, not data.
+		stats.Errors = append(stats.Errors, fmt.Errorf("rebuild search index: %w", err))
+		s.progress("Warning: could not rebuild the search index: %v", err)
+		return
+	}
+	stats.SearchIndexRebuilt = true
 }
 
 // processSession handles a single session file using the given adapter. ctx

@@ -149,12 +149,22 @@ CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(
 
 -- Triggers to keep FTS in sync.
 --
--- turns_ad depends on PRAGMA recursive_triggers being ON, which ccvault's
--- connection DSN sets and verifyConnectionPragmas asserts. Turns are written
--- with INSERT OR REPLACE, and SQLite fires a REPLACE's implicit DELETE
--- through an AFTER DELETE trigger only when recursive triggers are enabled.
--- With the default setting a replaced turn indexes its new content and leaves
--- the old entry in turns_fts, matching text no turns row holds any more.
+-- turns_ad fires on a DELETE statement under SQLite's own rules, with no
+-- pragma involved, and that is what the index's correctness rests on.
+--
+-- It did not always. Turns used to be written with INSERT OR REPLACE, and
+-- SQLite routes a REPLACE's *implicit* delete through an AFTER DELETE trigger
+-- only when PRAGMA recursive_triggers is on — off by default. So a replaced
+-- turn indexed its new content and left the old entry in turns_fts, matching
+-- text no turns row holds any more, unless the connection had opted in. #42
+-- set the pragma in ccvault's DSN; #93 established that this was not enough,
+-- because the file cannot require the setting of anything else that opens it,
+-- and a ccvault built before #42 was still first on the author's PATH. One
+-- `sync --full` through that binary left 19,023 orphaned documents.
+-- internal/db's deleteTurnConflictsSQL is the fix: an explicit DELETE of the
+-- rows a turn is about to replace, then a plain INSERT. tool_uses was always
+-- written that way, which is why tool_uses_fts came through the same sync
+-- clean.
 CREATE TRIGGER IF NOT EXISTS turns_ai AFTER INSERT ON turns BEGIN
     INSERT INTO turns_fts(rowid, content, search_period)
     VALUES (new.rowid, new.content, new.search_period);
@@ -195,11 +205,16 @@ CREATE VIRTUAL TABLE IF NOT EXISTS tool_uses_fts USING fts5(
     content_rowid='id'
 );
 
--- Same recursive_triggers dependency as turns_ad. Triggers are scoped to
--- exactly the columns the index reads, counting timestamp for the one
--- search_period derives from: an UPDATE that leaves them alone leaves the
--- index correct, and a wider scope is what cost migration 008's backfill
--- 377 MB of dead segments before it was narrowed.
+-- Triggers are scoped to exactly the columns the index reads, counting
+-- timestamp for the one search_period derives from: an UPDATE that leaves
+-- them alone leaves the index correct, and a wider scope is what cost
+-- migration 008's backfill 377 MB of dead segments before it was narrowed.
+--
+-- tool_uses never needed recursive_triggers, because it is written as an
+-- explicit DELETE followed by a plain INSERT rather than with INSERT OR
+-- REPLACE. That is the whole reason tool_uses_fts survived the `sync --full`
+-- of issue #93 that left 19,023 orphans in turns_fts, and the shape turns is
+-- now written in too.
 CREATE TRIGGER IF NOT EXISTS tool_uses_ai AFTER INSERT ON tool_uses BEGIN
     INSERT INTO tool_uses_fts(rowid, input_json, result_content, search_period)
     VALUES (new.id, new.input_json, new.result_content, new.search_period);

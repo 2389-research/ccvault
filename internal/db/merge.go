@@ -438,8 +438,29 @@ func mergeSessions(ctx context.Context, tx *sql.Tx, columns map[string][]string,
 		turnInsert += ", " + quoteIdent("ordinal")
 		turnSelect += ", ROW_NUMBER() OVER (PARTITION BY i.session_id ORDER BY i.rowid) - 1"
 	}
+
+	// A turn uuid is not unique to a session: a resumed transcript copies the
+	// earlier session's lines verbatim, so an incoming turn can collide with a
+	// row belonging to a session this merge never picked. The DELETE above
+	// cleared the picked sessions' turns and cannot reach those.
+	//
+	// Deleted here with a statement of our own rather than left to INSERT OR
+	// REPLACE, for the reason internal/db/turns.go's deleteTurnConflictsSQL
+	// sets out: a REPLACE's implicit delete reaches the turns_ad trigger only
+	// when PRAGMA recursive_triggers is on, so an index that depends on it is
+	// an index any writer without the pragma can shred. Position collisions
+	// need no handling — the only rows that could hold a picked session's
+	// position are that session's own, and they are already gone.
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM main.turns WHERE id IN (
+			SELECT i.id FROM incoming.turns i
+			JOIN temp.merge_pick k ON k.id = i.session_id
+		)`); err != nil {
+		return fmt.Errorf("clear turns the merge is about to replace: %w", err)
+	}
+
 	turnQuery := fmt.Sprintf(`
-		INSERT OR REPLACE INTO main.turns (%s)
+		INSERT INTO main.turns (%s)
 		SELECT %s FROM incoming.turns i
 		JOIN temp.merge_pick k ON k.id = i.session_id`,
 		turnInsert, turnSelect)

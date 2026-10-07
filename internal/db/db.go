@@ -25,13 +25,20 @@ const (
 	busyTimeoutMS = 5000
 
 	// recursiveTriggersOn is PRAGMA recursive_triggers=ON as the pragma
-	// reports it back. Turns are written with INSERT OR REPLACE, and SQLite
-	// fires a REPLACE's implicit DELETE through AFTER DELETE triggers only
-	// when recursive triggers are enabled — which they are not by default. The
-	// turns_ad trigger is what removes a row's entry from the turns_fts
-	// external-content index, so with the default setting a replaced turn
-	// indexed its new content and left the old entry behind, matching text no
-	// turns row holds any more.
+	// reports it back. SQLite fires the implicit DELETE of an INSERT OR
+	// REPLACE through AFTER DELETE triggers only when recursive triggers are
+	// enabled, and they are off by default. turns_ad is what removes a row's
+	// entry from the turns_fts external-content index, so a REPLACE on a
+	// connection without this setting indexes the new content and leaves the
+	// old entry behind, matching text no turns row holds any more.
+	//
+	// It is no longer what keeps the index correct. Issue #93: resting the
+	// index on a connection-level setting meant any writer that did not opt in
+	// shredded it silently, and a ccvault built before #42 was still first on
+	// the author's PATH. InsertTurnsTx now deletes the rows it is about to
+	// replace with a DELETE of its own, which fires triggers under SQLite's
+	// own rules on every connection. This stays as defence in depth, for any
+	// REPLACE that gets written against this schema later.
 	//
 	// The recursion it allows is one level deep and cannot loop: the three
 	// triggers on turns all write to turns_fts, a virtual table, and nothing

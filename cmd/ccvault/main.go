@@ -305,7 +305,11 @@ func printIntegritySection(f db.FTSIntegrity) {
 	if f.Missing() > 0 {
 		fmt.Printf("  Unindexed:     %d turns that search cannot reach\n", f.Missing())
 	}
-	fmt.Println("  Rebuild the index with 'ccvault sync --rebuild'.")
+	// --full, not --rebuild. Both repair the index, but --rebuild wipes the
+	// archive first and destroys every session whose source file is gone,
+	// which is a steep price for a search index that a non-destructive
+	// re-parse rebuilds on its way past. See Syncer.repairSearchIndex.
+	fmt.Println("  Repair the index with 'ccvault sync --full'.")
 	fmt.Println()
 }
 
@@ -590,6 +594,9 @@ over the live DB (the path is printed at run), or merge it back in with
 			fmt.Printf("  Rewritten upstream: %d session(s) — the transcript was replaced, "+
 				"not appended to, so the archived turns were swapped rather than extended\n",
 				stats.SessionsRewrittenUpstream)
+		}
+		if stats.SearchIndexRebuilt {
+			fmt.Println("  Search index: rebuilt from the parsed turns")
 		}
 
 		if len(stats.Errors) > 0 {

@@ -26,16 +26,31 @@ func (db *DB) InsertTurnsTx(tx *sql.Tx, turns []models.Turn) error {
 		return err
 	}
 
-	stmt, err := tx.Prepare(`
-		INSERT OR REPLACE INTO turns (id, session_id, parent_id, type, timestamp, ordinal, content, raw_json, input_tokens, output_tokens)
+	// A turn can collide with a row already in the table two ways: by id,
+	// which is the transcript uuid, and by position, which UNIQUE(session_id,
+	// ordinal) enforces. Both collisions are resolved by deleting the row that
+	// holds the spot — the same thing INSERT OR REPLACE did — but with a
+	// DELETE statement of our own rather than REPLACE's implicit one. See
+	// deleteTurnConflictsSQL for why that distinction is the whole fix.
+	del, err := tx.Prepare(deleteTurnConflictsSQL)
+	if err != nil {
+		return fmt.Errorf("prepare delete conflicting turns: %w", err)
+	}
+	defer func() { _ = del.Close() }()
+
+	ins, err := tx.Prepare(`
+		INSERT INTO turns (id, session_id, parent_id, type, timestamp, ordinal, content, raw_json, input_tokens, output_tokens)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return fmt.Errorf("prepare insert turns: %w", err)
 	}
-	defer func() { _ = stmt.Close() }()
+	defer func() { _ = ins.Close() }()
 
 	for _, t := range turns {
-		_, err := stmt.Exec(
+		if _, err := del.Exec(t.ID, t.SessionID, t.Ordinal); err != nil {
+			return fmt.Errorf("delete turn conflicting with %s: %w", t.ID, err)
+		}
+		_, err := ins.Exec(
 			t.ID,
 			t.SessionID,
 			t.ParentID,
@@ -55,15 +70,45 @@ func (db *DB) InsertTurnsTx(tx *sql.Tx, turns []models.Turn) error {
 	return nil
 }
 
+// deleteTurnConflictsSQL removes whatever occupies the id and the position a
+// turn is about to take, so the insert that follows cannot conflict.
+//
+// This replaces INSERT OR REPLACE, and the reason is the whole of issue #93.
+// turns_fts is an FTS5 external-content index: a turn's index entry is keyed
+// by its rowid, and the only thing that removes one is the turns_ad trigger
+// firing on a DELETE. SQLite routes a REPLACE's *implicit* delete through an
+// AFTER DELETE trigger only when PRAGMA recursive_triggers is on, and that is
+// off by default. So with REPLACE, the index's correctness rested on a
+// connection-level setting that the database file cannot require of anything
+// that opens it. ccvault's own DSN sets it and verifyConnectionPragmas
+// asserts it (#42), which fixed ccvault — and left every other writer able to
+// shred the index silently: the sqlite3 CLI, another tool, a driver upgrade
+// that renames the DSN parameter, or a ccvault binary built before #42 that
+// is still first on someone's PATH. One `sync --full` through such a binary
+// left 19,023 documents in the author's turns_fts with no turns row behind
+// them, and only FTS5's strict integrity-check could see it.
+//
+// A DELETE statement fires AFTER DELETE triggers under SQLite's own rules,
+// with no pragma involved. That is why tool_uses came through the same sync
+// untouched — it is written as an explicit DELETE followed by a plain INSERT —
+// and this makes turns match it.
+//
+// Semantics are unchanged from REPLACE: one or two rows can be deleted (a
+// turn can collide by id with one row and by position with another), and both
+// go. The OR is two index seeks, sqlite_autoindex_turns_1 and
+// idx_turns_session_ordinal, not a scan.
+const deleteTurnConflictsSQL = `
+	DELETE FROM turns WHERE id = ? OR (session_id = ? AND ordinal = ?)`
+
 // checkDistinctOrdinals rejects a batch that gives two turns in one session
 // the same position.
 //
 // The unique index on (session_id, ordinal) already forbids this, but the
-// insert above is INSERT OR REPLACE, and SQLite resolves a REPLACE against a
-// unique index by *deleting* the conflicting row. So a caller that forgot to
-// assign ordinals would not get an error — it would get a session holding one
-// turn where it passed twenty, silently, with every earlier turn deleted on
-// its way in.
+// write above resolves a position collision by deleting whatever holds the
+// position — the same thing INSERT OR REPLACE did before it. So a caller that
+// forgot to assign ordinals would not get an error; it would get a session
+// holding one turn where it passed twenty, silently, with every earlier turn
+// deleted on its way in.
 //
 // Checked here rather than left to the schema so the failure says which turns
 // collided instead of which index did.
