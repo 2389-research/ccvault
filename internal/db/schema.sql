@@ -86,6 +86,19 @@ CREATE INDEX IF NOT EXISTS idx_turns_type ON turns(type);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_session_ordinal ON turns(session_id, ordinal);
 
 -- Tool uses table
+--
+-- Every ON DELETE CASCADE in this file, here and on turns, is inert. Foreign
+-- key enforcement is off by default in SQLite and ccvault's DSN does not turn
+-- it on, so these clauses document intent and enforce nothing. #87's 6,378
+-- orphaned tool_uses rows are what that cost. Enabling enforcement is a
+-- schema-wide decision on an archive that has never had it — PRAGMA
+-- foreign_key_check on the author's 46,061-session archive reports three
+-- violations already, all sessions.parent_session_id naming a parent
+-- transcript the archive does not hold, which is a legitimate shape for a
+-- subagent session whose parent was never synced. So internal/db deletes a
+-- turn's tool uses explicitly instead, in every path that deletes a turn: a
+-- database file cannot require a connection setting of whatever opens it, and
+-- #93 is the story of what happens when correctness rests on one.
 CREATE TABLE IF NOT EXISTS tool_uses (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     turn_id TEXT REFERENCES turns(id) ON DELETE CASCADE,
@@ -106,6 +119,9 @@ CREATE TABLE IF NOT EXISTS tool_uses (
     result_content TEXT,
     result_length INTEGER,
     result_omitted_reason TEXT,
+    -- This call's position within the turn that issued it, from 0. Half of the
+    -- table's key: see idx_tool_uses_turn_ordinal below and migration 011.
+    turn_ordinal INTEGER NOT NULL DEFAULT 0,
     -- Same tokens as turns.search_period, from this row's own timestamp —
     -- which adapter.ToolUseFromParsed stamps with the timestamp of the turn
     -- that issued the call, the timestamp the search query filters on.
@@ -119,12 +135,32 @@ CREATE TABLE IF NOT EXISTS tool_uses (
 
 CREATE INDEX IF NOT EXISTS idx_tool_uses_session ON tool_uses(session_id);
 
--- "The tool uses of this turn", which search asks twice per returned row to
--- label a payload hit with its tool and its snippet. Without it SQLite answers
--- by walking the whole FTS match set looking for a row belonging to the turn.
-CREATE INDEX IF NOT EXISTS idx_tool_uses_turn_id ON tool_uses(turn_id);
 CREATE INDEX IF NOT EXISTS idx_tool_uses_tool_name ON tool_uses(tool_name);
 CREATE INDEX IF NOT EXISTS idx_tool_uses_file_path ON tool_uses(file_path);
+
+-- The table's key, added by migration 011 after the cleanup that made it
+-- possible: a call is identified by the turn that issued it and its position in
+-- that turn. Before it, tool_uses had no key at all, and two defects came out
+-- of that — 1,302 surplus rows from the recovery import (#82) and 6,378 rows
+-- naming a turn that no longer existed (#87).
+--
+-- Positional rather than keyed on the provider's id, because tool_use_id is not
+-- available everywhere: jeff leaves it empty on 633 of 742 calls, and SQLite
+-- treats NULLs in a unique index as distinct, so the constraint would simply
+-- not apply to them. An ordinal covers every row of every source.
+--
+-- Also "the tool uses of this turn", which search asks twice per returned row
+-- to label a payload hit with its tool and its snippet. turn_id leads the
+-- index, so the seek is the same one the standalone index on turn_id used to
+-- answer; migration 011 dropped that index as redundant.
+--
+-- Safe only because the write path does not use INSERT OR REPLACE: SQLite
+-- resolves a REPLACE's unique conflict by deleting the conflicting row, so a
+-- unique index plus REPLACE converts a duplicate into a silent deletion.
+-- InsertToolUsesTx deletes the row holding the position itself, then plainly
+-- inserts — the shape #93 moved the turns write path to.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_uses_turn_ordinal
+    ON tool_uses(turn_id, turn_ordinal);
 
 -- Not unique: the same transcript ingested under two sources legitimately
 -- repeats a provider id, and INSERT OR REPLACE resolves a unique conflict by

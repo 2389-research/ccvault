@@ -464,7 +464,11 @@ func TestSearch_PayloadAttributionDrivesFromTheTurn(t *testing.T) {
 
 	plan := queryPlan(t, fixture.database, query, args)
 
-	const idx = "idx_tool_uses_turn_id"
+	// Migration 011 replaced the standalone index on turn_id with the unique
+	// index that keys the table, (turn_id, turn_ordinal). turn_id leads it, so
+	// it answers this lookup with the same seek; the standalone index was
+	// dropped as redundant rather than kept alongside it.
+	const idx = "idx_tool_uses_turn_ordinal"
 	if got := strings.Count(plan, idx); got != 2 {
 		t.Errorf("plan uses %s %d times, want 2 — one per attribution subquery.\nplan:\n%s", idx, got, plan)
 	}

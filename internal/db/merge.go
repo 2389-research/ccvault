@@ -118,9 +118,10 @@ func (db *DB) MergeFrom(path string) (*MergeStats, error) {
 		if !committed {
 			_ = tx.Rollback()
 		}
-		// The temp table outlives the transaction on a pooled connection,
-		// so drop it explicitly rather than leaving it for the next caller.
+		// The temp tables outlive the transaction on a pooled connection,
+		// so drop them explicitly rather than leaving them for the next caller.
 		_, _ = conn.ExecContext(ctx, "DROP TABLE IF EXISTS temp.merge_pick")
+		_, _ = conn.ExecContext(ctx, "DROP TABLE IF EXISTS temp.merge_tool_surplus")
 	}()
 
 	if err := mergeProjects(ctx, tx, columns["projects"], stats); err != nil {
@@ -395,14 +396,26 @@ func mergeSessions(ctx context.Context, tx *sql.Tx, columns map[string][]string,
 		}
 	}
 
-	// tool_uses has no natural key, so an older copy's rows must go before
-	// the incoming ones land or the session ends up with both sets.
+	// An older copy's rows must go before the incoming ones land or the
+	// session ends up with both sets.
 	for _, table := range []string{"tool_uses", "turns"} {
 		query := fmt.Sprintf(
 			"DELETE FROM main.%s WHERE session_id IN (SELECT id FROM temp.merge_pick)", table)
 		if _, err := tx.ExecContext(ctx, query); err != nil {
 			return fmt.Errorf("clear existing %s for merged sessions: %w", table, err)
 		}
+	}
+
+	// Clearing tool_uses by session_id is not enough to leave no orphan: a row
+	// can be filed under a session its turn does not belong to, and the DELETE
+	// above cannot reach those. 1,281 rows on the author's archive were in
+	// exactly that state before migration 011 repaired them, and that is how
+	// #87's 6,378 orphans were made. The turns are gone as of the loop above,
+	// so this reaches the rows by the turn they belong to instead.
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM main.tool_uses WHERE turn_id IS NOT NULL
+		  AND NOT EXISTS (SELECT 1 FROM main.turns t WHERE t.id = main.tool_uses.turn_id)`); err != nil {
+		return fmt.Errorf("clear tool uses whose turns the merge removed: %w", err)
 	}
 
 	// projects.id differs between archives, so the incoming project_id is
@@ -451,6 +464,17 @@ func mergeSessions(ctx context.Context, tx *sql.Tx, columns map[string][]string,
 	// an index any writer without the pragma can shred. Position collisions
 	// need no handling — the only rows that could hold a picked session's
 	// position are that session's own, and they are already gone.
+	//
+	// Their tool uses go first, for the reason above: a turn that is deleted
+	// rather than replaced must not leave rows pointing at it, and those rows
+	// may be filed under a session this merge never looked at.
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM main.tool_uses WHERE turn_id IN (
+			SELECT i.id FROM incoming.turns i
+			JOIN temp.merge_pick k ON k.id = i.session_id
+		)`); err != nil {
+		return fmt.Errorf("clear tool uses of the turns the merge is about to replace: %w", err)
+	}
 	if _, err := tx.ExecContext(ctx, `
 		DELETE FROM main.turns WHERE id IN (
 			SELECT i.id FROM incoming.turns i
@@ -488,11 +512,86 @@ func mergeSessions(ctx context.Context, tx *sql.Tx, columns map[string][]string,
 
 	// tool_uses.id is a local autoincrement key; the destination assigns its own.
 	toolCols := without(columns["tool_uses"], "id")
+	toolInsert, toolSelect := columnList(toolCols), qualify("i", toolCols)
+
+	// Same gap migration 008 left on turns.ordinal, for the same reason:
+	// sharedColumns drops a column the incoming database lacks, so an archive
+	// written before migration 011 would land every call of a turn on
+	// turn_ordinal's DEFAULT 0 and the second one would violate the unique
+	// index — turning a recovery import into a hard failure. The position is
+	// computed the way migration 011's backfill computes it, rowid order within
+	// the turn, which is the order that archive's parser read the message's
+	// blocks in. Window functions are evaluated after the WHERE below, so the
+	// numbering is gapless over the rows that actually land.
+	if !contains(toolCols, "turn_ordinal") {
+		toolInsert += ", " + quoteIdent("turn_ordinal")
+		toolSelect += ", ROW_NUMBER() OVER (PARTITION BY i.turn_id ORDER BY i.rowid) - 1"
+	}
+
+	// Only calls whose turn is in this archive. main.turns holds everything the
+	// merge brought in by now, so this is the join that stops an import from
+	// adding to #87's orphan count: an incoming call can name a turn belonging
+	// to a session the merge did not pick, and importing it would leave a row
+	// nothing can reach.
+	toolWhere := `
+		JOIN temp.merge_pick k ON k.id = i.session_id
+		JOIN main.turns mt ON mt.id = i.turn_id`
+
+	// And not the rows migration 011 would have deleted. A pre-011 archive
+	// carries its duplicates, and #82's duplicates came from importing exactly
+	// such an archive — so the rule that cleaned them up has to apply on the
+	// way in too, or `ccvault import` re-creates them. Same rule, same shape,
+	// staged into a temp table for the reason the migration stages it: written
+	// as a correlated subquery it needs an index on tool_uses(turn_id) that an
+	// archive predating migration 010 does not have, and without one SQLite
+	// seeks on tool_name instead and the cost goes quadratic in the size of the
+	// largest tool.
+	//
+	// Skipped when the incoming archive predates migration 009 and has none of
+	// the three columns the rule reads. Such an archive cannot be deduplicated
+	// at all — nothing in it says which of two rows is the same call — and the
+	// ordinals still come out valid, so the import succeeds either way.
+	if contains(toolCols, "tool_use_id") && contains(toolCols, "input_json") && contains(toolCols, "result_length") {
+		if _, err := tx.ExecContext(ctx, "DROP TABLE IF EXISTS temp.merge_tool_surplus"); err != nil {
+			return fmt.Errorf("drop merge tool surplus table: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			CREATE TABLE temp.merge_tool_surplus AS
+			SELECT id FROM (
+				SELECT id, tool_use_id, input_json, result_length,
+					ROW_NUMBER() OVER (PARTITION BY turn_id, tool_name ORDER BY id) AS pos_in_group,
+					ROW_NUMBER() OVER (PARTITION BY turn_id, tool_name, tool_use_id ORDER BY id) AS pos_in_id_group
+				FROM incoming.tool_uses
+			)
+			WHERE (tool_use_id IS NOT NULL AND pos_in_id_group > 1)
+			   OR (tool_use_id IS NULL
+			       AND input_json IS NULL
+			       AND result_length IS NULL
+			       AND pos_in_group > 1)`); err != nil {
+			return fmt.Errorf("stage the incoming archive's duplicate tool uses: %w", err)
+		}
+		toolWhere += `
+		WHERE i.id NOT IN (SELECT id FROM temp.merge_tool_surplus)`
+	}
+
+	// Whatever the destination holds for the turns these calls belong to goes
+	// first. Clearing by session_id missed them: a destination row can be filed
+	// under a session this merge never picked while naming a turn the incoming
+	// archive is supplying calls for, and leaving it would collide with the
+	// unique index — or, before that index existed, quietly double the turn's
+	// calls.
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM main.tool_uses WHERE turn_id IN (
+			SELECT i.turn_id FROM incoming.tool_uses i
+			JOIN temp.merge_pick k ON k.id = i.session_id
+		)`); err != nil {
+		return fmt.Errorf("clear tool uses the merge is about to replace: %w", err)
+	}
+
 	toolQuery := fmt.Sprintf(`
 		INSERT INTO main.tool_uses (%s)
-		SELECT %s FROM incoming.tool_uses i
-		JOIN temp.merge_pick k ON k.id = i.session_id`,
-		columnList(toolCols), qualify("i", toolCols))
+		SELECT %s FROM incoming.tool_uses i%s`,
+		toolInsert, toolSelect, toolWhere)
 	res, err = tx.ExecContext(ctx, toolQuery)
 	if err != nil {
 		return fmt.Errorf("merge tool uses: %w", err)

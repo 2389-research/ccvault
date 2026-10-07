@@ -399,7 +399,9 @@ func (s *Searcher) buildQuery(q *Query, limit int, periods []string) (string, []
 	// CROSS JOIN is load-bearing, not decoration. It is how SQLite is told not
 	// to reorder the join, and left to choose it puts the virtual table first:
 	// it has no row estimate for an fts5 MATCH that would tell it a seek on
-	// idx_tool_uses_turn_id is the cheaper end to start from.
+	// the index on tool_uses.turn_id is the cheaper end to start from.
+	// (That index is idx_tool_uses_turn_ordinal since migration 011, which
+	// keys the table on (turn_id, turn_ordinal) and leads with turn_id.)
 	//
 	// Which makes that index a hard dependency of this shape rather than an
 	// optimisation of it. Pinning the order without an index to seek turns the

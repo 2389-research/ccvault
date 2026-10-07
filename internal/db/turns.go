@@ -13,6 +13,11 @@ import (
 	"github.com/2389-research/ccvault/pkg/models"
 )
 
+// toolUsesTurnOrdinalIndex is the unique index that gives tool_uses a key:
+// (turn_id, turn_ordinal), a call's position inside the turn that issued it.
+// Named here because migration 011 creates it and the tests probe for it.
+const toolUsesTurnOrdinalIndex = "idx_tool_uses_turn_ordinal"
+
 // InsertTurns inserts multiple turns in a batch
 func (db *DB) InsertTurns(turns []models.Turn) error {
 	return db.WithTx(func(tx *sql.Tx) error {
@@ -38,6 +43,12 @@ func (db *DB) InsertTurnsTx(tx *sql.Tx, turns []models.Turn) error {
 	}
 	defer func() { _ = del.Close() }()
 
+	delTools, err := tx.Prepare(deleteToolUsesOfConflictingTurnsSQL)
+	if err != nil {
+		return fmt.Errorf("prepare delete tool uses of conflicting turns: %w", err)
+	}
+	defer func() { _ = delTools.Close() }()
+
 	ins, err := tx.Prepare(`
 		INSERT INTO turns (id, session_id, parent_id, type, timestamp, ordinal, content, raw_json, input_tokens, output_tokens)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
@@ -47,6 +58,9 @@ func (db *DB) InsertTurnsTx(tx *sql.Tx, turns []models.Turn) error {
 	defer func() { _ = ins.Close() }()
 
 	for _, t := range turns {
+		if _, err := delTools.Exec(t.ID, t.SessionID, t.Ordinal); err != nil {
+			return fmt.Errorf("delete tool uses of turns conflicting with %s: %w", t.ID, err)
+		}
 		if _, err := del.Exec(t.ID, t.SessionID, t.Ordinal); err != nil {
 			return fmt.Errorf("delete turn conflicting with %s: %w", t.ID, err)
 		}
@@ -99,6 +113,49 @@ func (db *DB) InsertTurnsTx(tx *sql.Tx, turns []models.Turn) error {
 // idx_turns_session_ordinal, not a scan.
 const deleteTurnConflictsSQL = `
 	DELETE FROM turns WHERE id = ? OR (session_id = ? AND ordinal = ?)`
+
+// deleteToolUsesOfConflictingTurnsSQL removes the tool uses of whatever
+// deleteTurnConflictsSQL is about to delete, so no row is left pointing at a
+// turn that no longer exists. Same three bindings, same two index seeks.
+//
+// This is issue #87: 6,378 rows whose turn_id named no row in turns, 2.4% of
+// the table, invisible to search — every query joins through turns — and
+// counted by GetToolUsageStats regardless.
+//
+// tool_uses.turn_id has declared `REFERENCES turns(id) ON DELETE CASCADE`
+// since the initial schema and that declaration has never done anything,
+// because foreign key enforcement is off by default in SQLite and ccvault's
+// DSN does not turn it on. Enforcing it would be a schema-wide change on an
+// archive that has never had it — `PRAGMA foreign_key_check` on the author's
+// archive reports three violations already, all sessions.parent_session_id
+// naming a parent transcript the archive does not hold, which is a legitimate
+// shape for a subagent session whose parent was never synced. So the delete is
+// explicit here instead, for the same reason #93 made the turns write path
+// delete explicitly: a database file cannot require a connection setting of
+// whatever opens it, so correctness must not rest on one.
+//
+// Why a turn gets deleted rather than replaced: sync resolves a position
+// collision by deleting whatever holds the position, so a transcript that was
+// rewritten rather than appended to (internal/sync reports this as "rewritten
+// upstream") removes turns outright. Deleting a session's tool uses by
+// session_id does not cover it, because a row can be filed under a session its
+// turn does not belong to — 1,281 of them were on the author's archive before
+// migration 011 repaired them.
+//
+// It runs per turn, alongside the DELETE above, which is one more statement in
+// the hottest loop in the writer. Measured on a synthetic 200-session,
+// 24,000-turn, 24,000-tool-use archive: a first sync goes 2.42s to 2.56s and a
+// `sync --full` 3.37s to 3.53s, against a binary built without it.
+const deleteToolUsesOfConflictingTurnsSQL = `
+	DELETE FROM tool_uses WHERE turn_id IN (
+		SELECT id FROM turns WHERE id = ? OR (session_id = ? AND ordinal = ?))`
+
+// deleteToolUsesOfSessionTurnsSQL is the same guarantee for the whole-session
+// delete: a session's turns go, so their tool uses go, wherever those rows
+// happen to be filed.
+const deleteToolUsesOfSessionTurnsSQL = `
+	DELETE FROM tool_uses WHERE turn_id IN (
+		SELECT id FROM turns WHERE session_id = ?)`
 
 // checkDistinctOrdinals rejects a batch that gives two turns in one session
 // the same position.
@@ -244,14 +301,20 @@ func (db *DB) SessionTurnCursor(sessionID string) (TurnCursor, error) {
 	return c, nil
 }
 
-// DeleteTurnsForSession removes all turns for a session (for re-sync)
+// DeleteTurnsForSession removes all turns for a session (for re-sync), and the
+// tool uses belonging to those turns — see deleteToolUsesOfSessionTurnsSQL.
 func (db *DB) DeleteTurnsForSession(sessionID string) error {
-	_, err := db.Exec("DELETE FROM turns WHERE session_id = ?", sessionID)
-	return err
+	return db.WithTx(func(tx *sql.Tx) error {
+		return db.DeleteTurnsForSessionTx(tx, sessionID)
+	})
 }
 
-// DeleteTurnsForSessionTx removes all turns for a session within a transaction
+// DeleteTurnsForSessionTx removes all turns for a session within a transaction,
+// and the tool uses belonging to those turns.
 func (db *DB) DeleteTurnsForSessionTx(tx *sql.Tx, sessionID string) error {
+	if _, err := tx.Exec(deleteToolUsesOfSessionTurnsSQL, sessionID); err != nil {
+		return fmt.Errorf("delete tool uses of session %s's turns: %w", sessionID, err)
+	}
 	_, err := tx.Exec("DELETE FROM turns WHERE session_id = ?", sessionID)
 	return err
 }
@@ -426,22 +489,53 @@ func (db *DB) InsertToolUses(toolUses []models.ToolUse) error {
 	})
 }
 
-// InsertToolUsesTx inserts tool usage records within a transaction
+// InsertToolUsesTx inserts tool usage records within a transaction.
+//
+// Each call is numbered by its position within the turn that issued it, which
+// is what UNIQUE(turn_id, turn_ordinal) keys the table on (migration 011). The
+// position comes from the batch: a transcript's calls arrive in the order the
+// parser read them, and internal/sync passes one session's calls in one slice,
+// so the Nth call of a turn in this batch is the Nth call of that turn in the
+// transcript. A caller that split one turn's calls across two batches would
+// restart the numbering and replace the rows the first batch wrote — the one
+// thing this function requires of its caller and cannot check.
+//
+// The delete-then-insert is deliberate and not interchangeable with INSERT OR
+// REPLACE. SQLite resolves a REPLACE's unique conflict by deleting the
+// conflicting row, so REPLACE against the new index would turn a position
+// collision into a silent deletion — #29 found that shape, and #93 rewrote the
+// turns write path away from it. A DELETE of our own also fires tool_uses_ad
+// under SQLite's own rules rather than only when PRAGMA recursive_triggers is
+// on, which is what keeps tool_uses_fts free of orphans on any connection.
 func (db *DB) InsertToolUsesTx(tx *sql.Tx, toolUses []models.ToolUse) error {
+	del, err := tx.Prepare(`DELETE FROM tool_uses WHERE turn_id = ? AND turn_ordinal = ?`)
+	if err != nil {
+		return fmt.Errorf("prepare delete conflicting tool_uses: %w", err)
+	}
+	defer func() { _ = del.Close() }()
+
 	stmt, err := tx.Prepare(`
 		INSERT INTO tool_uses (turn_id, session_id, tool_name, file_path, timestamp,
 			tool_use_id, input_json, input_length,
-			result_content, result_length, result_omitted_reason)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+			result_content, result_length, result_omitted_reason, turn_ordinal)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return fmt.Errorf("prepare insert tool_uses: %w", err)
 	}
 	defer func() { _ = stmt.Close() }()
 
+	next := make(map[string]int, len(toolUses))
 	for _, tu := range toolUses {
+		ordinal := next[tu.TurnID]
+		next[tu.TurnID] = ordinal + 1
+
+		if _, err := del.Exec(tu.TurnID, ordinal); err != nil {
+			return fmt.Errorf("delete tool_use conflicting with call %d of turn %s: %w", ordinal, tu.TurnID, err)
+		}
 		_, err := stmt.Exec(tu.TurnID, tu.SessionID, tu.ToolName, tu.FilePath, tu.Timestamp,
 			nullIfEmpty(tu.ToolUseID), nullIfEmpty(tu.InputJSON), nullIfZero(tu.InputLength),
-			nullIfEmpty(tu.ResultContent), resultLengthValue(tu), nullIfEmpty(tu.ResultOmittedReason))
+			nullIfEmpty(tu.ResultContent), resultLengthValue(tu), nullIfEmpty(tu.ResultOmittedReason),
+			ordinal)
 		if err != nil {
 			return fmt.Errorf("insert tool_use: %w", err)
 		}
