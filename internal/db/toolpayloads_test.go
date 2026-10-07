@@ -603,8 +603,17 @@ func TestInsertToolUsesWritesPayloads(t *testing.T) {
 	})
 
 	t.Run("empty id stores NULL, not the empty string", func(t *testing.T) {
+		// Its own turn, not turn-live. A batch carries a turn's calls from
+		// position 0, and migration 011 keys tool_uses on (turn_id,
+		// turn_ordinal), so a second batch naming turn-live would replace the
+		// first call this test wrote rather than adding to it.
+		if _, err := database.Exec(
+			`INSERT INTO turns (id, session_id, type, timestamp, content, ordinal)
+			 VALUES ('turn-live-2', 'sess-live', 'assistant', ?, '', 1)`, ts); err != nil {
+			t.Fatalf("seed second turn: %v", err)
+		}
 		if err := database.InsertToolUses([]models.ToolUse{{
-			TurnID: "turn-live", SessionID: "sess-live", ToolName: "email", Timestamp: ts,
+			TurnID: "turn-live-2", SessionID: "sess-live", ToolName: "email", Timestamp: ts,
 			ToolUseID: "", InputJSON: `{"operation":"list"}`, InputLength: 20,
 		}}); err != nil {
 			t.Fatalf("InsertToolUses: %v", err)
