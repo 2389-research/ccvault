@@ -179,12 +179,30 @@ func forgetSupersededSourceFile(w sessionWriter, previousFile, currentFile strin
 //     blast radius for a defect only reachable by importing an archive that is
 //     already inconsistent.
 //
+// model, git_branch, turn_count and the four token counters get the same
+// treatment for the same reason (issue #64), but in SQL rather than at the
+// scan. All seven are nullable in the schema — the two text columns with no
+// default at all, the five counters with a DEFAULT 0 that applies to an
+// omitted column and not to an explicit NULL — and all seven live in
+// models.Session as non-nullable Go types, so a NULL in any of them did not
+// read as incomplete, it failed the scan and made the session unreadable.
+//
+// COALESCE in the statement rather than seven sql.Null* locals per read path,
+// which is where this diverges in mechanism (not in decision) from #43: the
+// same SELECT already spells "absent reads as the zero value" that way for the
+// joined project path, and three read paths times seven columns is twenty-one
+// scan temporaries to express what the SQL says once each. The decision is
+// #43's unchanged — tolerate the NULL on read, zero value means absent, no
+// NOT NULL migration and so no rewrite of a 44k-session table.
+//
 // GetSession resolves a subagent id as readily as a top-level one — no flag,
 // no separate call. Hidden from default listings is not the same as secret.
 func (db *DB) GetSession(id string) (*models.Session, error) {
 	query := `
-		SELECT id, project_id, started_at, ended_at, model, git_branch,
-			turn_count, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+		SELECT id, project_id, started_at, ended_at,
+			COALESCE(model, ''), COALESCE(git_branch, ''),
+			COALESCE(turn_count, 0), COALESCE(input_tokens, 0), COALESCE(output_tokens, 0),
+			COALESCE(cache_read_tokens, 0), COALESCE(cache_write_tokens, 0),
 			source_file, source, parent_session_id, last_entry_uuid,
 			(SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = sessions.id)
 		FROM sessions WHERE id = ?`
@@ -196,7 +214,7 @@ func (db *DB) GetSession(id string) (*models.Session, error) {
 	// last_entry_uuid is NULL for a session with no turns, and for every row
 	// that predates migration 008 on an archive whose sessions were emptied
 	// since. Scanned through NullString rather than straight into the string
-	// field — the mistake issue #64 records for model and git_branch.
+	// field, the mistake model and git_branch used to make (#64).
 	var lastEntryUUID sql.NullString
 	err := db.QueryRow(query, id).Scan(
 		&s.ID,
@@ -292,9 +310,14 @@ type SessionQuery struct {
 // sessionListSelect is the column list every session listing reads. The
 // correlated subagent_count is what earns the default filtering: a surface
 // that hides subagent rows still reports how many it hid, per parent.
+//
+// The COALESCEs on the nullable metadata columns are #64 — see GetSession for
+// why they are here rather than at the scan.
 const sessionListSelect = `
-		SELECT s.id, s.project_id, s.started_at, s.ended_at, s.model, s.git_branch,
-			s.turn_count, s.input_tokens, s.output_tokens, s.cache_read_tokens, s.cache_write_tokens,
+		SELECT s.id, s.project_id, s.started_at, s.ended_at,
+			COALESCE(s.model, ''), COALESCE(s.git_branch, ''),
+			COALESCE(s.turn_count, 0), COALESCE(s.input_tokens, 0), COALESCE(s.output_tokens, 0),
+			COALESCE(s.cache_read_tokens, 0), COALESCE(s.cache_write_tokens, 0),
 			s.source_file, COALESCE(p.path, '') as project_path, s.source,
 			s.parent_session_id,
 			(SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = s.id) as subagent_count
@@ -418,13 +441,21 @@ func nullableString(s string) interface{} {
 	return s
 }
 
-// GetSessionStats returns aggregate statistics for sessions
+// GetSessionStats returns aggregate statistics for sessions.
+//
+// Each counter is COALESCEd before it is added, not just the SUM afterwards.
+// Addition in SQL yields NULL if any operand is NULL, so a row holding one
+// NULL counter and four real ones used to contribute nothing at all to the
+// token total — SUM skips a NULL input rather than failing on it, which makes
+// the undercount silent. The outer COALESCE only ever covered the case of no
+// rows at all. Same nullable-column defect as #64, in aggregate form.
 func (db *DB) GetSessionStats() (count int, totalTurns int, totalTokens int64, err error) {
 	query := `
 		SELECT
 			COUNT(*),
-			COALESCE(SUM(turn_count), 0),
-			COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens), 0)
+			COALESCE(SUM(COALESCE(turn_count, 0)), 0),
+			COALESCE(SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)
+				+ COALESCE(cache_read_tokens, 0) + COALESCE(cache_write_tokens, 0)), 0)
 		FROM sessions`
 	err = db.QueryRow(query).Scan(&count, &totalTurns, &totalTokens)
 	if err != nil {
@@ -433,11 +464,15 @@ func (db *DB) GetSessionStats() (count int, totalTurns int, totalTokens int64, e
 	return count, totalTurns, totalTokens, nil
 }
 
-// GetSessionBySourceFile retrieves a session by its source file path
+// GetSessionBySourceFile retrieves a session by its source file path. Same
+// COALESCEs over the nullable metadata columns as the other two read paths —
+// see GetSession.
 func (db *DB) GetSessionBySourceFile(path string) (*models.Session, error) {
 	query := `
-		SELECT id, project_id, started_at, ended_at, model, git_branch,
-			turn_count, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+		SELECT id, project_id, started_at, ended_at,
+			COALESCE(model, ''), COALESCE(git_branch, ''),
+			COALESCE(turn_count, 0), COALESCE(input_tokens, 0), COALESCE(output_tokens, 0),
+			COALESCE(cache_read_tokens, 0), COALESCE(cache_write_tokens, 0),
 			source_file, source_mtime
 		FROM sessions WHERE source_file = ?`
 
