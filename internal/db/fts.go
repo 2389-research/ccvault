@@ -52,6 +52,19 @@ func (f FTSIntegrity) Consistent() bool {
 // row of the content table. `ccvault stats` runs this on an archive with tens
 // of thousands of sessions, so this trades the stronger check for one that
 // scans a two-column shadow table and does a rowid lookup per row.
+//
+// The counts it returns are a lower bound, not a verdict. A stranded document
+// is only visible here while its rowid is still unused, and a re-parse hands
+// every turn a fresh rowid from the end of the table — so the rowids a
+// stranded document sits on get reused, its %_docsize row is overwritten, and
+// these counts agree again while the index still holds the stale terms and
+// still answers queries with them. Measured: 2,000 stranded documents injected
+// into a 235,101-turn archive, then one `sync --full`, left Orphaned at 0 with
+// all 2,000 still matchable and the strict check still reporting "database
+// disk image is malformed". Consistent() reporting true therefore means
+// "nothing cheap to see here", and only the strict check or a rebuild settles
+// it. That is why `sync --full` rebuilds unconditionally rather than gating on
+// this; see Syncer.rebuildSearchIndex.
 func (db *DB) CheckFTSIntegrity() (FTSIntegrity, error) {
 	return db.CheckFTSIntegrityContext(context.Background())
 }
@@ -70,4 +83,30 @@ func (db *DB) CheckFTSIntegrityContext(ctx context.Context) (FTSIntegrity, error
 		return FTSIntegrity{}, fmt.Errorf("check turns_fts integrity: %w", err)
 	}
 	return f, nil
+}
+
+// RebuildTurnsFTS discards the turns_fts index and derives it again from the
+// turns table.
+//
+// This is the only repair for an index that has already drifted. The triggers
+// keep the index in step with changes to turns, so they cannot remove a
+// document whose turns row is gone — there is no row left to delete, and
+// nothing to fire the trigger. FTS5's 'rebuild' command drops the lot and
+// re-tokenizes the content table, which is also why it is the repair rather
+// than a per-row fix: the cost is one pass over turns.
+//
+// Measured on the author's 1,014,942-turn archive: 18 seconds.
+func (db *DB) RebuildTurnsFTS() error {
+	return db.RebuildTurnsFTSContext(context.Background())
+}
+
+// RebuildTurnsFTSContext is RebuildTurnsFTS bound to ctx. Re-tokenizing a
+// million turns is one long write, so a caller that can be cancelled needs to
+// be able to interrupt it; cancelling rolls the rebuild back and leaves the
+// index as it was.
+func (db *DB) RebuildTurnsFTSContext(ctx context.Context) error {
+	if _, err := db.ExecContext(ctx, "INSERT INTO turns_fts(turns_fts) VALUES('rebuild')"); err != nil {
+		return fmt.Errorf("rebuild turns_fts: %w", err)
+	}
+	return nil
 }
