@@ -13,9 +13,15 @@ import (
 
 // distinctValue returns a non-zero value for a field type, so a field that
 // fails to survive a conversion shows up as a zero where a value was set.
-func distinctValue(t *testing.T, kind reflect.Kind, seed int) reflect.Value {
+//
+// Takes the type rather than the kind so the pointer case can allocate the
+// right pointee. A nullable field is a pointer here (models.ToolUse.IsError),
+// and a non-nil pointer is what makes a dropped copy visible: a conversion
+// that forgets it leaves nil, which DeepEqual separates from a pointer to the
+// zero value as well as from one to a set value.
+func distinctValue(t *testing.T, typ reflect.Type, seed int) reflect.Value {
 	t.Helper()
-	switch kind {
+	switch typ.Kind() {
 	case reflect.String:
 		return reflect.ValueOf("value-" + time.Duration(seed).String())
 	case reflect.Int:
@@ -24,8 +30,12 @@ func distinctValue(t *testing.T, kind reflect.Kind, seed int) reflect.Value {
 		return reflect.ValueOf(int64(seed + 1))
 	case reflect.Bool:
 		return reflect.ValueOf(true)
+	case reflect.Ptr:
+		p := reflect.New(typ.Elem())
+		p.Elem().Set(distinctValue(t, typ.Elem(), seed))
+		return p
 	default:
-		t.Fatalf("distinctValue has no case for %s — add one when a field of that type is introduced", kind)
+		t.Fatalf("distinctValue has no case for %s — add one when a field of that type is introduced", typ.Kind())
 		return reflect.Value{}
 	}
 }
@@ -42,7 +52,7 @@ func TestToolUseRoundTrip(t *testing.T) {
 	var original ParsedToolUse
 	v := reflect.ValueOf(&original).Elem()
 	for i := range v.NumField() {
-		v.Field(i).Set(distinctValue(t, v.Field(i).Kind(), i))
+		v.Field(i).Set(distinctValue(t, v.Field(i).Type(), i))
 	}
 
 	stored := ToolUseFromParsed(original, "turn-1", "session-1", time.Unix(1700000000, 0).UTC())

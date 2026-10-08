@@ -468,12 +468,17 @@ func ExtractToolUses(turns []models.Turn) []models.ToolUse {
 				toolUse.InputLength = len(content.Input)
 			}
 
-			if rawResult, ok := results[content.ID]; ok && content.ID != "" {
-				decided := toolpayload.ResultFromJSON(content.Name, rawResult)
+			if res, ok := results[content.ID]; ok && content.ID != "" {
+				decided := toolpayload.ResultFromJSON(content.Name, res.content)
 				toolUse.HasResult = true
 				toolUse.ResultContent = decided.Content
 				toolUse.ResultLength = decided.Length
 				toolUse.ResultOmittedReason = decided.OmitReason
+				// Taken from the block rather than derived from the text, and
+				// set for every result including an omitted one: a failing
+				// Read keeps no body to read a failure out of, and the flag is
+				// the only thing such a row can say (#83).
+				toolUse.IsError = &res.isError
 			}
 
 			toolUses = append(toolUses, toolUse)
@@ -494,18 +499,34 @@ func ExtractToolUses(turns []models.Turn) []models.ToolUse {
 // is a real bug (see the note on TestExtractUserContent_IgnoresImageBlocks)
 // but it is not this change's bug, and the new payloads reach search through
 // their own index rather than by disturbing that one.
+// Content is left raw for the reason above; IsError is a plain bool because
+// the key is absent far more often than present — 217,581 of the author's
+// 273,023 result blocks omit it — and Claude Code writes it only when there is
+// something to report, so absent and false are the same statement. The
+// three-state distinction lives one level up, in whether a result was found at
+// all (#83).
 type rawToolResultBlock struct {
 	Type      string          `json:"type"`
 	ToolUseID string          `json:"tool_use_id"`
 	Content   json.RawMessage `json:"content"`
+	IsError   bool            `json:"is_error"`
+}
+
+// toolResult is one answered call: the result content as the transcript wrote
+// it, and whether that result reported a failure. Kept together because they
+// come from the same block and a lookup that returned only the content would
+// make the flag unreachable without a second pass over every turn.
+type toolResult struct {
+	content json.RawMessage
+	isError bool
 }
 
 // collectToolResults indexes every tool_result block in the session by the
 // tool_use_id it names. Walks all turn types rather than only "user": the
 // result's home is the user message today, and keying on the block's own type
 // costs nothing and does not assume that.
-func collectToolResults(turns []models.Turn) map[string]json.RawMessage {
-	results := make(map[string]json.RawMessage)
+func collectToolResults(turns []models.Turn) map[string]toolResult {
+	results := make(map[string]toolResult)
 
 	for _, turn := range turns {
 		var raw models.RawTurn
@@ -532,7 +553,7 @@ func collectToolResults(turns []models.Turn) map[string]json.RawMessage {
 			// answered one call twice; keeping the first keeps the mapping
 			// stable regardless of which turn order a re-parse sees.
 			if _, seen := results[block.ToolUseID]; !seen {
-				results[block.ToolUseID] = block.Content
+				results[block.ToolUseID] = toolResult{content: block.Content, isError: block.IsError}
 			}
 		}
 	}

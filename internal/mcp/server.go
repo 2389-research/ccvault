@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -275,8 +276,12 @@ func (s *Server) handleToolsList(req *jsonRPCRequest) {
 				Type: "object",
 				Properties: map[string]property{
 					"query": {
-						Type:        "string",
-						Description: "Search query. Supports: project:name, model:opus, tool:Bash, before:2024-01-01, after:2024-01-01, \"exact phrase\"",
+						Type: "string",
+						Description: "Search query. Supports: project:name, model:opus, tool:Bash, " +
+							"before:2024-01-01, after:2024-01-01, \"exact phrase\", has:subagent, " +
+							"has:error (sessions that held a tool failure), has:toolerror (the turns " +
+							"whose own tool call failed — the per-call granularity, and what to use " +
+							"to find what broke)",
 					},
 					"limit": {
 						Type:        "number",
@@ -299,7 +304,10 @@ func (s *Server) handleToolsList(req *jsonRPCRequest) {
 			Description: "Get a quick overview of a session: metadata, stats, tools used, and first/last " +
 				"messages. Use this first before get_turns. tools_used is counted from each assistant " +
 				"turn's raw_json; when some turns cannot be read the count is incomplete, and the " +
-				"response says so with unreadable_turns and a 'tools_used incomplete' warnings[] entry.",
+				"response says so with unreadable_turns and a 'tools_used incomplete' warnings[] entry. " +
+				"failed_tool_calls and failed_tools report the calls whose result said they failed, " +
+				"read from a stored column rather than raw_json, so they stay correct on a session " +
+				"whose tools_used is incomplete. Both are absent when nothing failed.",
 			InputSchema: inputSchema{
 				Type: "object",
 				Properties: map[string]property{
@@ -319,7 +327,10 @@ func (s *Server) handleToolsList(req *jsonRPCRequest) {
 				"but counts rows in the last response rather than naming a turn. An assistant turn whose " +
 				"raw_json could not be read carries raw_unavailable: true and omits tools and " +
 				"has_thinking — absence of tools on such a turn is not evidence it called none. The page " +
-				"reports how many in unreadable_turns plus one warnings[] entry.",
+				"reports how many in unreadable_turns plus one warnings[] entry. A turn that issued a " +
+				"call whose result said it failed carries failed_tools with that call's tool name; it " +
+				"comes from a stored column, so it is present even on a raw_unavailable turn, and it is " +
+				"absent rather than empty when nothing failed.",
 			InputSchema: inputSchema{
 				Type: "object",
 				Properties: map[string]property{
@@ -797,6 +808,61 @@ func readTurnEnrichment(rawJSON []byte) (tools []string, hasThinking, ok bool) {
 	return tools, hasThinking, true
 }
 
+// topCountsByName renders a name-to-count map as the {tool, count} list the
+// MCP responses use, highest first and capped at ten.
+//
+// Extracted so tools_used and failed_tools come out in the same shape, which
+// is the point of putting them side by side: a caller comparing "what this
+// session reached for" against "what came back broken" should not have to read
+// two formats to do it. Ties break on the name so one session's summary does
+// not reorder between calls.
+func topCountsByName(counts map[string]int) []map[string]interface{} {
+	names := make([]string, 0, len(counts))
+	for name := range counts {
+		names = append(names, name)
+	}
+	sort.Slice(names, func(i, j int) bool {
+		if counts[names[i]] != counts[names[j]] {
+			return counts[names[i]] > counts[names[j]]
+		}
+		return names[i] < names[j]
+	})
+	if len(names) > 10 {
+		names = names[:10]
+	}
+
+	out := make([]map[string]interface{}, len(names))
+	for i, name := range names {
+		out[i] = map[string]interface{}{"tool": name, "count": counts[name]}
+	}
+	return out
+}
+
+// failedToolsByTurn groups a session's failed calls by the turn that issued
+// them, so a response can label each turn with what broke in it.
+//
+// Reads the stored is_error column through db.GetFailedToolCalls rather than
+// re-deriving the flag from raw_json, and that is the whole point of the
+// column. readTurnEnrichment above fails on 216,978 of the author's turns
+// (#101) and reports nothing on any source whose raw shape has no top-level
+// message key (#100); a failure flag recovered by the backfill or written by
+// sync must not be lost to either.
+//
+// Names rather than ids: a caller reading "failed_tools: [Edit]" learns what
+// it needs without a second lookup, and the same turn's `tools` field is names
+// too. Duplicates are kept — a turn that made three failing Bash calls says
+// Bash three times, because the count is the fact.
+func failedToolsByTurn(failures []db.FailedToolCall) map[string][]string {
+	if len(failures) == 0 {
+		return nil
+	}
+	byTurn := make(map[string][]string, len(failures))
+	for _, f := range failures {
+		byTurn[f.TurnID] = append(byTurn[f.TurnID], f.ToolName)
+	}
+	return byTurn
+}
+
 func (s *Server) getSessionSummary(args map[string]interface{}) (interface{}, error) {
 	sessionID, _ := args["session_id"].(string)
 	if sessionID == "" {
@@ -880,31 +946,7 @@ func (s *Server) getSessionSummary(args map[string]interface{}) (interface{}, er
 		lastUserMsg = lastUserMsg[:500] + "..."
 	}
 
-	// Build top tools list
-	type toolCount struct {
-		name  string
-		count int
-	}
-	var topTools []toolCount
-	for name, count := range toolCounts {
-		topTools = append(topTools, toolCount{name, count})
-	}
-	// Sort by count desc
-	for i := 0; i < len(topTools); i++ {
-		for j := i + 1; j < len(topTools); j++ {
-			if topTools[j].count > topTools[i].count {
-				topTools[i], topTools[j] = topTools[j], topTools[i]
-			}
-		}
-	}
-	// Take top 10
-	if len(topTools) > 10 {
-		topTools = topTools[:10]
-	}
-	topToolsMap := make([]map[string]interface{}, len(topTools))
-	for i, t := range topTools {
-		topToolsMap[i] = map[string]interface{}{"tool": t.name, "count": t.count}
-	}
+	topToolsMap := topCountsByName(toolCounts)
 
 	result := map[string]interface{}{
 		"session_id":     session.ID,
@@ -925,6 +967,31 @@ func (s *Server) getSessionSummary(args map[string]interface{}) (interface{}, er
 		"last_user_msg":  lastUserMsg,
 		"hint": "Use get_turns to paginate through the conversation, resuming with " +
 			"after_ordinal",
+	}
+
+	// What broke, counted per tool. tools_used says what the session reached
+	// for; this says which of those reaches came back a failure, which is the
+	// half of "what happened here" the summary could not answer before (#83).
+	//
+	// Read from the stored column, so it is unaffected by the raw_json that
+	// makes tools_used incomplete on a corrupt session — the two can therefore
+	// disagree, with failed_tool_calls naming a tool tools_used undercounts.
+	// That is the honest outcome and the warning below already says why.
+	//
+	// Both fields are omitted entirely when nothing failed, rather than
+	// emitted as a zero and an empty list. A field that is present and empty on
+	// every clean session is a field callers learn to skip.
+	failures, err := s.db.GetFailedToolCalls(sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("read failed tool calls: %w", err)
+	}
+	if len(failures) > 0 {
+		failedCounts := make(map[string]int, len(failures))
+		for _, f := range failures {
+			failedCounts[f.ToolName]++
+		}
+		result["failed_tool_calls"] = len(failures)
+		result["failed_tools"] = topCountsByName(failedCounts)
 	}
 
 	// Where the session's sequence ends, so a caller can resume from the tail
@@ -1040,6 +1107,15 @@ func (s *Server) getTurns(args map[string]interface{}) (interface{}, error) {
 		turns = turns[:limit]
 	}
 
+	// Which calls failed, read once for the session rather than per turn.
+	// One indexed query against idx_tool_uses_is_error costs less than fifty
+	// lookups, and a page shows at most fifty turns.
+	failures, err := s.db.GetFailedToolCalls(sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get failed tool calls: %w", err)
+	}
+	failedTools := failedToolsByTurn(failures)
+
 	// Transform to compact representation
 	compactTurns := make([]map[string]interface{}, 0, len(turns))
 	unreadableTurns := 0
@@ -1086,6 +1162,19 @@ func (s *Server) getTurns(args map[string]interface{}) (interface{}, error) {
 				turn["raw_unavailable"] = true
 				unreadableTurns++
 			}
+		}
+
+		// failed_tools names the calls of this turn whose result reported a
+		// failure (#83). Set only when there are some: an empty array on
+		// every turn would make "this turn broke nothing" and "nothing is
+		// known about this turn" the same shape, and the second is a real
+		// state — a call nothing answered stores NULL, not 0.
+		//
+		// Outside the raw_unavailable branch deliberately. It comes from the
+		// stored column, so it is just as good on a turn whose raw_json is
+		// unreadable, which is where it is worth the most.
+		if names := failedTools[t.ID]; len(names) > 0 {
+			turn["failed_tools"] = names
 		}
 
 		compactTurns = append(compactTurns, turn)

@@ -328,6 +328,26 @@ func (s *Searcher) buildQuery(q *Query, limit int, periods []string) (string, []
 		conditions = append(conditions, "s.has_subagent = 1")
 	}
 
+	// has:toolerror — this turn issued a call whose result reported a failure
+	// (#83). Per call, which is the granularity the flag exists for:
+	// s.has_error above returns every turn of a session that broke something
+	// somewhere, and a reader asking what broke wants the turn it broke in.
+	//
+	// An EXISTS rather than a join, for two reasons. A join on turn_id would
+	// multiply a turn that made several failing calls into several result rows
+	// — the SELECT DISTINCT above would collapse them again, but only after
+	// sorting them — and a correlated EXISTS composes with the tool: and file:
+	// joins already attached to this query without any of them having to know
+	// about the others.
+	//
+	// Seeks idx_tool_uses_is_error, which is partial on is_error = 1 and
+	// carries turn_id, so the predicate is answered out of 10,909 index
+	// entries rather than by looking at 279,383 rows.
+	if q.HasToolError {
+		conditions = append(conditions,
+			"EXISTS (SELECT 1 FROM tool_uses etu WHERE etu.turn_id = t.id AND etu.is_error = 1)")
+	}
+
 	// Source filter
 	if q.Source != "" {
 		conditions = append(conditions, fmt.Sprintf("s.source = $%d", argNum))

@@ -155,6 +155,29 @@ type ToolUse struct {
 	// reads this instead of re-deriving the classification from tool_name and
 	// ResultLength.
 	ResultOmittedReason string `json:"result_omitted_reason,omitempty"`
+
+	// IsError reports whether the result said the call failed. Three states,
+	// all of them real (#83):
+	//
+	//   nil    nothing is known. Either no result ever answered the call, or
+	//          the source records no error flag at all — codex's
+	//          function_call_output and jeff's tool_result both carry the
+	//          output and nothing about its success.
+	//   false  a result arrived and did not report a failure. Claude Code
+	//          writes is_error: false on 44,533 of the author's result blocks
+	//          and omits the key on 217,581 more; both mean the same thing.
+	//   true   the result reported a failure. 10,909 of them in the author's
+	//          archive, whose text was already stored by #28 but only
+	//          findable by guessing at the wording.
+	//
+	// A pointer rather than the HasResult/ResultLength pair above, because
+	// that pair exists only to give an int a nil it does not have. A bool does
+	// have one, and a second gating field would encode three states in four.
+	//
+	// Not derivable from ResultContent: a tool that fails having printed
+	// nothing, and a Read whose body the policy omits, both leave no text to
+	// read a failure out of. The flag is the only thing those rows carry.
+	IsError *bool `json:"is_error,omitempty"`
 }
 
 // RawTurn represents the raw JSONL entry from Claude Code
