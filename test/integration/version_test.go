@@ -4,6 +4,7 @@
 package integration
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -184,18 +185,68 @@ func gitOutput(t *testing.T, args ...string) string {
 // dirtyTheTree adds an untracked file to the repository for the duration of
 // the test. The name is deliberately not covered by .gitignore, since an
 // ignored file would leave `git status` clean and prove nothing.
+//
+// The name has no extension and says what it is, because the probe only has
+// to be invisible to one gitignore to break the test. The first version used
+// a ".tmp" suffix, which the repository ignores nothing about but the
+// author's global config does -- so it passed in CI, where hosted runners
+// have no global gitignore, and failed on the machine. Green in CI and red
+// locally is the worst direction for a failure: it teaches people to
+// distrust their own test runs.
+//
+// Nearly every pattern a global gitignore carries is an extension glob
+// (*.tmp, *.log, *.bak, *.swp, *~), a directory, or a dotfile, so an
+// extension-free name at the repository root survives all of them. That is
+// an argument about likelihood though, not a guarantee, so the assumption is
+// checked rather than trusted.
 func dirtyTheTree(t *testing.T) {
 	t.Helper()
 
-	probe := filepath.Join(repoRoot(t), "makefile-dirty-probe.tmp")
+	probe := filepath.Join(repoRoot(t), "makefile-dirty-probe-do-not-ignore")
+
+	// Ask git rather than guess. check-ignore answers from every source that
+	// applies -- the repository's .gitignore, .git/info/exclude and the
+	// user's core.excludesFile -- so a future pattern that would swallow the
+	// probe is reported by name instead of surfacing as a confusing failure.
+	if rule := gitIgnoreRule(t, probe); rule != "" {
+		t.Skipf("probe %s is covered by a gitignore rule and cannot dirty the tree: %s", probe, rule)
+	}
+
 	if err := os.WriteFile(probe, []byte("probe\n"), 0o644); err != nil {
 		t.Fatalf("write %s: %v", probe, err)
 	}
 	t.Cleanup(func() { _ = os.Remove(probe) })
 
+	// The probe is only useful if the real `git status --porcelain` -- the
+	// command the Makefile runs -- reports it. Checked so the test can never
+	// pass vacuously against a tree git still considers clean.
 	if gitOutput(t, "status", "--porcelain") == "" {
-		t.Fatalf("%s did not make the tree dirty; is it covered by .gitignore?", probe)
+		t.Fatalf("%s did not register as a change, so there is no dirty tree to test against", probe)
 	}
+}
+
+// gitIgnoreRule returns the gitignore rule covering path, as
+// "<source>:<line>:<pattern>", or "" when nothing ignores it.
+func gitIgnoreRule(t *testing.T, path string) string {
+	t.Helper()
+
+	//nolint:gosec // G204: path is the probe this harness built from repoRoot
+	cmd := exec.Command("git", "check-ignore", "-v", path)
+	cmd.Dir = repoRoot(t)
+	out, err := cmd.Output()
+	if err == nil {
+		// Exit 0: the path is ignored, and stdout names the rule.
+		return strings.TrimSpace(string(out))
+	}
+
+	// Exit 1 is the answer "not ignored", not a failure. Anything else means
+	// git could not answer, and a guess is worse than saying so.
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return ""
+	}
+	t.Skipf("git check-ignore could not answer for %s: %v", path, err)
+	return ""
 }
 
 // TestMakeBuild_CommitStampAdmitsADirtyTree pins the halves of the version
