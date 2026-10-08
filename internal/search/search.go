@@ -190,12 +190,24 @@ func (s *Searcher) buildQuery(q *Query, limit int, periods []string) (string, []
 		argNum++
 		payloadMatchArg := argNum
 		argNum++
+		// The payload branch joins back to turns on the turn's full identity,
+		// (session_id, id), not on its uuid alone. A resumed transcript copies
+		// the earlier session's lines verbatim, uuids included, so since
+		// migration 012 one uuid can name a turn in each of two sessions. On
+		// the uuid alone this join yields both copies for a call that belongs
+		// to one of them, and the UNION cannot collapse that away — the two
+		// rowids are genuinely different rows — so a search for a command only
+		// one session ran came back with the other session's turn as well, a
+		// hit whose session does not contain the query anywhere.
+		//
+		// Both halves of the pair are index-leading — turns' primary key is
+		// (session_id, id) — so the join is the same seek it was.
 		prefix = fmt.Sprintf(`text_hits AS (
 			SELECT rowid AS turn_rowid FROM turns_fts WHERE turns_fts MATCH $%d
 			UNION
 			SELECT ht.rowid FROM tool_uses_fts
 			JOIN tool_uses htu ON htu.id = tool_uses_fts.rowid
-			JOIN turns ht ON ht.id = htu.turn_id
+			JOIN turns ht ON ht.id = htu.turn_id AND ht.session_id = htu.session_id
 			WHERE tool_uses_fts MATCH $%d
 		)`, turnsMatchArg, payloadMatchArg)
 		args = append(args,
@@ -401,7 +413,12 @@ func (s *Searcher) buildQuery(q *Query, limit int, periods []string) (string, []
 	// it has no row estimate for an fts5 MATCH that would tell it a seek on
 	// the index on tool_uses.turn_id is the cheaper end to start from.
 	// (That index is idx_tool_uses_turn_ordinal since migration 011, which
-	// keys the table on (turn_id, turn_ordinal) and leads with turn_id.)
+	// keys the table on (turn_id, session_id, turn_ordinal) and leads with
+	// turn_id. Migration 012 added session_id to it, because a turn's identity
+	// is (session_id, id) and one uuid can name a turn in each of two sessions
+	// — which is also why both subqueries below match on the session as well,
+	// so a turn is attributed its own session's call rather than the other
+	// copy's. Both columns are index-leading, so the seek narrows.)
 	//
 	// Which makes that index a hard dependency of this shape rather than an
 	// optimisation of it. Pinning the order without an index to seek turns the
@@ -413,10 +430,12 @@ func (s *Searcher) buildQuery(q *Query, limit int, periods []string) (string, []
 		SELECT page.*,
 			(SELECT mtu.tool_name FROM tool_uses mtu
 			 CROSS JOIN tool_uses_fts ON tool_uses_fts.rowid = mtu.id
-			 WHERE mtu.turn_id = page.id AND tool_uses_fts MATCH $%d LIMIT 1),
+			 WHERE mtu.turn_id = page.id AND mtu.session_id = page.session_id
+			   AND tool_uses_fts MATCH $%d LIMIT 1),
 			(SELECT snippet(tool_uses_fts, -1, '', '', '…', 24) FROM tool_uses mtu
 			 CROSS JOIN tool_uses_fts ON tool_uses_fts.rowid = mtu.id
-			 WHERE mtu.turn_id = page.id AND tool_uses_fts MATCH $%d LIMIT 1)
+			 WHERE mtu.turn_id = page.id AND mtu.session_id = page.session_id
+			   AND tool_uses_fts MATCH $%d LIMIT 1)
 		FROM page
 		ORDER BY page.timestamp DESC, page.id ASC`,
 		prefix, baseQuery, snippetMatchArg, snippetMatchArg), args
