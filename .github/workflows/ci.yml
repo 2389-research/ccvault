@@ -90,9 +90,16 @@ jobs:
         with:
           # Must match mise.toml's golangci-lint pin, or a developer and CI
           # lint with different rule sets and disagree in both directions.
-          # v2.7.2 was the old pin: its gosec reports G602 on bounds it cannot
-          # prove, and it panics outright on this tree now that a dependency
-          # declares go1.26 (its go/types is from go1.25).
+          #
+          # This pin is coupled to the Go toolchain, so it moves when go.mod's
+          # Go version does. golangci-lint type-checks with the go/types
+          # vendored into the version you run, and that copy refuses any file
+          # requiring a newer Go than it was built with. The old v2.7.2 pin is
+          # built with go1.25, so it panics outright on a toolchain where a
+          # dependency declares go1.26 -- it survived here only because the
+          # runner's Go happened to match it, while contributors on current Go
+          # could not lint at all. It also reported gosec G602 on bounds it
+          # could not prove, which cost a round-trip on #118.
           version: v2.11.4
           args: --timeout=10m
           verify: false
