@@ -70,6 +70,13 @@ type ParsedToolUse struct {
 	ResultContent       string
 	ResultLength        int
 	ResultOmittedReason string
+
+	// IsError is the tri-state failure flag — see models.ToolUse.IsError. A
+	// source whose transcripts carry no error flag leaves it nil, which is why
+	// it is not folded into HasResult: codex and jeff record a result and say
+	// nothing about whether it failed, and false would assert success they
+	// never claimed.
+	IsError *bool
 }
 
 // SourceAdapter is the interface that all conversation source backends must implement.

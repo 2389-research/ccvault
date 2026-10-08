@@ -134,6 +134,12 @@ CREATE TABLE IF NOT EXISTS tool_uses (
     result_content TEXT,
     result_length INTEGER,
     result_omitted_reason TEXT,
+    -- Whether the result answering this call reported a failure: 1 it did, 0 it
+    -- did not, NULL nothing is known — no result arrived, or the source records
+    -- no error flag at all (codex and jeff record neither). The same
+    -- NULL-means-unanswered convention as result_length above. Per-call, where
+    -- sessions.has_error is per-session. See migration 013 and #83.
+    is_error INTEGER,
     -- This call's position within the turn that issued it, from 0. Half of the
     -- table's key: see idx_tool_uses_turn_ordinal below and migration 011.
     turn_ordinal INTEGER NOT NULL DEFAULT 0,
@@ -187,6 +193,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_uses_turn_ordinal
 -- silently deleting the conflicting row.
 CREATE INDEX IF NOT EXISTS idx_tool_uses_tool_use_id ON tool_uses(tool_use_id)
     WHERE tool_use_id IS NOT NULL;
+
+-- The failed calls, and only those: 10,909 rows out of 279,383 on the author's
+-- archive, so a full index on is_error would carry the other 96% for nothing.
+-- Carries session_id and turn_id because every reader of it asks the same
+-- follow-up — GetFailedToolCalls scopes by session, search asks whether a turn
+-- holds a failed call — and neither has to seek back into the table.
+CREATE INDEX IF NOT EXISTS idx_tool_uses_is_error
+    ON tool_uses(session_id, turn_id)
+    WHERE is_error = 1;
 
 -- Full-text search virtual table.
 --

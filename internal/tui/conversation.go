@@ -39,6 +39,19 @@ type ConversationModel struct {
 	mdWrapWidth int
 	statusMsg   string
 	statusClear time.Time
+
+	// failedCalls holds the provider ids of this session's calls whose result
+	// reported a failure, from tool_uses.is_error (#83). Keyed on the id
+	// because that is what the rendered tool_use block carries: the view draws
+	// the call out of the turn's raw_json, so the id is the only thing the two
+	// have in common.
+	//
+	// A call whose source minted no id — jeff leaves it empty on 633 of 742 —
+	// simply goes unmarked. Marking by position instead would risk putting the
+	// mark on the wrong call of a turn that made fifteen, and a wrong mark is
+	// worse than a missing one: it sends a reader looking for a failure that
+	// is somewhere else.
+	failedCalls map[string]bool
 }
 
 // NewConversationModel creates a new conversation model
@@ -115,12 +128,28 @@ func (m *ConversationModel) loadConversation() tea.Msg {
 		return ErrorMsg{Err: err}
 	}
 
-	return conversationLoadedMsg{session: session, turns: turns}
+	// Which of this session's calls failed, read once here rather than per
+	// rendered block. One indexed query against idx_tool_uses_is_error, in the
+	// same command that already fetches the turns, so opening a conversation
+	// still costs one round of loading.
+	failures, err := m.db.GetFailedToolCalls(m.sessionID)
+	if err != nil {
+		return ErrorMsg{Err: err}
+	}
+	failed := make(map[string]bool, len(failures))
+	for _, f := range failures {
+		if f.ToolUseID != "" {
+			failed[f.ToolUseID] = true
+		}
+	}
+
+	return conversationLoadedMsg{session: session, turns: turns, failedCalls: failed}
 }
 
 type conversationLoadedMsg struct {
-	session *models.Session
-	turns   []models.Turn
+	session     *models.Session
+	turns       []models.Turn
+	failedCalls map[string]bool
 }
 
 type exportCompleteMsg struct {
@@ -231,6 +260,7 @@ func (m *ConversationModel) Update(msg tea.Msg) tea.Cmd {
 	case conversationLoadedMsg:
 		m.session = msg.session
 		m.turns = msg.turns
+		m.failedCalls = msg.failedCalls
 		m.loading = false
 		m.initViewport()
 		return nil
@@ -444,6 +474,10 @@ func (m *ConversationModel) renderAssistantContent(t models.Turn) string {
 				Thinking string          `json:"thinking,omitempty"`
 				Name     string          `json:"name,omitempty"`
 				Input    json.RawMessage `json:"input,omitempty"`
+				// ID is the provider's tool_use id, read so a block can be
+				// matched against the failed calls loaded from tool_uses.
+				// Absent on every other block type, which is harmless.
+				ID string `json:"id,omitempty"`
 			} `json:"content"`
 		} `json:"message"`
 	}
@@ -476,7 +510,7 @@ func (m *ConversationModel) renderAssistantContent(t models.Turn) string {
 				parts = append(parts, thinkingStyle.Render("💭 "+wrapText(thinking, m.width-6)))
 			}
 		case "tool_use":
-			toolBlock := m.formatToolUseBlock(c.Name, c.Input)
+			toolBlock := m.formatToolUseBlock(c.Name, c.Input, m.failedCalls[c.ID])
 			parts = append(parts, toolBlock)
 		}
 	}
@@ -484,11 +518,25 @@ func (m *ConversationModel) renderAssistantContent(t models.Turn) string {
 	return strings.Join(parts, "\n")
 }
 
-// formatToolUseBlock formats a tool use with input details
-func (m *ConversationModel) formatToolUseBlock(toolName string, input json.RawMessage) string {
+// failedCallMarker is what a failed call is labelled with. Text rather than
+// colour alone: the view is read over SSH, piped, and copied to the clipboard,
+// and a mark that survives none of those is not a mark.
+const failedCallMarker = "✗ FAILED"
+
+// formatToolUseBlock formats a tool use with input details, labelling it when
+// the call's result reported a failure (#83).
+//
+// The label goes on the call's own header line, not on the turn, because one
+// assistant turn renders every call it made into one block — a turn-level mark
+// would point a reader at whichever call they noticed first.
+func (m *ConversationModel) formatToolUseBlock(toolName string, input json.RawMessage, failed bool) string {
 	var b strings.Builder
 
 	b.WriteString(toolStyle.Render(fmt.Sprintf("🔧 %s", toolName)))
+	if failed {
+		b.WriteString(" ")
+		b.WriteString(errorStyle.Render(failedCallMarker))
+	}
 	b.WriteString("\n")
 
 	if len(input) == 0 {

@@ -762,6 +762,11 @@ Supports Gmail-like query syntax:
   tool:Bash        Sessions using specific tool
   before:date      Before date, excluding that date itself
   after:date       From the start of date, including that date
+  has:error        Sessions flagged as holding a tool failure
+  has:toolerror    Turns whose own tool call failed — per call, not per
+                   session, so this lands on what broke rather than on the
+                   conversation it broke in
+  has:subagent     Sessions that dispatched a subagent
   "exact phrase"   Exact match
 
 Both date bounds land on midnight starting the day they name, so

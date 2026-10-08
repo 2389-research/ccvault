@@ -560,8 +560,8 @@ func (db *DB) InsertToolUsesTx(tx *sql.Tx, toolUses []models.ToolUse) error {
 	stmt, err := tx.Prepare(`
 		INSERT INTO tool_uses (turn_id, session_id, tool_name, file_path, timestamp,
 			tool_use_id, input_json, input_length,
-			result_content, result_length, result_omitted_reason, turn_ordinal)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+			result_content, result_length, result_omitted_reason, is_error, turn_ordinal)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return fmt.Errorf("prepare insert tool_uses: %w", err)
 	}
@@ -587,7 +587,7 @@ func (db *DB) InsertToolUsesTx(tx *sql.Tx, toolUses []models.ToolUse) error {
 		_, err := stmt.Exec(tu.TurnID, tu.SessionID, tu.ToolName, tu.FilePath, tu.Timestamp,
 			nullIfEmpty(tu.ToolUseID), nullIfEmpty(tu.InputJSON), nullIfZero(tu.InputLength),
 			nullIfEmpty(tu.ResultContent), resultLengthValue(tu), nullIfEmpty(tu.ResultOmittedReason),
-			ordinal)
+			isErrorValue(tu), ordinal)
 		if err != nil {
 			return fmt.Errorf("insert tool_use: %w", err)
 		}
@@ -623,6 +623,24 @@ func resultLengthValue(tu models.ToolUse) any {
 		return nil
 	}
 	return tu.ResultLength
+}
+
+// isErrorValue encodes the tri-state failure flag (#83). NULL means nothing is
+// known — no result answered the call, or the source records no error flag at
+// all — and 0 means a result arrived and did not report a failure.
+//
+// Gated on the pointer rather than on HasResult, which would be the obvious
+// reuse and would be wrong: codex and jeff record a result and say nothing
+// about whether it failed, so HasResult is true there with nothing to report.
+// A 0 for those rows would be an assertion of success no transcript makes.
+func isErrorValue(tu models.ToolUse) any {
+	if tu.IsError == nil {
+		return nil
+	}
+	if *tu.IsError {
+		return 1
+	}
+	return 0
 }
 
 // DeleteToolUsesForSession removes tool uses for a session

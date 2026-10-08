@@ -5,8 +5,8 @@
 | Tool | Required Params | Optional Params | Returns | Notes |
 |------|----------------|-----------------|---------|-------|
 | `search_conversations` | `query` (string) | `limit` (number, default 10, max 50), `offset` (number) | Paginated results with 200-char snippets | Check `has_more` / `next_offset` for pagination. Each result carries `project_name` (the adapter-provided label, or the path basename as fallback) alongside `project_path`. An empty result for a `tool:` query adds `similar_tool_names` with close matches; both that lookup and the project-name enrichment are enrichment queries — if one fails, its field is omitted and a `warnings` entry (`similar_tool_names unavailable: …` / `project enrichment unavailable: …`) appears instead. Search is **never** filtered by the subagent listing default, so a hit can sit in a transcript `list_sessions` does not show: each result carries `parent_session_id` (null when the hit is in a top-level session). A query also matches **stored tool inputs and results**, not only turn text — so a command you ran or an error a tool printed is findable. Such a hit carries `matched_tool_name` (the tool whose payload matched; null when the match was in the turn's own content) and its `snippet` is drawn from that payload rather than from the conversation |
-| `get_session_summary` | `session_id` (string) | — | Metadata, turn counts by type, top 10 tools used, first/last user messages (500 chars each) | Most cost-effective entry point for any session. `tools_used` is counted out of each assistant turn's `raw_json`; turns that could not be read contribute nothing, so when `unreadable_turns` is present the count is an undercount and a `tools_used incomplete: …` entry appears in `warnings[]`. An empty `tools_used` on such a session is not evidence the session called no tools |
-| `get_turns` | `session_id` (string) | `offset` (number, default 0), `limit` (number, default 20, max 50), `type` (user/assistant/tool_result) | Paginated turns, content truncated at 1000 chars | Includes tool names; `has_thinking` flag on assistant turns. Both are read out of the turn's `raw_json` and are **best-effort per turn**: a turn whose `raw_json` could not be read carries `raw_unavailable: true` and omits `tools` and `has_thinking`, so absence there means "could not tell", not "called no tools". The page reports `unreadable_turns` (a count, present only when nonzero) plus one `turn enrichment unavailable: …` entry in `warnings[]` — one for the whole page, not one per turn. Accepts a subagent session id with no extra parameter |
+| `get_session_summary` | `session_id` (string) | — | Metadata, turn counts by type, top 10 tools used, first/last user messages (500 chars each) | Most cost-effective entry point for any session. `tools_used` is counted out of each assistant turn's `raw_json`; turns that could not be read contribute nothing, so when `unreadable_turns` is present the count is an undercount and a `tools_used incomplete: …` entry appears in `warnings[]`. An empty `tools_used` on such a session is not evidence the session called no tools. `failed_tool_calls` (a count) and `failed_tools` (per-tool, same shape as `tools_used`) report the calls whose result said they failed; both come from the stored `is_error` column rather than `raw_json`, so they stay correct on a session whose `tools_used` is incomplete, and both are **absent** when nothing failed |
+| `get_turns` | `session_id` (string) | `offset` (number, default 0), `limit` (number, default 20, max 50), `type` (user/assistant/tool_result) | Paginated turns, content truncated at 1000 chars | Includes tool names; `has_thinking` flag on assistant turns. Both are read out of the turn's `raw_json` and are **best-effort per turn**: a turn whose `raw_json` could not be read carries `raw_unavailable: true` and omits `tools` and `has_thinking`, so absence there means "could not tell", not "called no tools". The page reports `unreadable_turns` (a count, present only when nonzero) plus one `turn enrichment unavailable: …` entry in `warnings[]` — one for the whole page, not one per turn. A turn that issued a call whose result said it failed also carries `failed_tools` with that call's tool name. That one is read from the stored `is_error` column, not from `raw_json`, so it is present even on a `raw_unavailable` turn — and it is absent rather than empty when nothing failed. Accepts a subagent session id with no extra parameter |
 | `get_session` | `session_id` (string) | — | Full session as markdown | Sessions over 100 turns come back without `markdown`: the response carries `session_id`, `turn_count`, `hint`, and a `markdown unavailable: large session with N turns...` entry in the top-level `warnings[]` array — there is no singular `warning` field. Markdown truncates at 50K chars. Prefer summary + turns for large sessions |
 | `list_sessions` | — | `project` (string, partial match), `limit` (number, default 20, max 100), `offset` (number, default 0), `include_subagents` (bool, default false), `subagents_of` (string, a session id) | Recent **top-level** sessions sorted by date desc, OR an `ambiguous_project_filter` object when the `project` filter matches multiple projects | Partial match on path or display name; returns error (not empty) if no project matches; when the filter matches N>1 projects, returns `{ambiguous_project_filter: true, filter, matched_projects: [{name, path}], hint}` instead of sessions — the agent then re-calls with a more specific filter (typically a full path). Paginates like `search_conversations`: check `has_more` / `next_offset`. Session objects include both `project_path` and `project_name` — the adapter-provided label if any, or the basename fallback — plus `parent_session_id` (null for top-level) and `subagent_count`, always, filtered or not. Subagent sessions are hidden by default; `include_subagents: true` flattens them in, `subagents_of: "<id>"` returns just one session's children. |
 | `list_projects` | — | `sort` (name/activity/tokens/sessions, default: activity), `limit` (number, default 50, max 100), `offset` (number, default 0) | Projects with session counts and token usage | Use to discover project names before searching; paginates like `search_conversations` — check `has_more` / `next_offset`. Each project object carries both `name` (the adapter-provided label) and `path` (the disambiguating identifier) — always prefer `path` when uniqueness matters. Sort order includes `path ASC` as tiebreaker so pagination stays stable. |
@@ -32,7 +32,8 @@ Pagination is uniform across `search_conversations`, `get_turns`, `list_sessions
 | File | `file:path` | `file:auth.py` | Matches file paths mentioned in session |
 | Before | `before:DATE` | `before:2026-02-01` | **Exclusive** of `DATE` — stops at midnight starting it. To include a day, name the day after. See date formats below |
 | After | `after:DATE` | `after:thisweek` | **Inclusive** of `DATE` — starts at midnight starting it. See date formats below |
-| Has error | `has:error` | `has:error` | Filters to sessions flagged with tool errors during sync |
+| Has error | `has:error` | `has:error` | Filters to **sessions** flagged with tool errors during sync |
+| Has tool error | `has:toolerror` | `has:toolerror` | Filters to the **turns whose own tool call failed** — per call, from `tool_uses.is_error`. This is the one to reach for when asking what broke: `has:error` returns every turn of a conversation that broke something somewhere, this returns the turn it broke in. `has:tool-error` and `has:tool_error` also accepted |
 | Has subagent | `has:subagent` | `has:agent` | Filters to sessions using Task (subagent) tool — `has:subagent` and `has:agent` both accepted |
 | Exact phrase | `"phrase"` | `"deploy script"` | Quoted exact phrase matching |
 | Free text | `terms` | `authentication bug` | FTS5 full-text search on unquoted terms |
@@ -99,6 +100,12 @@ after:2026-01-01 before:2026-02-01 project:myapp
 # Find sessions with tool errors
 has:error project:myapp
 
+# Find the calls that actually failed, and what they were doing
+has:toolerror project:myapp after:week
+
+# "What broke when I was working on the deploy, and what did I do about it"
+has:toolerror deploy
+
 # Find sessions using subagents
 has:subagent after:thisweek
 
@@ -133,6 +140,40 @@ anything. What is omitted is omitted completely and says so:
 `result_content` present) is distinguishable from an omitted one without
 guessing. `result_length IS NULL` is a third thing again: nothing ever
 answered that call.
+
+### Which calls failed
+
+`tool_uses.is_error` says whether the result reported a failure, with the same
+three states `result_length` uses:
+
+| `is_error` | Means |
+|---|---|
+| `1` | The result reported a failure. 10,909 of them in the author's archive |
+| `0` | A result arrived and did not report a failure |
+| `NULL` | Nothing is known: no result arrived, **or** the source records no error flag at all |
+
+The flag is not derivable from `result_content`. A tool that fails having
+printed nothing leaves no text to read a failure out of, and a failing
+`Read` has its body omitted by the storage policy entirely — which is why
+`is_error` is stored rather than inferred.
+
+**Which sources it covers.** claude-code and nanoclaw write an `is_error` flag
+on their `tool_result` blocks, and those are the rows that carry a `0` or a
+`1`. codex (`function_call_output`) and jeff (`tool_result`) record the output
+and nothing about whether it failed, so their rows stay `NULL` — "no flag
+recorded" rather than a `0` asserting a success the transcript never claimed.
+hex records no tool calls at all.
+
+**What the backfill could not reach.** Migration 013 reads `turns.raw_json`,
+and 216,978 turns hold `raw_json` that does not parse (#101) — 1,808 of them
+carrying the text `"is_error":true`. Those calls stay `NULL`. On the author's
+archive the migration recovered 10,909 failures and that gap is the roughly
+14% it could not; closing it means fixing the ingestion, after which a re-sync
+fills those rows through the write path.
+
+`has:toolerror` in the search syntax above is this column. `sessions.has_error`
+is the same question at session scope and the two are checked not to disagree:
+no session holding an `is_error = 1` call is left unflagged.
 
 ## 7. Subagent Sessions
 

@@ -30,6 +30,7 @@ func ParsedToolUseFromModel(tu models.ToolUse) ParsedToolUse {
 		ResultContent:       tu.ResultContent,
 		ResultLength:        tu.ResultLength,
 		ResultOmittedReason: tu.ResultOmittedReason,
+		IsError:             tu.IsError,
 	}
 }
 
@@ -50,5 +51,6 @@ func ToolUseFromParsed(p ParsedToolUse, turnID, sessionID string, timestamp time
 		ResultContent:       p.ResultContent,
 		ResultLength:        p.ResultLength,
 		ResultOmittedReason: p.ResultOmittedReason,
+		IsError:             p.IsError,
 	}
 }
