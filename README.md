@@ -37,15 +37,33 @@ Make sure `$GOPATH/bin` (or `$HOME/go/bin`) is in your `PATH`.
 ```bash
 git clone https://github.com/2389-research/ccvault.git
 cd ccvault
-go build -o ccvault ./cmd/ccvault
+make build
 sudo mv ccvault /usr/local/bin/
 ```
+
+`make build` writes `./ccvault` and stamps it with the version, commit and
+build date from your checkout. A plain `go build ./cmd/ccvault` works too, but
+the binary then reports its version as `dev`.
 
 ### Verify installation
 
 ```bash
 ccvault version
 ```
+
+Which prints the version, the commit it was built from, and when:
+
+```
+ccvault 0.3.0
+commit: 8a3df3533c167834ae79fddc557f0268610604bd
+built:  2026-10-08T12:34:56Z
+```
+
+The first line is always `ccvault <version>`, so a script can read the version
+off it. An unstamped source-tree build reports `dev` with the commit Go embeds
+from the tree, while one installed with `go install <module>@<version>` reports
+that module version. A fact the binary does not carry reads `unknown` rather
+than being guessed at.
 
 ## Quick Start
 

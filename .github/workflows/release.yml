@@ -1,3 +1,5 @@
+# ABOUTME: GitHub Actions release workflow for ccvault, triggered by a v* tag
+# ABOUTME: Builds macOS artifacts with GoReleaser and the Linux binary directly
 name: Release
 
 on:
@@ -8,6 +10,14 @@ on:
 permissions:
   contents: write
   packages: write
+
+# GOTOOLCHAIN=local, for the same reason CI sets it: setup-go below installs
+# the version go.mod names, and left unset the toolchain would quietly
+# download and use a different one if that install ever came up short. A
+# release artifact built by a compiler nobody chose, and that CI never ran
+# against, is worse than a tag that fails loudly and gets re-cut.
+env:
+  GOTOOLCHAIN: local
 
 jobs:
   release-darwin:

@@ -4,7 +4,27 @@
 .PHONY: build test test-race test-short test-coverage clean install lint release
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
-LDFLAGS := -ldflags "-X main.version=$(VERSION)"
+
+# "+dirty" when the tree has changes, empty otherwise, and empty outside a
+# repository. Resolved to the literal suffix in the shell rather than to a
+# file list, so no filename ever reaches a make variable.
+#
+# This is the notion of dirty Go's own build info uses for vcs.modified --
+# `git status --porcelain`, untracked files included -- so the commit line
+# reads the same whether the stamp came from here or from the ReadBuildInfo
+# fallback. VERSION above is tracked-only, because that is what upstream
+# `git describe --dirty` does and it is not worth reimplementing.
+GIT_DIRTY := $(shell test -z "$$(git status --porcelain 2>/dev/null)" || echo '+dirty')
+
+# Part of the value, not appended in LDFLAGS: a caller passing COMMIT in gets
+# it stamped verbatim, with no second suffix glued on.
+COMMIT ?= $(shell git rev-parse HEAD 2>/dev/null)$(GIT_DIRTY)
+DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# All three stamps, so `make build` rehearses what the release pipeline does
+# and a broken -X shows up here rather than at tag time. A build with no
+# stamps still reports honestly -- see cmd/ccvault/version.go.
+LDFLAGS := -ldflags "-X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.date=$(DATE)"
 
 build:
 	go build $(LDFLAGS) -o ccvault ./cmd/ccvault
