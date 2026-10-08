@@ -1581,7 +1581,7 @@ Debug mode: Set CCVAULT_MCP_DEBUG=1 for verbose logging to stderr.`,
 		}
 		defer func() { _ = database.Close() }()
 
-		server, err := mcp.NewServer(database, cfg)
+		server, err := mcp.NewServer(database, cfg, currentBuild())
 		if err != nil {
 			return fmt.Errorf("create server: %w", err)
 		}
