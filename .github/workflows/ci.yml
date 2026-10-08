@@ -123,8 +123,38 @@ jobs:
           version: v2.18.2
           install-only: true
 
+      # `goreleaser check` exits non-zero for a deprecated key just as it does
+      # for an invalid one, and .goreleaser.yml still uses `brews` on purpose
+      # (see the comment there, and 2389-research/homebrew-tap#1). So that one
+      # deprecation is tolerated and everything else fails.
+      #
+      # Fail-closed by construction: the job passes only when `check` exits 0,
+      # or when it fails with the deprecation-only message AND every DEPRECATED
+      # line names `brews`. An invalid key, a second deprecation, upstream
+      # removing `brews` outright, or goreleaser rewording its own output all
+      # fail the job rather than passing quietly. That last case is the point --
+      # it means the removal lands on a PR instead of on a tag.
       - name: Check .goreleaser.yml
-        run: goreleaser check
+        run: |
+          status=0
+          output=$(goreleaser check 2>&1) || status=$?
+          printf '%s\n' "$output"
+
+          if [ "$status" -eq 0 ]; then
+            exit 0
+          fi
+
+          if ! printf '%s\n' "$output" | grep -qF 'configuration is valid, but uses deprecated properties'; then
+            echo "::error::goreleaser check failed for a reason other than a deprecated key."
+            exit "$status"
+          fi
+
+          if printf '%s\n' "$output" | grep -F 'DEPRECATED:' | grep -qvF ' brews '; then
+            echo "::error::goreleaser check reports a deprecation other than the known 'brews' one."
+            exit "$status"
+          fi
+
+          echo "::notice::Only the known 'brews' deprecation, tracked in 2389-research/homebrew-tap#1."
 
   build:
     name: Build
