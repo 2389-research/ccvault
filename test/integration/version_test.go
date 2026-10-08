@@ -4,8 +4,10 @@
 package integration
 
 import (
+	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -135,4 +137,104 @@ func isHexRevision(s string) bool {
 	return strings.IndexFunc(s, func(r rune) bool {
 		return !strings.ContainsRune("0123456789abcdef", r)
 	}) == -1
+}
+
+var commitStampPattern = regexp.MustCompile(`-X main\.commit=(\S+)`)
+
+// makeCommitStamp reads the commit the Makefile would stamp, by asking make
+// to print the build command rather than run it. Nothing is compiled and no
+// binary is written, so this stays fast and leaves the tree alone.
+func makeCommitStamp(t *testing.T, makeArgs ...string) string {
+	t.Helper()
+
+	if _, err := exec.LookPath("make"); err != nil {
+		t.Skipf("make unavailable: %v", err)
+	}
+
+	args := append([]string{"-n", "build"}, makeArgs...)
+	//nolint:gosec // G204: args are literals from this test
+	cmd := exec.Command("make", args...)
+	cmd.Dir = repoRoot(t)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("make %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+
+	match := commitStampPattern.FindStringSubmatch(string(out))
+	if match == nil {
+		t.Fatalf("make %s printed no -X main.commit stamp:\n%s", strings.Join(args, " "), out)
+	}
+	return match[1]
+}
+
+// gitOutput runs a git command in the repository the Makefile builds from.
+func gitOutput(t *testing.T, args ...string) string {
+	t.Helper()
+
+	//nolint:gosec // G204: args are literals from this test
+	cmd := exec.Command("git", args...)
+	cmd.Dir = repoRoot(t)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Skipf("git %s unavailable: %v", strings.Join(args, " "), err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// dirtyTheTree adds an untracked file to the repository for the duration of
+// the test. The name is deliberately not covered by .gitignore, since an
+// ignored file would leave `git status` clean and prove nothing.
+func dirtyTheTree(t *testing.T) {
+	t.Helper()
+
+	probe := filepath.Join(repoRoot(t), "makefile-dirty-probe.tmp")
+	if err := os.WriteFile(probe, []byte("probe\n"), 0o644); err != nil {
+		t.Fatalf("write %s: %v", probe, err)
+	}
+	t.Cleanup(func() { _ = os.Remove(probe) })
+
+	if gitOutput(t, "status", "--porcelain") == "" {
+		t.Fatalf("%s did not make the tree dirty; is it covered by .gitignore?", probe)
+	}
+}
+
+// TestMakeBuild_CommitStampAdmitsADirtyTree pins the halves of the version
+// output agreeing with each other. VERSION comes from `git describe --dirty`
+// and says so when the tree has changes; the commit stamp said nothing, so
+// one `ccvault version` gave two answers -- a version admitting it was dirty
+// beside a commit claiming to be clean.
+//
+// It mattered more here than it would elsewhere: resolveBuild gives an
+// ldflags stamp priority over the ReadBuildInfo fallback, and that fallback
+// does append "+dirty". Without this, `make build` was strictly less honest
+// than a plain `go build`, which is backwards.
+func TestMakeBuild_CommitStampAdmitsADirtyTree(t *testing.T) {
+	head := gitOutput(t, "rev-parse", "HEAD")
+
+	// Only assert the clean case when the tree actually is clean; a
+	// developer running this mid-edit should not see a spurious failure.
+	if gitOutput(t, "status", "--porcelain") == "" {
+		if got := makeCommitStamp(t); got != head {
+			t.Errorf("clean tree stamped commit %q, want bare HEAD %q", got, head)
+		}
+	}
+
+	dirtyTheTree(t)
+
+	if got := makeCommitStamp(t); got != head+"+dirty" {
+		t.Errorf("dirty tree stamped commit %q, want %q", got, head+"+dirty")
+	}
+}
+
+// TestMakeBuild_ExplicitCommitIsStampedVerbatim covers the other half: a
+// caller passing COMMIT in must get exactly that, with no second "+dirty"
+// glued on by the Makefile. The dirty tree is what makes the test meaningful
+// -- that is the only condition under which doubling could happen.
+func TestMakeBuild_ExplicitCommitIsStampedVerbatim(t *testing.T) {
+	dirtyTheTree(t)
+
+	const want = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef+dirty"
+	if got := makeCommitStamp(t, "COMMIT="+want); got != want {
+		t.Errorf("explicit COMMIT stamped as %q, want %q", got, want)
+	}
 }
