@@ -152,13 +152,20 @@ func (db *DB) MergeFrom(path string) (*MergeStats, error) {
 	return stats, nil
 }
 
+// Each token counter is COALESCEd before it is added for the same reason
+// ReconcileProjectAggregates does it: `a + b + c + d` is NULL if any operand is
+// NULL and SUM skips NULLs, so one session with one NULL counter would
+// contribute zero instead of its three real ones. A merge is exactly where such
+// a row arrives — the incoming archive need not have been written by this
+// binary. See #110.
 const reconcileAggregatesSQL = `
 	UPDATE main.projects SET
 		session_count = (
 			SELECT COUNT(*) FROM main.sessions WHERE main.sessions.project_id = main.projects.id
 		),
 		total_tokens = (
-			SELECT COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens), 0)
+			SELECT COALESCE(SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)
+				+ COALESCE(cache_read_tokens, 0) + COALESCE(cache_write_tokens, 0)), 0)
 			FROM main.sessions WHERE main.sessions.project_id = main.projects.id
 		)`
 
