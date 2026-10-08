@@ -4,6 +4,7 @@
 package search
 
 import (
+	"slices"
 	"testing"
 	"time"
 
@@ -103,11 +104,9 @@ func TestSearch_HasToolErrorSelectsOnlyTheFailedCall(t *testing.T) {
 		t.Fatalf("search: %v", err)
 	}
 
-	if len(results) != 1 {
-		t.Fatalf("has:toolerror returned %d turns (%v), want 1", len(results), resultIDs(results))
-	}
-	if results[0].Turn.ID != "turn-failed" {
-		t.Errorf("has:toolerror returned %s, want turn-failed", results[0].Turn.ID)
+	got, want := resultIDs(results), []string{"turn-failed"}
+	if !slices.Equal(got, want) {
+		t.Errorf("has:toolerror returned %v, want %v", got, want)
 	}
 }
 
@@ -161,8 +160,9 @@ func TestSearch_HasToolErrorCombinesWithText(t *testing.T) {
 	if err != nil {
 		t.Fatalf("search text + filter: %v", err)
 	}
-	if len(narrowed) != 1 || narrowed[0].Turn.ID != "turn-failed" {
-		t.Errorf("narrowed search returned %v, want only turn-failed", resultIDs(narrowed))
+	got, want := resultIDs(narrowed), []string{"turn-failed"}
+	if !slices.Equal(got, want) {
+		t.Errorf("narrowed search returned %v, want %v", got, want)
 	}
 }
 

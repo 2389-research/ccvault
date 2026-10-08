@@ -6,6 +6,7 @@ package db
 import (
 	"database/sql"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -272,14 +273,8 @@ func TestMigration013IsErrorIsQueryable(t *testing.T) {
 	}
 
 	want := []string{"toolu_ARRFAIL", "toolu_FAILED"}
-	if len(got) != len(want) {
-		t.Fatalf("is_error = 1 selected %v, want %v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Errorf("is_error = 1 selected %v, want %v", got, want)
-			break
-		}
+	if !slices.Equal(got, want) {
+		t.Errorf("is_error = 1 selected %v, want %v", got, want)
 	}
 }
 

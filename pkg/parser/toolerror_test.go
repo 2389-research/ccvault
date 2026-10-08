@@ -4,6 +4,7 @@
 package parser
 
 import (
+	"slices"
 	"strings"
 	"testing"
 )
@@ -40,7 +41,7 @@ func TestExtractToolUses_IsErrorTrue(t *testing.T) {
 
 	got := extractIsErrorFrom(t, transcript)
 	want := []string{"error"}
-	if len(got) != 1 || got[0] != want[0] {
+	if !slices.Equal(got, want) {
 		t.Errorf("IsError states = %v, want %v", got, want)
 	}
 }
@@ -53,9 +54,9 @@ func TestExtractToolUses_IsErrorFalseIsNotUnknown(t *testing.T) {
 	transcript := `{"uuid":"a-1","sessionId":"s-2","type":"assistant","timestamp":"2026-09-01T10:00:00.000Z","message":{"model":"claude","role":"assistant","content":[{"type":"tool_use","id":"toolu_OK","name":"Bash","input":{"command":"true"}}]}}
 {"uuid":"u-1","sessionId":"s-2","type":"user","timestamp":"2026-09-01T10:00:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_OK","is_error":false,"content":"done"}]}}`
 
-	got := extractIsErrorFrom(t, transcript)
-	if len(got) != 1 || got[0] != "ok" {
-		t.Errorf("IsError states = %v, want [ok]", got)
+	got, want := extractIsErrorFrom(t, transcript), []string{"ok"}
+	if !slices.Equal(got, want) {
+		t.Errorf("IsError states = %v, want %v", got, want)
 	}
 }
 
@@ -66,9 +67,9 @@ func TestExtractToolUses_IsErrorFalseIsNotUnknown(t *testing.T) {
 // as unknown would make 80% of the archive unqueryable and the column close to
 // useless.
 func TestExtractToolUses_AbsentFlagOnAPresentResultIsSuccess(t *testing.T) {
-	got := extractIsErrorFrom(t, twoTurnTranscript)
-	if len(got) != 1 || got[0] != "ok" {
-		t.Errorf("IsError states = %v, want [ok]", got)
+	got, want := extractIsErrorFrom(t, twoTurnTranscript), []string{"ok"}
+	if !slices.Equal(got, want) {
+		t.Errorf("IsError states = %v, want %v", got, want)
 	}
 }
 
@@ -79,9 +80,9 @@ func TestExtractToolUses_AbsentFlagOnAPresentResultIsSuccess(t *testing.T) {
 func TestExtractToolUses_NoResultIsUnknown(t *testing.T) {
 	transcript := `{"uuid":"a-1","sessionId":"s-3","type":"assistant","timestamp":"2026-09-01T10:00:00.000Z","message":{"model":"claude","role":"assistant","content":[{"type":"tool_use","id":"toolu_ORPHAN","name":"Bash","input":{"command":"sleep 600"}}]}}`
 
-	got := extractIsErrorFrom(t, transcript)
-	if len(got) != 1 || got[0] != "unknown" {
-		t.Errorf("IsError states = %v, want [unknown] — nothing answered this call", got)
+	got, want := extractIsErrorFrom(t, transcript), []string{"unknown"}
+	if !slices.Equal(got, want) {
+		t.Errorf("IsError states = %v, want %v — nothing answered this call", got, want)
 	}
 }
 
@@ -96,7 +97,7 @@ func TestExtractToolUses_IsErrorFollowsItsOwnCall(t *testing.T) {
 
 	got := extractIsErrorFrom(t, transcript)
 	want := []string{"error", "ok"}
-	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+	if !slices.Equal(got, want) {
 		t.Errorf("IsError states = %v, want %v — the flag belongs to the call its tool_use_id names", got, want)
 	}
 }
@@ -133,8 +134,8 @@ func TestExtractToolUses_IsErrorFromStructuredContent(t *testing.T) {
 	transcript := `{"uuid":"a-1","sessionId":"s-6","type":"assistant","timestamp":"2026-09-01T10:00:00.000Z","message":{"model":"claude","role":"assistant","content":[{"type":"tool_use","id":"toolu_ARR","name":"Bash","input":{"command":"boom"}}]}}
 {"uuid":"u-1","sessionId":"s-6","type":"user","timestamp":"2026-09-01T10:00:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_ARR","is_error":true,"content":[{"type":"text","text":"stderr said no"}]}]}}`
 
-	got := extractIsErrorFrom(t, transcript)
-	if len(got) != 1 || got[0] != "error" {
-		t.Errorf("IsError states = %v, want [error]", got)
+	got, want := extractIsErrorFrom(t, transcript), []string{"error"}
+	if !slices.Equal(got, want) {
+		t.Errorf("IsError states = %v, want %v", got, want)
 	}
 }

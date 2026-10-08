@@ -4,6 +4,7 @@
 package mcp
 
 import (
+	"slices"
 	"testing"
 	"time"
 
@@ -84,8 +85,8 @@ func TestGetTurns_ReportsFailedTools(t *testing.T) {
 	if !ok {
 		t.Fatalf("turn-mixed has no failed_tools: %+v", mixed)
 	}
-	if len(failed) != 1 || failed[0] != "Edit" {
-		t.Errorf("failed_tools = %v, want [Edit] — only the Edit call reported a failure", failed)
+	if want := []string{"Edit"}; !slices.Equal(failed, want) {
+		t.Errorf("failed_tools = %v, want %v — only the Edit call reported a failure", failed, want)
 	}
 
 	// The turn whose only call succeeded, and the one nothing answered, must
@@ -145,9 +146,9 @@ func TestGetTurns_FailedToolsSurvivesUnreadableRawJSON(t *testing.T) {
 		t.Fatalf("expected turn-corrupt to be flagged raw_unavailable, got %+v", corrupt)
 	}
 	failed, ok := corrupt["failed_tools"].([]string)
-	if !ok || len(failed) != 1 || failed[0] != "Bash" {
-		t.Errorf("failed_tools = %v (present=%t), want [Bash] — the stored flag does not depend on raw_json parsing",
-			failed, ok)
+	if want := []string{"Bash"}; !ok || !slices.Equal(failed, want) {
+		t.Errorf("failed_tools = %v (present=%t), want %v — the stored flag does not depend on raw_json parsing",
+			failed, ok, want)
 	}
 }
 
