@@ -118,9 +118,14 @@ func TestSessionReadPathsTolerateNullMetadata(t *testing.T) {
 	})
 }
 
-// A NULL turn_count must not be counted as anything by the aggregate either —
-// GetSessionStats already COALESCEs its SUMs, and this pins that down so a
+// A NULL token counter must not be counted as anything by the aggregate
+// either — GetSessionStats COALESCEs its SUMs, and this pins that down so a
 // NULL row cannot make the archive-wide totals NULL.
+//
+// The turn total is not summed from a counter at all any more; it is counted
+// off the turns table, which is #91. So the assertion here is the stronger
+// one: a session claiming three turns while the archive holds one is reported
+// as one.
 func TestGetSessionStatsTolerateNullCounters(t *testing.T) {
 	db, cleanup := setupTestDB(t)
 	defer cleanup()
@@ -141,6 +146,15 @@ func TestGetSessionStatsTolerateNullCounters(t *testing.T) {
 		t.Fatalf("insert session with partially NULL counters: %v", err)
 	}
 
+	// One turn against the counter's three, so the figure the aggregate
+	// reports says which of the two it read.
+	if _, err := db.Exec(
+		`INSERT INTO turns (id, session_id, type, timestamp, content, ordinal)
+		 VALUES ('partial-counters-turn', 'partial-counters-session', 'user', ?, 'c', 0)`,
+		time.Now()); err != nil {
+		t.Fatalf("insert turn: %v", err)
+	}
+
 	count, totalTurns, totalTokens, err := db.GetSessionStats()
 	if err != nil {
 		t.Fatalf("GetSessionStats with a NULL counter row present: %v", err)
@@ -148,8 +162,8 @@ func TestGetSessionStatsTolerateNullCounters(t *testing.T) {
 	if count != 2 {
 		t.Errorf("session count = %d, want 2", count)
 	}
-	if totalTurns != 3 {
-		t.Errorf("total turns = %d, want 3", totalTurns)
+	if totalTurns != 1 {
+		t.Errorf("total turns = %d, want the 1 row turns holds, not the 3 the counter claims", totalTurns)
 	}
 	if totalTokens != 500 {
 		t.Errorf("total tokens = %d, want 500", totalTokens)

@@ -412,6 +412,13 @@ func mergeSessions(ctx context.Context, tx *sql.Tx, columns map[string][]string,
 	// exactly that state before migration 011 repaired them, and that is how
 	// #87's 6,378 orphans were made. The turns are gone as of the loop above,
 	// so this reaches the rows by the turn they belong to instead.
+	//
+	// Matched on the uuid alone, deliberately, even though a turn's identity is
+	// (session_id, id) since migration 012. Scoping this to the session would
+	// also delete a row that a pre-011 archive filed under the wrong session —
+	// the state migration 011 exists to *repair* — and an import is the one
+	// path that still meets archives in that state. Only a row whose uuid no
+	// turn in the destination holds at all is taken as an orphan here.
 	if _, err := tx.ExecContext(ctx, `
 		DELETE FROM main.tool_uses WHERE turn_id IS NOT NULL
 		  AND NOT EXISTS (SELECT 1 FROM main.turns t WHERE t.id = main.tool_uses.turn_id)`); err != nil {
@@ -453,9 +460,19 @@ func mergeSessions(ctx context.Context, tx *sql.Tx, columns map[string][]string,
 	}
 
 	// A turn uuid is not unique to a session: a resumed transcript copies the
-	// earlier session's lines verbatim, so an incoming turn can collide with a
-	// row belonging to a session this merge never picked. The DELETE above
-	// cleared the picked sessions' turns and cannot reach those.
+	// earlier session's lines verbatim, so the same uuid arrives in two files.
+	// Since migration 012 that is what the schema says too — a turn is
+	// identified by (session_id, id) — so the rows to clear are the picked
+	// sessions' own copies, matched on both columns.
+	//
+	// It used to match on the uuid alone, on the reasoning that an incoming
+	// turn "can collide with a row belonging to a session this merge never
+	// picked". It can, and that row is that session's own turn: deleting it is
+	// #92, the defect that cost the author's archive 31,864 turns. The DELETE
+	// above has already cleared the picked sessions' turns, and after it there
+	// is nothing left for this to reach — it stays because the INSERT that
+	// follows must not be able to conflict, and because a session the merge
+	// picked may hold turns under a source_file the loop above did not cover.
 	//
 	// Deleted here with a statement of our own rather than left to INSERT OR
 	// REPLACE, for the reason internal/db/turns.go's deleteTurnConflictsSQL
@@ -466,19 +483,22 @@ func mergeSessions(ctx context.Context, tx *sql.Tx, columns map[string][]string,
 	// position are that session's own, and they are already gone.
 	//
 	// Their tool uses go first, for the reason above: a turn that is deleted
-	// rather than replaced must not leave rows pointing at it, and those rows
-	// may be filed under a session this merge never looked at.
+	// rather than replaced must not leave rows pointing at it.
 	if _, err := tx.ExecContext(ctx, `
-		DELETE FROM main.tool_uses WHERE turn_id IN (
-			SELECT i.id FROM incoming.turns i
+		DELETE FROM main.tool_uses WHERE EXISTS (
+			SELECT 1 FROM incoming.turns i
 			JOIN temp.merge_pick k ON k.id = i.session_id
+			WHERE i.id = main.tool_uses.turn_id
+			  AND i.session_id = main.tool_uses.session_id
 		)`); err != nil {
 		return fmt.Errorf("clear tool uses of the turns the merge is about to replace: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `
-		DELETE FROM main.turns WHERE id IN (
-			SELECT i.id FROM incoming.turns i
+		DELETE FROM main.turns WHERE EXISTS (
+			SELECT 1 FROM incoming.turns i
 			JOIN temp.merge_pick k ON k.id = i.session_id
+			WHERE i.id = main.turns.id
+			  AND i.session_id = main.turns.session_id
 		)`); err != nil {
 		return fmt.Errorf("clear turns the merge is about to replace: %w", err)
 	}
@@ -533,6 +553,13 @@ func mergeSessions(ctx context.Context, tx *sql.Tx, columns map[string][]string,
 	// adding to #87's orphan count: an incoming call can name a turn belonging
 	// to a session the merge did not pick, and importing it would leave a row
 	// nothing can reach.
+	//
+	// Joined on the uuid alone rather than on the turn's full identity, for the
+	// reason the orphan pass above is: an incoming archive written before
+	// migration 011 can file a call under a session its turn does not belong
+	// to, and requiring the session to match would drop those rows instead of
+	// importing them. The guard this join is here for — "is this call's turn in
+	// the archive at all" — is answered by the uuid.
 	toolWhere := `
 		JOIN temp.merge_pick k ON k.id = i.session_id
 		JOIN main.turns mt ON mt.id = i.turn_id`
@@ -575,15 +602,23 @@ func mergeSessions(ctx context.Context, tx *sql.Tx, columns map[string][]string,
 	}
 
 	// Whatever the destination holds for the turns these calls belong to goes
-	// first. Clearing by session_id missed them: a destination row can be filed
-	// under a session this merge never picked while naming a turn the incoming
-	// archive is supplying calls for, and leaving it would collide with the
-	// unique index — or, before that index existed, quietly double the turn's
-	// calls.
+	// first, so the INSERT cannot collide with the unique index — or, before
+	// that index existed, quietly double the turn's calls.
+	//
+	// Matched on (session_id, turn_id), the turn's identity. It used to match
+	// on turn_id alone, to reach "a destination row filed under a session this
+	// merge never picked while naming a turn the incoming archive is supplying
+	// calls for". Since migration 012 such a row is that session's own call on
+	// its own copy of the turn, the unique index is scoped to the session too,
+	// and so there is nothing to collide with — deleting it would be #92 one
+	// table over. A destination row naming a turn nobody holds is an orphan,
+	// and the pass near the top of this function is what removes those.
 	if _, err := tx.ExecContext(ctx, `
-		DELETE FROM main.tool_uses WHERE turn_id IN (
-			SELECT i.turn_id FROM incoming.tool_uses i
+		DELETE FROM main.tool_uses WHERE EXISTS (
+			SELECT 1 FROM incoming.tool_uses i
 			JOIN temp.merge_pick k ON k.id = i.session_id
+			WHERE i.turn_id = main.tool_uses.turn_id
+			  AND i.session_id = main.tool_uses.session_id
 		)`); err != nil {
 		return fmt.Errorf("clear tool uses the merge is about to replace: %w", err)
 	}

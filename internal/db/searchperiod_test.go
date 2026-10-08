@@ -141,7 +141,7 @@ func TestSearchPeriod_ColumnHoldsTheTokens(t *testing.T) {
 			// produce.
 			if _, err := database.Exec(
 				`INSERT OR REPLACE INTO turns (id, session_id, type, timestamp, content, ordinal)
-				 VALUES ('period-probe', NULL, 'user', ?, 'probe', 0)`, tc.ts); err != nil {
+				 VALUES ('period-probe', 'period-probe-session', 'user', ?, 'probe', 0)`, tc.ts); err != nil {
 				t.Fatalf("insert probe turn: %v", err)
 			}
 

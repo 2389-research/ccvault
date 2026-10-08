@@ -39,8 +39,12 @@ type Stats struct {
 	// SearchIndexRebuilt records that this run re-derived turns_fts from the
 	// turns table. True after any run that re-parsed every file.
 	SearchIndexRebuilt bool
-	Errors             []error
-	Duration           time.Duration
+	// TurnCountsReconciled counts the session rows whose turn_count this run
+	// corrected against the turns they actually hold. Only a run that
+	// re-parsed every file reconciles anything — see reconcileTurnCounts.
+	TurnCountsReconciled int64
+	Errors               []error
+	Duration             time.Duration
 }
 
 // Syncer handles syncing conversation data to ccvault
@@ -269,6 +273,7 @@ func (s *Syncer) Run(ctx context.Context) (*Stats, error) {
 
 	s.reconcileProjects(stats, projectsTouched)
 	s.rebuildSearchIndex(ctx, stats)
+	s.reconcileTurnCounts(ctx, stats)
 
 	stats.ProjectsFound = len(projectsSeen)
 	stats.Duration = time.Since(start)
@@ -354,6 +359,47 @@ func (s *Syncer) rebuildSearchIndex(ctx context.Context, stats *Stats) {
 		return
 	}
 	stats.SearchIndexRebuilt = true
+}
+
+// reconcileTurnCounts rewrites sessions.turn_count from the rows each session
+// actually holds, and is step three of issue #92's order.
+//
+// The counter is written as len(turns) by every re-parse, so it is correct for
+// any session this run touched. What it cannot fix by itself is a session
+// whose turns another session's write deleted before migration 012 made a
+// turn's identity (session_id, id): those rows come back only from re-reading
+// the transcript, and for a session whose transcript is gone from disk they do
+// not come back at all. Three of the author's 201 drifted sessions are in that
+// state. This is what finally brings their counter down to what the archive
+// holds.
+//
+// Gated on a run that re-parsed every file, and that gate is the point. An
+// incremental run has re-read whatever changed and nothing else, so
+// reconciling from it would make the counter agree with a database whose
+// missing turns have not been looked for — the precise failure #92 warns
+// against, and the reason migration 012 leaves the counter alone and forgets
+// the affected files' mtimes instead. Skipped on a cancelled run for the same
+// reason: a run that stopped half way has not re-read everything either.
+//
+// Deliberately after rebuildSearchIndex, so the whole repair is done before
+// the counter is allowed to agree with it. Non-fatal: the rows are already
+// committed and only a display counter is wrong — the figures `stats` reports
+// come off the rows regardless (#91).
+func (s *Syncer) reconcileTurnCounts(ctx context.Context, stats *Stats) {
+	if !s.reparseAll() || ctx.Err() != nil {
+		return
+	}
+
+	corrected, err := s.db.ReconcileSessionTurnCounts()
+	if err != nil {
+		stats.Errors = append(stats.Errors, fmt.Errorf("reconcile session turn counts: %w", err))
+		s.progress("Warning: could not reconcile session turn counts: %v", err)
+		return
+	}
+	stats.TurnCountsReconciled = corrected
+	if corrected > 0 {
+		s.progress("Reconciled turn_count on %d session(s) against the turns they hold", corrected)
+	}
 }
 
 // processSession handles a single session file using the given adapter. ctx

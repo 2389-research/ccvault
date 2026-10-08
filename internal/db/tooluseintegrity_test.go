@@ -500,11 +500,18 @@ func TestInsertToolUsesReplacesRatherThanDuplicating(t *testing.T) {
 // asserted below so that enabling it makes this test say so rather than
 // quietly start proving something else.
 //
-// The surviving tool use is recorded under a different session_id than its
-// turn, which is the state migration 011 repairs and the state that made the
-// orphans in the first place: sync deletes a session's tool uses by
-// session_id, and a row filed under another session is out of that DELETE's
-// reach.
+// The tool use is filed under the session its turn belongs to, because since
+// migration 012 that is the only state the write path can produce: a turn is
+// identified by (session_id, id), so a row naming another session is that
+// session's own call on its own copy of the turn rather than a mis-filed copy
+// of this one. The mis-filed state this test used to seed is what migration
+// 011 repaired, 1,281 rows of it — and reaching into another session to delete
+// it is exactly the loss #92 is about, so the write path no longer does.
+//
+// What still has to hold, and is what this test is for: sync clears a
+// session's tool uses by session_id, and that cannot see a row whose turn is
+// being deleted by position rather than by name. #87's 6,378 orphans came from
+// that gap.
 func TestInsertTurnsDeletesToolUsesOfTheTurnsItReplaces(t *testing.T) {
 	database, err := Open(t.TempDir())
 	if err != nil {
@@ -522,12 +529,8 @@ func TestInsertTurnsDeletesToolUsesOfTheTurnsItReplaces(t *testing.T) {
 	}
 
 	seedTurnsForToolUses(t, database, "sess-a", "turn-vanishing")
-	if _, err := database.Exec(`INSERT INTO sessions (id, started_at, source_file, source)
-		VALUES ('sess-elsewhere', ?, '/fake/sess-elsewhere.jsonl', 'claude-code')`, time.Now()); err != nil {
-		t.Fatalf("seed other session: %v", err)
-	}
 	if err := database.InsertToolUses([]models.ToolUse{{
-		TurnID: "turn-vanishing", SessionID: "sess-elsewhere", ToolName: "Bash",
+		TurnID: "turn-vanishing", SessionID: "sess-a", ToolName: "Bash",
 		Timestamp: time.Now(), ToolUseID: "toolu_vanishing", InputJSON: `{"cmd":"ls"}`,
 	}}); err != nil {
 		t.Fatalf("insert tool use: %v", err)
@@ -542,10 +545,14 @@ func TestInsertTurnsDeletesToolUsesOfTheTurnsItReplaces(t *testing.T) {
 		t.Fatalf("insert replacement turn: %v", err)
 	}
 
+	// Orphaned against the turn's full identity, (session_id, id), not its
+	// uuid alone — a row naming a uuid some other session holds is still a row
+	// pointing at a turn that does not exist.
 	var orphans int
 	if err := database.QueryRow(`SELECT COUNT(*) FROM tool_uses tu
 		WHERE tu.turn_id IS NOT NULL
-		  AND NOT EXISTS (SELECT 1 FROM turns t WHERE t.id = tu.turn_id)`).Scan(&orphans); err != nil {
+		  AND NOT EXISTS (SELECT 1 FROM turns t
+		                  WHERE t.id = tu.turn_id AND t.session_id = tu.session_id)`).Scan(&orphans); err != nil {
 		t.Fatalf("count orphans: %v", err)
 	}
 	if orphans != 0 {
@@ -555,9 +562,15 @@ func TestInsertTurnsDeletesToolUsesOfTheTurnsItReplaces(t *testing.T) {
 }
 
 // TestDeleteTurnsForSessionTakesTheirToolUses covers the other turn-deleting
-// path. A session's tool uses can sit under a different session_id than its
-// turns do — that is exactly the state migration 011 repairs — so deleting by
-// session_id alone is not enough to leave no orphans behind.
+// path: a session's turns go, so the calls those turns issued go with them.
+//
+// Another session's copy of the same turn uuid is seeded alongside, and has to
+// survive. A turn's identity is (session_id, id) since migration 012 — a
+// resumed transcript repeats the earlier session's uuids verbatim — so a row
+// naming this uuid under another session is that session's own call, and
+// taking it would be #92 again one table over. This test used to seed exactly
+// that row as a *mis-filed* copy of sess-a's call, which is the pre-011 state
+// migration 011 repaired and the write path can no longer create.
 func TestDeleteTurnsForSessionTakesTheirToolUses(t *testing.T) {
 	database, err := Open(t.TempDir())
 	if err != nil {
@@ -566,17 +579,18 @@ func TestDeleteTurnsForSessionTakesTheirToolUses(t *testing.T) {
 	defer func() { _ = database.Close() }()
 
 	seedSessionForToolUses(t, database, "sess-a", "turn-a")
-	if _, err := database.Exec(`INSERT INTO sessions (id, started_at, source_file, source, model, git_branch)
-		VALUES ('sess-b', ?, '/fake/sess-b.jsonl', 'claude-code', '', '')`, time.Now()); err != nil {
-		t.Fatalf("seed session b: %v", err)
-	}
-	// The tool use belongs to turn-a (which lives in sess-a) but is recorded
-	// under sess-b.
+	seedSessionForToolUses(t, database, "sess-b", "turn-a")
 	if err := database.InsertToolUses([]models.ToolUse{{
-		TurnID: "turn-a", SessionID: "sess-b", ToolName: "Bash",
+		TurnID: "turn-a", SessionID: "sess-a", ToolName: "Bash",
 		Timestamp: time.Now(), ToolUseID: "toolu_x",
 	}}); err != nil {
 		t.Fatalf("insert tool use: %v", err)
+	}
+	if err := database.InsertToolUses([]models.ToolUse{{
+		TurnID: "turn-a", SessionID: "sess-b", ToolName: "Bash",
+		Timestamp: time.Now(), ToolUseID: "toolu_y",
+	}}); err != nil {
+		t.Fatalf("insert the other session's tool use: %v", err)
 	}
 
 	if err := database.DeleteTurnsForSession("sess-a"); err != nil {
@@ -584,11 +598,20 @@ func TestDeleteTurnsForSessionTakesTheirToolUses(t *testing.T) {
 	}
 
 	var left int
-	if err := database.QueryRow("SELECT COUNT(*) FROM tool_uses").Scan(&left); err != nil {
+	if err := database.QueryRow(
+		"SELECT COUNT(*) FROM tool_uses WHERE session_id = 'sess-a'").Scan(&left); err != nil {
 		t.Fatalf("count tool_uses: %v", err)
 	}
 	if left != 0 {
 		t.Errorf("%d tool_uses rows outlived the turns they belong to", left)
+	}
+	var elsewhere int
+	if err := database.QueryRow(
+		"SELECT COUNT(*) FROM tool_uses WHERE session_id = 'sess-b'").Scan(&elsewhere); err != nil {
+		t.Fatalf("count the other session's tool_uses: %v", err)
+	}
+	if elsewhere != 1 {
+		t.Errorf("the other session's copy of the turn lost %d of its calls", 1-elsewhere)
 	}
 }
 

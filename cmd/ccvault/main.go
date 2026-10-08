@@ -313,6 +313,36 @@ func printIntegritySection(f db.FTSIntegrity) {
 	fmt.Println()
 }
 
+// printTurnCountSection reports a disagreement between sessions.turn_count and
+// the turns the archive holds, and says nothing at all when they agree.
+//
+// The Turns figure above it is counted off the rows (#91), so this is not a
+// correction to it — it is the one thing the counter is still good for. A
+// session claiming more turns than it holds means its rows were deleted, which
+// is #92: a turn used to be keyed on its uuid alone, so parsing a resumed
+// transcript deleted the rows of the session it resumed. 201 sessions and
+// 31,864 turns on the author's archive.
+//
+// Reported rather than quietly reconciled, in the same shape the storage
+// section uses for reclaimable space. Said out loud, it is a repairable fault
+// with an instruction attached; reconciled, it is an archive that is silently
+// short.
+func printTurnCountSection(d db.TurnDrift) {
+	if !d.Drifted() {
+		return
+	}
+	fmt.Println("Turn counts:")
+	fmt.Printf("  %d session(s) claim turns the archive does not hold (%d claimed, %d present).\n",
+		d.Sessions, d.Counted, d.Rows)
+	// --full, not --rebuild: --full re-reads every transcript and restores
+	// whatever the sources still hold, where --rebuild would also discard every
+	// session whose file is gone. Migration 012 already forgot the mtimes of
+	// the affected files, so an ordinary `ccvault sync` repairs them too — this
+	// names --full because it also reconciles what no source can supply.
+	fmt.Println("  Recover the missing turns with 'ccvault sync --full'.")
+	fmt.Println()
+}
+
 var orientCmd = &cobra.Command{
 	Use:   "orient",
 	Short: "Output database state for AI agents",
@@ -796,6 +826,11 @@ var statsCmd = &cobra.Command{
 			return fmt.Errorf("check search index integrity: %w", err)
 		}
 
+		drift, err := database.TurnCountDrift()
+		if err != nil {
+			return fmt.Errorf("measure turn count drift: %w", err)
+		}
+
 		if jsonOutput {
 			out := map[string]interface{}{
 				"projects":        projectCount,
@@ -807,6 +842,13 @@ var statsCmd = &cobra.Command{
 				"top_tools":       toolStats,
 				"storage":         storageJSON(storage),
 				"search_index":    integrityJSON(integrity),
+			}
+			if drift.Drifted() {
+				out["turn_count_drift"] = map[string]interface{}{
+					"claimed":  drift.Counted,
+					"rows":     drift.Rows,
+					"sessions": drift.Sessions,
+				}
 			}
 			if !first.IsZero() && !last.IsZero() {
 				out["activity"] = map[string]interface{}{
@@ -838,6 +880,7 @@ var statsCmd = &cobra.Command{
 
 		printStorageSection(storage)
 		printIntegritySection(integrity)
+		printTurnCountSection(drift)
 
 		if len(tokensByModel) > 0 {
 			fmt.Println("Tokens by Model:")

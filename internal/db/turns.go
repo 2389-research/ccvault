@@ -14,8 +14,11 @@ import (
 )
 
 // toolUsesTurnOrdinalIndex is the unique index that gives tool_uses a key:
-// (turn_id, turn_ordinal), a call's position inside the turn that issued it.
-// Named here because migration 011 creates it and the tests probe for it.
+// (turn_id, session_id, turn_ordinal), a call's position inside the turn that
+// issued it. Named here because migration 011 creates it, migration 012 adds
+// the session to it — a turn's identity is (session_id, id), so one turn uuid
+// can name two turns and each issues its own calls — and the tests probe for
+// it under this name.
 const toolUsesTurnOrdinalIndex = "idx_tool_uses_turn_ordinal"
 
 // InsertTurns inserts multiple turns in a batch
@@ -31,12 +34,14 @@ func (db *DB) InsertTurnsTx(tx *sql.Tx, turns []models.Turn) error {
 		return err
 	}
 
-	// A turn can collide with a row already in the table two ways: by id,
-	// which is the transcript uuid, and by position, which UNIQUE(session_id,
-	// ordinal) enforces. Both collisions are resolved by deleting the row that
-	// holds the spot — the same thing INSERT OR REPLACE did — but with a
-	// DELETE statement of our own rather than REPLACE's implicit one. See
-	// deleteTurnConflictsSQL for why that distinction is the whole fix.
+	// A turn can collide with a row already in the table two ways: by
+	// identity, which is (session_id, id) since migration 012, and by
+	// position, which UNIQUE(session_id, ordinal) enforces. Both collisions
+	// are resolved by deleting the row that holds the spot — the same thing
+	// INSERT OR REPLACE did — but with a DELETE statement of our own rather
+	// than REPLACE's implicit one. See deleteTurnConflictsSQL for why that
+	// distinction is the whole fix, and why both arms are confined to one
+	// session.
 	del, err := tx.Prepare(deleteTurnConflictsSQL)
 	if err != nil {
 		return fmt.Errorf("prepare delete conflicting turns: %w", err)
@@ -58,10 +63,10 @@ func (db *DB) InsertTurnsTx(tx *sql.Tx, turns []models.Turn) error {
 	defer func() { _ = ins.Close() }()
 
 	for _, t := range turns {
-		if _, err := delTools.Exec(t.ID, t.SessionID, t.Ordinal); err != nil {
+		if _, err := delTools.Exec(t.SessionID, t.ID, t.Ordinal); err != nil {
 			return fmt.Errorf("delete tool uses of turns conflicting with %s: %w", t.ID, err)
 		}
-		if _, err := del.Exec(t.ID, t.SessionID, t.Ordinal); err != nil {
+		if _, err := del.Exec(t.SessionID, t.ID, t.Ordinal); err != nil {
 			return fmt.Errorf("delete turn conflicting with %s: %w", t.ID, err)
 		}
 		_, err := ins.Exec(
@@ -107,12 +112,24 @@ func (db *DB) InsertTurnsTx(tx *sql.Tx, turns []models.Turn) error {
 // untouched — it is written as an explicit DELETE followed by a plain INSERT —
 // and this makes turns match it.
 //
-// Semantics are unchanged from REPLACE: one or two rows can be deleted (a
-// turn can collide by id with one row and by position with another), and both
-// go. The OR is two index seeks, sqlite_autoindex_turns_1 and
+// Both arms are confined to one session, and that is issue #92. The uuid arm
+// used to read `id = ?` with no session, because turns was keyed on the uuid
+// alone — so writing a session whose transcript was resumed from an earlier
+// one deleted the *earlier* session's rows, since a resumed Claude Code
+// transcript copies the earlier session's lines verbatim, uuids included. The
+// earlier session kept the turn_count its own parse recorded, and the
+// difference was the overlap: 31,864 turns across 201 sessions on the author's
+// archive, 197 of which were left holding exactly one turn. Migration 012
+// made (session_id, id) the table's primary key; this is the write path
+// agreeing with it.
+//
+// Semantics are otherwise unchanged from REPLACE: one or two rows can be
+// deleted (a turn can collide by uuid with one row of its session and by
+// position with another), and both go. The OR is two index seeks,
+// sqlite_autoindex_turns_1 over (session_id, id) and
 // idx_turns_session_ordinal, not a scan.
 const deleteTurnConflictsSQL = `
-	DELETE FROM turns WHERE id = ? OR (session_id = ? AND ordinal = ?)`
+	DELETE FROM turns WHERE session_id = ? AND (id = ? OR ordinal = ?)`
 
 // deleteToolUsesOfConflictingTurnsSQL removes the tool uses of whatever
 // deleteTurnConflictsSQL is about to delete, so no row is left pointing at a
@@ -146,16 +163,39 @@ const deleteTurnConflictsSQL = `
 // the hottest loop in the writer. Measured on a synthetic 200-session,
 // 24,000-turn, 24,000-tool-use archive: a first sync goes 2.42s to 2.56s and a
 // `sync --full` 3.37s to 3.53s, against a binary built without it.
+//
+// Scoped to the session on both sides since migration 012, for the reason
+// deleteTurnConflictsSQL is: the turn being replaced is this session's copy,
+// so the calls to remove are the ones filed under this session. A row of
+// another session that happens to name the same turn uuid belongs to that
+// session's own copy of the turn, which this write is not touching.
+//
+// Numbered parameters so the session id is named once and used on both sides;
+// the three bindings are still (session_id, id, ordinal), the same as
+// deleteTurnConflictsSQL takes.
 const deleteToolUsesOfConflictingTurnsSQL = `
-	DELETE FROM tool_uses WHERE turn_id IN (
-		SELECT id FROM turns WHERE id = ? OR (session_id = ? AND ordinal = ?))`
+	DELETE FROM tool_uses WHERE session_id = ?1 AND turn_id IN (
+		SELECT id FROM turns WHERE session_id = ?1 AND (id = ?2 OR ordinal = ?3))`
 
 // deleteToolUsesOfSessionTurnsSQL is the same guarantee for the whole-session
-// delete: a session's turns go, so their tool uses go, wherever those rows
-// happen to be filed.
+// delete: a session's turns go, so their tool uses go.
+//
+// Confined to this session's rows since migration 012. It used to reach every
+// row naming one of these turn uuids, "wherever those rows happen to be
+// filed", which was right when a turn uuid named one turn: a row filed under
+// another session had to be a mis-filed copy, and 1,281 such rows existed
+// before migration 011 repaired them. Now a row of another session naming the
+// same uuid is that session's own call on its own copy of the turn, and
+// deleting it is exactly the loss #92 is about.
+//
+// What this gives up is reaching a row mis-filed by a pre-011 archive. That
+// state cannot arise any more — migration 011 repaired it and the write path
+// keeps every row's session_id equal to its turn's — and the two paths that
+// can still meet such an archive clean it up themselves: migration 011's
+// orphan delete, and MergeFrom's.
 const deleteToolUsesOfSessionTurnsSQL = `
-	DELETE FROM tool_uses WHERE turn_id IN (
-		SELECT id FROM turns WHERE session_id = ?)`
+	DELETE FROM tool_uses WHERE session_id = ?1 AND turn_id IN (
+		SELECT id FROM turns WHERE session_id = ?1)`
 
 // checkDistinctOrdinals rejects a batch that gives two turns in one session
 // the same position.
@@ -492,7 +532,10 @@ func (db *DB) InsertToolUses(toolUses []models.ToolUse) error {
 // InsertToolUsesTx inserts tool usage records within a transaction.
 //
 // Each call is numbered by its position within the turn that issued it, which
-// is what UNIQUE(turn_id, turn_ordinal) keys the table on (migration 011). The
+// is what UNIQUE(turn_id, session_id, turn_ordinal) keys the table on
+// (migration 011, session-scoped by migration 012 when a turn's identity
+// became (session_id, id) — two sessions can hold one turn uuid, and each
+// one's copy issues its own calls). The
 // position comes from the batch: a transcript's calls arrive in the order the
 // parser read them, and internal/sync passes one session's calls in one slice,
 // so the Nth call of a turn in this batch is the Nth call of that turn in the
@@ -508,7 +551,7 @@ func (db *DB) InsertToolUses(toolUses []models.ToolUse) error {
 // under SQLite's own rules rather than only when PRAGMA recursive_triggers is
 // on, which is what keeps tool_uses_fts free of orphans on any connection.
 func (db *DB) InsertToolUsesTx(tx *sql.Tx, toolUses []models.ToolUse) error {
-	del, err := tx.Prepare(`DELETE FROM tool_uses WHERE turn_id = ? AND turn_ordinal = ?`)
+	del, err := tx.Prepare(`DELETE FROM tool_uses WHERE turn_id = ? AND session_id = ? AND turn_ordinal = ?`)
 	if err != nil {
 		return fmt.Errorf("prepare delete conflicting tool_uses: %w", err)
 	}
@@ -524,12 +567,21 @@ func (db *DB) InsertToolUsesTx(tx *sql.Tx, toolUses []models.ToolUse) error {
 	}
 	defer func() { _ = stmt.Close() }()
 
-	next := make(map[string]int, len(toolUses))
+	// Keyed on the turn's identity, not its uuid: two sessions can hold one
+	// turn uuid since migration 012, and each copy numbers its own calls from
+	// zero. A batch spanning both would otherwise continue the first session's
+	// numbering into the second's.
+	type turnKey struct {
+		sessionID string
+		turnID    string
+	}
+	next := make(map[turnKey]int, len(toolUses))
 	for _, tu := range toolUses {
-		ordinal := next[tu.TurnID]
-		next[tu.TurnID] = ordinal + 1
+		key := turnKey{tu.SessionID, tu.TurnID}
+		ordinal := next[key]
+		next[key] = ordinal + 1
 
-		if _, err := del.Exec(tu.TurnID, ordinal); err != nil {
+		if _, err := del.Exec(tu.TurnID, tu.SessionID, ordinal); err != nil {
 			return fmt.Errorf("delete tool_use conflicting with call %d of turn %s: %w", ordinal, tu.TurnID, err)
 		}
 		_, err := stmt.Exec(tu.TurnID, tu.SessionID, tu.ToolName, tu.FilePath, tu.Timestamp,
