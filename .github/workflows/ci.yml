@@ -137,12 +137,21 @@ jobs:
       - name: Check .goreleaser.yml
         run: |
           status=0
-          output=$(goreleaser check 2>&1) || status=$?
-          printf '%s\n' "$output"
+          raw=$(goreleaser check 2>&1) || status=$?
+          printf '%s\n' "$raw"
 
           if [ "$status" -eq 0 ]; then
             exit 0
           fi
+
+          # goreleaser colourises its output here even with no TTY, and it wraps
+          # the key name in escapes -- `brews` arrives as ESC[94mbrews ESC[0m,
+          # so matching the plain word fails. Strip ANSI before matching rather
+          # than setting NO_COLOR, which goreleaser ignores when something has
+          # already forced colour on. ESC is built with printf so this works
+          # under BSD sed as well as GNU.
+          esc=$(printf '\033')
+          output=$(printf '%s\n' "$raw" | sed "s/${esc}\[[0-9;]*m//g")
 
           if ! printf '%s\n' "$output" | grep -qF 'configuration is valid, but uses deprecated properties'; then
             echo "::error::goreleaser check failed for a reason other than a deprecated key."
