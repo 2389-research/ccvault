@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/2389-research/ccvault/internal/analytics"
+	"github.com/2389-research/ccvault/internal/buildinfo"
 	"github.com/2389-research/ccvault/internal/compact"
 	"github.com/2389-research/ccvault/internal/config"
 	"github.com/2389-research/ccvault/internal/db"
@@ -30,12 +31,15 @@ type Server struct {
 	cfg         *config.Config
 	analyzer    *analytics.Analyzer
 	analyzerErr error
+	build       buildinfo.Report
 	debug       bool
 	out         io.Writer // stdout by default; overridable for tests
 }
 
-// NewServer creates a new MCP server
-func NewServer(database *db.DB, cfg *config.Config) (*Server, error) {
+// NewServer creates a new MCP server. build is what the binary resolved about
+// itself; it is passed in rather than resolved here because the ldflags stamps
+// a release carries only reach package main.
+func NewServer(database *db.DB, cfg *config.Config, build buildinfo.Report) (*Server, error) {
 	cacheDir := filepath.Join(cfg.DataDir, "analytics")
 	analyzer, analyzerErr := analytics.NewAnalyzer(cacheDir)
 	if analyzerErr != nil {
@@ -48,6 +52,7 @@ func NewServer(database *db.DB, cfg *config.Config) (*Server, error) {
 		cfg:         cfg,
 		analyzer:    analyzer,
 		analyzerErr: analyzerErr,
+		build:       build,
 		debug:       os.Getenv("CCVAULT_MCP_DEBUG") == "1",
 		out:         os.Stdout,
 	}, nil
@@ -261,10 +266,30 @@ func (s *Server) handleInitialize(req *jsonRPCRequest) {
 		},
 		ServerInfo: serverInfo{
 			Name:    "ccvault",
-			Version: "0.1.0",
+			Version: s.advertisedVersion(),
 		},
 	}
 	s.sendResult(req.ID, result)
+}
+
+// advertisedVersion is what initialize reports as serverInfo.version.
+//
+// A client reads this to decide what the server can do -- which tools exist,
+// which response fields to expect, whether to work around a known bug -- so
+// it has to be the version this binary actually is. It is whatever
+// `ccvault version` reports, which for a build carrying no release stamps is
+// "dev" rather than a semver-shaped guess. MCP's Implementation.version is a
+// free-form string with no format requirement, so an honest "dev" is a better
+// answer to "which build is this" than an invented number.
+//
+// The Unknown fallback covers a Server assembled without build facts: the
+// field is required by the schema, and an empty string would read to a client
+// as a version it failed to parse rather than one the server does not have.
+func (s *Server) advertisedVersion() string {
+	if s.build.Version == "" {
+		return buildinfo.Unknown
+	}
+	return s.build.Version
 }
 
 func (s *Server) handleToolsList(req *jsonRPCRequest) {
