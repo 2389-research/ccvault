@@ -4,7 +4,13 @@
 .PHONY: build test test-race test-short test-coverage clean install lint release
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
-LDFLAGS := -ldflags "-X main.version=$(VERSION)"
+COMMIT ?= $(shell git rev-parse HEAD 2>/dev/null)
+DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# All three stamps, so `make build` rehearses what the release pipeline does
+# and a broken -X shows up here rather than at tag time. A build with no
+# stamps still reports honestly -- see cmd/ccvault/version.go.
+LDFLAGS := -ldflags "-X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.date=$(DATE)"
 
 build:
 	go build $(LDFLAGS) -o ccvault ./cmd/ccvault

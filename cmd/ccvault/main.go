@@ -35,8 +35,6 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var version = "0.1.0"
-
 var rootCmd = &cobra.Command{
 	Use:   "ccvault",
 	Short: "Archive and search Claude Code conversations",
@@ -96,8 +94,13 @@ func loadConfig(cmd *cobra.Command) (*config.Config, error) {
 var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "Print the version number",
+	Long: `Print the version, the commit this binary was built from, and when.
+
+The first line is always "ccvault <version>", so a script can read the
+version off it. Release builds carry all three facts; a build from a source
+tree reports "dev" and takes the commit from the VCS data Go embeds.`,
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Printf("ccvault %s\n", version)
+		fmt.Print(currentBuild().Text())
 	},
 }
 
@@ -337,7 +340,7 @@ Use --json for machine-readable output.`,
 		o := gatherOrientation(database)
 
 		orientationMap := map[string]interface{}{
-			"version": version,
+			"version": currentBuild().Version,
 			"status":  "ready",
 			"database": map[string]interface{}{
 				"projects":     o.ProjectCount,
@@ -400,7 +403,7 @@ Use --json for machine-readable output.`,
 
 		fmt.Println("=== ccvault Orientation ===")
 		fmt.Println()
-		fmt.Printf("Version: %s\n", version)
+		fmt.Printf("Version: %s\n", currentBuild().Version)
 		fmt.Printf("Status:  %s\n", orientationMap["status"])
 		fmt.Println()
 
