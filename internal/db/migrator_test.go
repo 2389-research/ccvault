@@ -251,7 +251,11 @@ func TestMigrator_BootstrapPartial(t *testing.T) {
 	// subset of it. detectExistingState bootstraps this database to version 1,
 	// which asserts "everything 001 creates is present", and every later
 	// migration is entitled to rely on that. turns.raw_json and the tool_uses
-	// table were missing until migration 009 — which reads both — needed them.
+	// table were missing until migration 009 — which reads both — needed them;
+	// turns.parent_id, input_tokens and output_tokens, and the sessions
+	// counters, were missing until migration 012, which rebuilds turns column
+	// by column and reads sessions.turn_count to decide which transcripts need
+	// re-parsing.
 	stmts := []string{
 		`CREATE TABLE projects (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -262,15 +266,27 @@ func TestMigrator_BootstrapPartial(t *testing.T) {
 			id TEXT PRIMARY KEY,
 			project_id INTEGER,
 			started_at DATETIME NOT NULL,
-			source_file TEXT NOT NULL
+			ended_at DATETIME,
+			model TEXT,
+			git_branch TEXT,
+			turn_count INTEGER DEFAULT 0,
+			input_tokens INTEGER DEFAULT 0,
+			output_tokens INTEGER DEFAULT 0,
+			cache_read_tokens INTEGER DEFAULT 0,
+			cache_write_tokens INTEGER DEFAULT 0,
+			source_file TEXT NOT NULL,
+			source_mtime DATETIME
 		)`,
 		`CREATE TABLE turns (
 			id TEXT PRIMARY KEY,
 			session_id TEXT,
+			parent_id TEXT,
 			type TEXT NOT NULL,
 			timestamp DATETIME NOT NULL,
 			content TEXT,
-			raw_json TEXT
+			raw_json TEXT,
+			input_tokens INTEGER DEFAULT 0,
+			output_tokens INTEGER DEFAULT 0
 		)`,
 		`CREATE TABLE tool_uses (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,

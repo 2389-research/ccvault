@@ -97,22 +97,27 @@ func TestFTSIntegrity_MissingAndConsistent(t *testing.T) {
 	}
 }
 
-// Turns are written with INSERT OR REPLACE. SQLite fires a REPLACE's implicit
-// DELETE through the AFTER DELETE trigger only when recursive_triggers is on,
-// and it is off by default — so a colliding turn id used to index the new
-// content while leaving the old row's FTS entry behind, pointing at content
-// that no longer exists.
+// Turns used to be written with INSERT OR REPLACE. SQLite fires a REPLACE's
+// implicit DELETE through the AFTER DELETE trigger only when
+// recursive_triggers is on, and it is off by default — so a replaced turn
+// indexed the new content while leaving the old row's FTS entry behind,
+// pointing at content that no longer exists.
 //
-// A collision needs two sources to mint the same turn id, which real Claude
-// Code data does not do. It is reachable all the same: PR #36 found the test
-// fixture writeTestSession had been giving every session the identical turn
-// uuids, so one session's insert stole another's turns.
-func TestInsertTurns_CollidingTurnIDLeavesNoFTSGhost(t *testing.T) {
+// The replace exercised here is one session re-parsing its own turn, which is
+// what every re-sync of an edited transcript does. It used to be a *cross*-
+// session collision, on the reasoning that two sources minting the same turn
+// id is something real Claude Code data does not do. #92 established that it
+// does — a resumed transcript copies the earlier session's lines verbatim,
+// uuids included — and that treating those as one row is what deleted 31,864
+// turns from the author's archive. Since migration 012 a turn is identified by
+// (session_id, id), so the cross-session insert is no longer a replace at all
+// and could not test one; TestInsertTurnsKeepsAnotherSessionsCopyOfTheSameUUID
+// covers that case instead.
+func TestInsertTurns_ReplacedTurnLeavesNoFTSGhost(t *testing.T) {
 	db, cleanup := setupTestDB(t)
 	defer cleanup()
 
 	seedTurnSession(t, db, "session-first")
-	seedTurnSession(t, db, "session-second")
 
 	now := time.Now()
 	if err := db.InsertTurns([]models.Turn{{
@@ -131,15 +136,15 @@ func TestInsertTurns_CollidingTurnIDLeavesNoFTSGhost(t *testing.T) {
 		t.Fatalf("index hits for the original content = %d, want 1 — the fixture is not exercising the index", got)
 	}
 
-	// The collision: same turn id, different session, different content.
+	// The replace: same turn, re-parsed with different content.
 	if err := db.InsertTurns([]models.Turn{{
 		ID:        "turn-collide",
-		SessionID: "session-second",
+		SessionID: "session-first",
 		Type:      "user",
 		Timestamp: now.Add(time.Minute),
 		Content:   "sarsaparilla is the word the surviving row holds",
 	}}); err != nil {
-		t.Fatalf("insert colliding turn: %v", err)
+		t.Fatalf("insert replacement turn: %v", err)
 	}
 
 	if got := ftsMatchCount(t, db, "zymurgyghost"); got != 0 {
@@ -163,8 +168,8 @@ func TestInsertTurns_CollidingTurnIDLeavesNoFTSGhost(t *testing.T) {
 	if len(hits) != 1 {
 		t.Fatalf("search for the surviving content returned %d hits, want 1", len(hits))
 	}
-	if hits[0].SessionID != "session-second" {
-		t.Errorf("surviving turn belongs to %q, want session-second", hits[0].SessionID)
+	if hits[0].SessionID != "session-first" {
+		t.Errorf("surviving turn belongs to %q, want session-first", hits[0].SessionID)
 	}
 }
 

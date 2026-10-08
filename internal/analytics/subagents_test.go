@@ -4,6 +4,7 @@
 package analytics
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -27,6 +28,21 @@ func TestAnalyticsCountsSubagentSessions(t *testing.T) {
 		"claude-opus-4", "claude-code", 100, 50, 0)
 	seedSubagentSession(t, database, now.Add(time.Minute), "/tmp/proj-a", "claude-code:parent-a:agent-a1",
 		"parent-a", 1000, 500)
+
+	// Two turns each, matching the turn_count the seeds record. The archive-wide
+	// turn figure is counted off the turns table rather than summed from that
+	// counter (#91), so a seed that sets the counter without writing the rows
+	// would be asserting against a figure nothing reads.
+	for _, sessionID := range []string{"parent-a", "claude-code:parent-a:agent-a1"} {
+		for ordinal := 0; ordinal < 2; ordinal++ {
+			if _, err := database.Exec(
+				`INSERT INTO turns (id, session_id, type, timestamp, content, ordinal)
+				 VALUES (?, ?, 'user', ?, 'c', ?)`,
+				fmt.Sprintf("%s-turn-%d", sessionID, ordinal), sessionID, now, ordinal); err != nil {
+				t.Fatalf("seed turn %d of %s: %v", ordinal, sessionID, err)
+			}
+		}
+	}
 
 	// The summary the TUI and MCP read is driven by these totals.
 	count, turns, tokens, err := database.GetSessionStats()

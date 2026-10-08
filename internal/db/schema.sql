@@ -49,9 +49,17 @@ CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id)
     WHERE parent_session_id IS NOT NULL;
 
 -- Turns table
+--
+-- Keyed on (session_id, id), which is a turn's identity: the session it
+-- belongs to together with its uuid. The uuid alone is not unique across the
+-- archive — a resumed Claude Code transcript copies the earlier session's
+-- lines verbatim, uuids included — so keying on it alone made the
+-- later-parsed session's write delete the earlier session's rows. On the
+-- author's archive that cost 31,864 turns across 201 sessions, 197 of which
+-- were left holding exactly one turn apiece. See migration 012 and #92.
 CREATE TABLE IF NOT EXISTS turns (
-    id TEXT PRIMARY KEY,
-    session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+    id TEXT NOT NULL,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     parent_id TEXT,
     type TEXT NOT NULL,
     timestamp DATETIME NOT NULL,
@@ -74,7 +82,8 @@ CREATE TABLE IF NOT EXISTS turns (
              THEN 'ccvd' || substr(timestamp, 1, 4) || substr(timestamp, 6, 2) || substr(timestamp, 9, 2)
                   || ' ccvym' || substr(timestamp, 1, 4) || substr(timestamp, 6, 2)
              ELSE 'ccvymx' END
-    ) VIRTUAL
+    ) VIRTUAL,
+    PRIMARY KEY (session_id, id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id);
@@ -99,6 +108,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_session_ordinal ON turns(session_id,
 -- turn's tool uses explicitly instead, in every path that deletes a turn: a
 -- database file cannot require a connection setting of whatever opens it, and
 -- #93 is the story of what happens when correctness rests on one.
+--
+-- tool_uses.turn_id's reference is doubly inert since migration 012: turns.id
+-- alone is not a unique key any more, so the clause does not even name one.
+-- Correcting it means rebuilding tool_uses for a declaration that enforces
+-- nothing; anything that enables enforcement has to do that and point the
+-- reference at (session_id, id).
 CREATE TABLE IF NOT EXISTS tool_uses (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     turn_id TEXT REFERENCES turns(id) ON DELETE CASCADE,
@@ -144,6 +159,11 @@ CREATE INDEX IF NOT EXISTS idx_tool_uses_file_path ON tool_uses(file_path);
 -- of that — 1,302 surplus rows from the recovery import (#82) and 6,378 rows
 -- naming a turn that no longer existed (#87).
 --
+-- session_id joined the key in migration 012, when a turn's identity became
+-- (session_id, id). Without it, the index says a shared turn may hold only one
+-- call at each position across the whole archive, so writing one session's copy
+-- of the turn deletes the other session's calls.
+--
 -- Positional rather than keyed on the provider's id, because tool_use_id is not
 -- available everywhere: jeff leaves it empty on 633 of 742 calls, and SQLite
 -- treats NULLs in a unique index as distinct, so the constraint would simply
@@ -160,7 +180,7 @@ CREATE INDEX IF NOT EXISTS idx_tool_uses_file_path ON tool_uses(file_path);
 -- InsertToolUsesTx deletes the row holding the position itself, then plainly
 -- inserts — the shape #93 moved the turns write path to.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_uses_turn_ordinal
-    ON tool_uses(turn_id, turn_ordinal);
+    ON tool_uses(turn_id, session_id, turn_ordinal);
 
 -- Not unique: the same transcript ingested under two sources legitimately
 -- repeats a provider id, and INSERT OR REPLACE resolves a unique conflict by

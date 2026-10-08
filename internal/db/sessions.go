@@ -470,17 +470,31 @@ func nullableString(s string) interface{} {
 
 // GetSessionStats returns aggregate statistics for sessions.
 //
-// Each counter is COALESCEd before it is added, not just the SUM afterwards.
-// Addition in SQL yields NULL if any operand is NULL, so a row holding one
-// NULL counter and four real ones used to contribute nothing at all to the
-// token total — SUM skips a NULL input rather than failing on it, which makes
-// the undercount silent. The outer COALESCE only ever covered the case of no
-// rows at all. Same nullable-column defect as #64, in aggregate form.
+// The turn total is counted off the turns table rather than summed from
+// sessions.turn_count, and that is issue #91. The counter is maintained
+// additively by the write path and drifts: on the author's archive it stood
+// 31,864 turns above the rows, 4.9% too high when the issue was filed, so
+// `stats`, the TUI dashboard, MCP's get_stats and `orient --json` all reported
+// turns that are not in the database. Agents read `orient --json` to decide
+// whether the archive is worth querying at all.
+//
+// COUNT(*) over a million rows is one b-tree walk and this runs once per
+// `stats` / `orient` / dashboard load, not per row. The counter is still worth
+// keeping — see TurnCountDrift, which is what `stats` reports a disagreement
+// from — but nothing should depend on it for a figure the rows can answer.
+//
+// Each token counter is COALESCEd before it is added, not just the SUM
+// afterwards. Addition in SQL yields NULL if any operand is NULL, so a row
+// holding one NULL counter and four real ones used to contribute nothing at
+// all to the token total — SUM skips a NULL input rather than failing on it,
+// which makes the undercount silent. The outer COALESCE only ever covered the
+// case of no rows at all. Same nullable-column defect as #64, in aggregate
+// form.
 func (db *DB) GetSessionStats() (count int, totalTurns int, totalTokens int64, err error) {
 	query := `
 		SELECT
 			COUNT(*),
-			COALESCE(SUM(COALESCE(turn_count, 0)), 0),
+			(SELECT COUNT(*) FROM turns),
 			COALESCE(SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)
 				+ COALESCE(cache_read_tokens, 0) + COALESCE(cache_write_tokens, 0)), 0)
 		FROM sessions`
@@ -489,6 +503,84 @@ func (db *DB) GetSessionStats() (count int, totalTurns int, totalTokens int64, e
 		return 0, 0, 0, fmt.Errorf("get session stats: %w", err)
 	}
 	return count, totalTurns, totalTokens, nil
+}
+
+// TurnDrift is what sessions.turn_count claims against what turns holds.
+type TurnDrift struct {
+	// Counted is SUM(sessions.turn_count) — what the sessions say they hold.
+	Counted int
+	// Rows is COUNT(*) FROM turns — what the archive actually holds.
+	Rows int
+	// Sessions is how many session rows disagree with their own turns, in
+	// either direction.
+	Sessions int
+}
+
+// Drifted reports whether the counter and the rows disagree at all.
+func (d TurnDrift) Drifted() bool {
+	return d.Counted != d.Rows || d.Sessions > 0
+}
+
+// TurnCountDrift measures sessions.turn_count against the turns table.
+//
+// #91 asks for the discrepancy to be surfaced rather than quietly corrected,
+// in the same shape `stats` already uses for reclaimable storage. The reason is
+// that the drift is not a cosmetic accounting error: a session claiming more
+// turns than it holds means its rows were deleted, which is what #92 is, and a
+// visible disagreement is strictly better than a confident wrong number.
+//
+// Both directions count. A counter below the rows is just as much a sign the
+// two have come apart, and reporting only the over-count would hide it.
+func (db *DB) TurnCountDrift() (TurnDrift, error) {
+	var d TurnDrift
+	err := db.QueryRow(`
+		SELECT
+			(SELECT COALESCE(SUM(COALESCE(turn_count, 0)), 0) FROM sessions),
+			(SELECT COUNT(*) FROM turns),
+			(SELECT COUNT(*) FROM sessions s
+			 WHERE COALESCE(s.turn_count, 0) <>
+			       (SELECT COUNT(*) FROM turns t WHERE t.session_id = s.id))
+	`).Scan(&d.Counted, &d.Rows, &d.Sessions)
+	if err != nil {
+		return TurnDrift{}, fmt.Errorf("measure turn count drift: %w", err)
+	}
+	return d, nil
+}
+
+// ReconcileSessionTurnCounts rewrites sessions.turn_count from the rows each
+// session actually holds, and returns how many counters it corrected.
+//
+// This is step three of #92's order, and the order is the whole point.
+// turn_count drifts because the write path maintained it additively while
+// another session's write could delete the rows underneath it; reconciling it
+// before the deleted turns have been re-parsed would make the counter agree
+// with a database that is still missing them, destroying the only visible
+// evidence anything is wrong. So this runs at the end of a sync that re-read
+// every transcript on disk — never from a migration, and never from an
+// incremental run that touched four files.
+//
+// The `<>` guard is what makes a clean archive's pass free: no row is written
+// unless its counter is wrong, so the UPDATE touches nothing on an archive
+// that is already consistent, and RowsAffected is a true count of repairs.
+// Same discipline as migration 011's backfill and ReconcileProjectAggregates.
+func (db *DB) ReconcileSessionTurnCounts() (int64, error) {
+	res, err := db.Exec(`
+		UPDATE sessions
+		SET turn_count = src.n
+		FROM (
+			SELECT s.id, (SELECT COUNT(*) FROM turns t WHERE t.session_id = s.id) AS n
+			FROM sessions s
+		) AS src
+		WHERE sessions.id = src.id
+		  AND COALESCE(sessions.turn_count, 0) <> src.n`)
+	if err != nil {
+		return 0, fmt.Errorf("reconcile session turn counts: %w", err)
+	}
+	corrected, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("reconcile session turn counts: rows affected: %w", err)
+	}
+	return corrected, nil
 }
 
 // GetSessionBySourceFile retrieves a session by its source file path. Same

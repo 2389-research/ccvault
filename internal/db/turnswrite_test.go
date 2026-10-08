@@ -256,11 +256,19 @@ func TestInsertOrReplace_LeavesFTSOrphansWithoutRecursiveTriggers(t *testing.T) 
 	}
 }
 
-// `ccvault import` writes turns too, and it collides the same way: a turn
-// uuid can belong to a session the merge never picked, because a resumed
-// transcript copies the earlier session's lines verbatim. The invariant has to
-// hold for every writer of turns or the next one reintroduces the dependency.
-func TestMergeFrom_StolenTurnIDKeepsFTSConsistent(t *testing.T) {
+// `ccvault import` writes turns too, and it meets the same shared uuid: a
+// resumed transcript copies the earlier session's lines verbatim, so a turn
+// uuid in the incoming archive can already be in the destination under another
+// session. The FTS invariant has to hold for every writer of turns or the next
+// one reintroduces the dependency on recursive_triggers.
+//
+// What the merge must *not* do is treat the two as one row. This test used to
+// assert that the import replaced the destination's turn and that the index
+// stopped answering for it — the behaviour #92 identified as the defect, and
+// the one that cost the author's archive 31,864 turns. Since migration 012 a
+// turn is identified by (session_id, id), so both sessions keep their copy and
+// the index has to answer for both, exactly once each.
+func TestMergeFrom_SharedTurnIDKeepsBothCopiesAndFTSConsistent(t *testing.T) {
 	for _, recursiveTriggers := range []int{1, 0} {
 		t.Run(fmt.Sprintf("recursive_triggers=%d", recursiveTriggers), func(t *testing.T) {
 			dest := openArchiveWithRecursiveTriggers(t, recursiveTriggers)
@@ -291,12 +299,21 @@ func TestMergeFrom_StolenTurnIDKeepsFTSConsistent(t *testing.T) {
 				t.Fatalf("MergeFrom: %v", err)
 			}
 
-			assertFTSSound(t, dest, "after merging a session that claims a turn id the destination held")
-			if got := ftsMatchCount(t, dest, "{content} : destinationcontent"); got != 0 {
-				t.Errorf("index still answers for the replaced turn with %d documents", got)
+			assertFTSSound(t, dest, "after merging a session that shares a turn id with the destination")
+			if got := ftsMatchCount(t, dest, "{content} : destinationcontent"); got != 1 {
+				t.Errorf("index answers for the destination's own turn with %d documents, want 1 — "+
+					"the import took a turn belonging to a session it never picked", got)
 			}
 			if got := ftsMatchCount(t, dest, "{content} : incomingcontent"); got != 1 {
 				t.Errorf("index answers for the imported turn with %d documents, want 1", got)
+			}
+			var copies int
+			if err := dest.QueryRow(
+				"SELECT COUNT(*) FROM turns WHERE id = 'shared-turn'").Scan(&copies); err != nil {
+				t.Fatalf("count copies of the shared turn: %v", err)
+			}
+			if copies != 2 {
+				t.Errorf("%d rows hold the shared uuid, want 2 — one per session", copies)
 			}
 		})
 	}
