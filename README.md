@@ -16,11 +16,14 @@ Inspired by [msgvault](https://github.com/wesm/msgvault), ccvault provides offli
 
 ## Installation
 
-### Homebrew (macOS/Linux)
+### Homebrew (macOS)
 
 ```bash
 brew install 2389-research/tap/ccvault
 ```
+
+The tap carries macOS builds only — on Linux use `go install` or build from
+source.
 
 ### Using `go install`
 

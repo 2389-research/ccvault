@@ -1,2 +1,15 @@
+# Explicit versions, not "latest". CI pins the same numbers, so a clean local
+# run means a clean CI run; "latest" on either side guarantees they drift
+# apart. Bumping a version here means bumping it in the workflows too:
+#
+#   golangci-lint  ->  .github/workflows/ci.yml       (Lint job)
+#   goreleaser     ->  .github/workflows/ci.yml       (Release config job)
+#                      .github/workflows/release.yml  (Release (macOS) job)
+#
+# golangci-lint's pin also moves with go.mod's Go version: it type-checks with
+# the go/types built into the binary, which rejects any file requiring a newer
+# Go than that. A linter older than the toolchain does not report findings, it
+# panics. Raising `go` in go.mod means checking this version still runs.
 [tools]
-golangci-lint = "latest"
+golangci-lint = "2.11.4"
+goreleaser = "2.18.2"

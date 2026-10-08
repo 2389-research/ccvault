@@ -72,6 +72,26 @@ changelog:
     - title: 'Other'
       order: 999
 
+# `brews` is deprecated in favour of `homebrew_casks`, and that migration is
+# deliberately NOT done here. Do not "fix" this in passing.
+#
+# The deprecation is soft: it fails `goreleaser check` and nothing else.
+# Verified on goreleaser 2.18.2 -- a real release still writes the formula and
+# exits 0, reporting only "you are using deprecated options". So the present
+# cost of staying is a red `check`, while the cost of migrating is that every
+# existing tap user must run `brew uninstall ccvault` by hand, because
+# GoReleaser would stop writing Formula/ccvault.rb and Homebrew will not
+# replace a Formula with a Cask on its own.
+#
+# That trade is not ours to make one repo at a time: 14 of 18 repos in the org
+# are in the same position, and the tap already carries Casks whose Formulae
+# were deleted rather than kept alongside. It is tracked tap-wide in
+# 2389-research/homebrew-tap#1, which is also where the signing-and-notarizing
+# approach lives -- Casks are quarantined on download, and the org already
+# solves that with a Developer ID cert rather than by stripping the attribute.
+#
+# CI's Release config job tolerates exactly this one deprecation and fails on
+# anything else, including upstream finally removing `brews`.
 brews:
   - repository:
       owner: 2389-research

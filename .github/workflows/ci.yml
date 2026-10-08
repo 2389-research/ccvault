@@ -88,9 +88,82 @@ jobs:
       - name: Run golangci-lint
         uses: golangci/golangci-lint-action@v7
         with:
-          version: v2.7.2
+          # Must match mise.toml's golangci-lint pin, or a developer and CI
+          # lint with different rule sets and disagree in both directions.
+          #
+          # This pin is coupled to the Go toolchain, so it moves when go.mod's
+          # Go version does. golangci-lint type-checks with the go/types
+          # vendored into the version you run, and that copy refuses any file
+          # requiring a newer Go than it was built with. The old v2.7.2 pin is
+          # built with go1.25, so it panics outright on a toolchain where a
+          # dependency declares go1.26 -- it survived here only because the
+          # runner's Go happened to match it, while contributors on current Go
+          # could not lint at all. It also reported gosec G602 on bounds it
+          # could not prove, which cost a round-trip on #118.
+          version: v2.11.4
           args: --timeout=10m
           verify: false
+
+  release-config:
+    name: Release config
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      # `goreleaser check` catches deprecated and invalid keys in seconds. It
+      # belongs on every PR because the alternative is finding out at tag time,
+      # when the fix costs a deleted tag and a re-cut release.
+      - name: Install GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          # Must match the pin in release.yml, so this job validates the config
+          # against the exact binary that will build the release.
+          version: v2.18.2
+          install-only: true
+
+      # `goreleaser check` exits non-zero for a deprecated key just as it does
+      # for an invalid one, and .goreleaser.yml still uses `brews` on purpose
+      # (see the comment there, and 2389-research/homebrew-tap#1). So that one
+      # deprecation is tolerated and everything else fails.
+      #
+      # Fail-closed by construction: the job passes only when `check` exits 0,
+      # or when it fails with the deprecation-only message AND every DEPRECATED
+      # line names `brews`. An invalid key, a second deprecation, upstream
+      # removing `brews` outright, or goreleaser rewording its own output all
+      # fail the job rather than passing quietly. That last case is the point --
+      # it means the removal lands on a PR instead of on a tag.
+      - name: Check .goreleaser.yml
+        run: |
+          status=0
+          raw=$(goreleaser check 2>&1) || status=$?
+          printf '%s\n' "$raw"
+
+          if [ "$status" -eq 0 ]; then
+            exit 0
+          fi
+
+          # goreleaser colourises its output here even with no TTY, and it wraps
+          # the key name in escapes -- `brews` arrives as ESC[94mbrews ESC[0m,
+          # so matching the plain word fails. Strip ANSI before matching rather
+          # than setting NO_COLOR, which goreleaser ignores when something has
+          # already forced colour on. ESC is built with printf so this works
+          # under BSD sed as well as GNU.
+          esc=$(printf '\033')
+          output=$(printf '%s\n' "$raw" | sed "s/${esc}\[[0-9;]*m//g")
+
+          if ! printf '%s\n' "$output" | grep -qF 'configuration is valid, but uses deprecated properties'; then
+            echo "::error::goreleaser check failed for a reason other than a deprecated key."
+            exit "$status"
+          fi
+
+          if printf '%s\n' "$output" | grep -F 'DEPRECATED:' | grep -qvF ' brews '; then
+            echo "::error::goreleaser check reports a deprecation other than the known 'brews' one."
+            exit "$status"
+          fi
+
+          echo "::notice::Only the known 'brews' deprecation, tracked in 2389-research/homebrew-tap#1."
 
   build:
     name: Build
