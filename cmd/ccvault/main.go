@@ -316,6 +316,81 @@ func printIntegritySection(f db.FTSIntegrity) {
 	fmt.Println()
 }
 
+// rawJSONJSON renders the stored-payload check for --json consumers, alongside
+// storageJSON and integrityJSON.
+func rawJSONJSON(r db.RawJSONIntegrity, withSource, withoutSource int) map[string]interface{} {
+	return map[string]interface{}{
+		"turns":                   r.Turns,
+		"scanned":                 r.Scanned,
+		"invalid":                 r.Invalid,
+		"sessions":                r.Sessions,
+		"sessions_with_source":    withSource,
+		"sessions_without_source": withoutSource,
+		"complete":                r.Complete,
+		"consistent":              r.Consistent(),
+	}
+}
+
+// printRawJSONSection writes the human-readable stored-payload block.
+//
+// A turn whose raw_json is not JSON is invisible by every other measure: it is
+// indexed, searchable and counted, and only the things re-derived from the raw
+// line — tool payloads, thinking blocks — come back empty, because GetTurns
+// drops a payload it cannot parse rather than crashing its caller. 216,978 such
+// turns sat in the author's archive without anything reporting them (#101), so
+// the point of this block is that a recurrence is noticed.
+func printRawJSONSection(r db.RawJSONIntegrity, withSource, withoutSource int) {
+	if r.Scanned == 0 {
+		return
+	}
+	fmt.Println("Raw payloads:")
+	if r.Consistent() {
+		if r.Complete {
+			fmt.Printf("  Valid JSON:    all %d turns\n", r.Turns)
+		} else {
+			fmt.Printf("  Valid JSON:    the newest %d of %d turns\n", r.Scanned, r.Turns)
+			fmt.Println("  Check every turn with 'ccvault stats --check-raw-json'.")
+		}
+		fmt.Println()
+		return
+	}
+	scope := fmt.Sprintf("of the newest %d turns", r.Scanned)
+	if r.Complete {
+		scope = fmt.Sprintf("of %d turns", r.Turns)
+	}
+	fmt.Printf("  Invalid JSON:  %d %s, across %d session(s)\n", r.Invalid, scope, r.Sessions)
+	if withSource > 0 {
+		// Re-parsing is the only repair: the stored bytes are a fragment of
+		// unrelated input, so there is nothing in the archive to reconstruct
+		// them from. --full, not --rebuild, for the same reason the search
+		// index section says so — a rebuild discards every session whose
+		// source is gone, which here is most of them.
+		fmt.Printf("  With source:   %d session(s) still have a transcript on disk;\n", withSource)
+		fmt.Println("                 repair those with 'ccvault sync --full'.")
+	}
+	if withoutSource > 0 {
+		fmt.Printf("  No source:     %d session(s) cannot be repaired — the transcript is gone,\n", withoutSource)
+		fmt.Println("                 and the stored bytes are a fragment of unrelated input")
+		fmt.Println("                 rather than a truncation of the right one.")
+	}
+	fmt.Println()
+}
+
+// sessionSourceFileSplit counts how many of the given source files still exist.
+// Which of them survive is what decides whether damaged payloads can be
+// re-parsed at all; a stat error that isn't "not exists" counts as present, so
+// an unreadable path is never reported as unrepairable.
+func sessionSourceFileSplit(paths []string) (present, missing int) {
+	for _, path := range paths {
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			missing++
+			continue
+		}
+		present++
+	}
+	return present, missing
+}
+
 var orientCmd = &cobra.Command{
 	Use:   "orient",
 	Short: "Output database state for AI agents",
@@ -799,6 +874,19 @@ var statsCmd = &cobra.Command{
 			return fmt.Errorf("check search index integrity: %w", err)
 		}
 
+		// json_valid has to read every byte of raw_json, which is most of the
+		// database file, so the default report covers the newest turns only —
+		// see db.CheckRawJSONIntegrity for the measurements behind that.
+		rawWindow := int64(db.DefaultRawJSONWindow)
+		if checkAllRawJSON, _ := cmd.Flags().GetBool("check-raw-json"); checkAllRawJSON {
+			rawWindow = 0
+		}
+		rawJSON, err := database.CheckRawJSONIntegrity(rawWindow)
+		if err != nil {
+			return fmt.Errorf("check raw_json integrity: %w", err)
+		}
+		rawWithSource, rawWithoutSource := sessionSourceFileSplit(rawJSON.SourceFiles)
+
 		if jsonOutput {
 			out := map[string]interface{}{
 				"projects":        projectCount,
@@ -810,6 +898,7 @@ var statsCmd = &cobra.Command{
 				"top_tools":       toolStats,
 				"storage":         storageJSON(storage),
 				"search_index":    integrityJSON(integrity),
+				"raw_json":        rawJSONJSON(rawJSON, rawWithSource, rawWithoutSource),
 			}
 			if !first.IsZero() && !last.IsZero() {
 				out["activity"] = map[string]interface{}{
@@ -841,6 +930,7 @@ var statsCmd = &cobra.Command{
 
 		printStorageSection(storage)
 		printIntegritySection(integrity)
+		printRawJSONSection(rawJSON, rawWithSource, rawWithoutSource)
 
 		if len(tokensByModel) > 0 {
 			fmt.Println("Tokens by Model:")
@@ -1579,6 +1669,8 @@ func init() {
 
 	// Stats flags
 	statsCmd.Flags().Bool("json", false, "Output as JSON for machine parsing")
+	statsCmd.Flags().Bool("check-raw-json", false,
+		fmt.Sprintf("Check every turn's stored payload for valid JSON instead of the newest %d. Reads the whole raw_json column — ~35s per 6 GB of archive", db.DefaultRawJSONWindow))
 
 	// Vacuum flags
 	vacuumCmd.Flags().Bool("json", false, "Output as JSON for machine parsing")

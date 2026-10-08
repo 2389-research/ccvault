@@ -218,6 +218,12 @@ func (db *DB) GetProjectStats() (count int, totalTokens int64, err error) {
 // incoming"), so re-parsing a session file that is already indexed inflates
 // them. Recomputing from the rows that actually exist is the only way to get
 // them back in step, and it is cheap: sessions are indexed by project_id.
+// Each token counter is COALESCEd before it is added, not just the SUM
+// afterwards. Addition in SQL yields NULL if any operand is NULL and SUM skips
+// a NULL input rather than failing on it, so a session holding one NULL counter
+// used to contribute nothing at all to its project's total — a silent
+// undercount in the very function that exists to stop these counters drifting.
+// Same shape GetSessionStats fixed for #64; see #110.
 func (db *DB) ReconcileProjectAggregates(paths []string) error {
 	// first_seen_at and last_activity_at are deliberately left alone: the
 	// former is write-once at insert, the latter is already updated with a
@@ -234,7 +240,8 @@ func (db *DB) ReconcileProjectAggregates(paths []string) error {
 				SELECT COUNT(*) FROM sessions WHERE sessions.project_id = projects.id
 			),
 			total_tokens = (
-				SELECT COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens), 0)
+				SELECT COALESCE(SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)
+					+ COALESCE(cache_read_tokens, 0) + COALESCE(cache_write_tokens, 0)), 0)
 				FROM sessions WHERE sessions.project_id = projects.id
 			)`
 
