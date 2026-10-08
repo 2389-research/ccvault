@@ -41,7 +41,13 @@ jobs:
         uses: goreleaser/goreleaser-action@v6
         with:
           distribution: goreleaser
-          version: latest
+          # Explicit version, never `latest`. With `latest` the release used
+          # whichever GoReleaser shipped most recently at tag time, so the same
+          # tag could build differently next month and an upstream breaking
+          # change would land on a tag rather than on a PR. This pin is the
+          # version CI's Release config job runs `goreleaser check` against;
+          # bump both together, and mise.toml with them.
+          version: v2.18.2
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

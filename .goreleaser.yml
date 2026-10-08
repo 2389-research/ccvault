@@ -72,19 +72,45 @@ changelog:
     - title: 'Other'
       order: 999
 
-brews:
-  - repository:
+# Homebrew Cask, not Formula. GoReleaser soft-deprecated `brews` in v2.10 and
+# hard-deprecated it in v2.16; `goreleaser check` fails on it, and the next
+# major removes it outright. A Cask is the supported way to ship a
+# pre-compiled binary through a tap, so this writes Casks/ccvault.rb rather
+# than Formula/ccvault.rb.
+#
+# Two consequences of the switch, both deliberate:
+#   - `test:` has no Cask equivalent, so the old `ccvault version` smoke test
+#     is gone. Casks are not built from source and Homebrew does not run one.
+#   - `license:` is accepted by the schema but never rendered into a Cask, so
+#     it is dropped instead of kept as dead config.
+homebrew_casks:
+  - name: ccvault
+    repository:
       owner: 2389-research
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
-    directory: Formula
+    directory: Casks
     homepage: https://github.com/2389-research/ccvault
     description: "Claude Code conversation archive and analysis tool"
-    license: MIT
     commit_author:
       name: goreleaserbot
       email: bot@goreleaser.com
-    install: |
-      bin.install "ccvault"
-    test: |
-      system "#{bin}/ccvault", "version"
+    # Cask equivalent of the old `bin.install "ccvault"`: symlink this
+    # executable out of the staged archive onto the PATH.
+    binaries:
+      - ccvault
+    # There is no `conflicts: [formula: ccvault]` guarding against the old
+    # Formula still being installed, because Homebrew removed Cask-vs-Formula
+    # conflicts (Homebrew/brew#20499) and GoReleaser deprecated the field to
+    # match: it would be a no-op that fails `goreleaser check`. Anyone on the
+    # old Formula has to `brew uninstall ccvault` before installing the Cask.
+    #
+    # Homebrew quarantines Cask downloads, and these binaries are unsigned, so
+    # without this Gatekeeper reports "ccvault is damaged and cannot be
+    # opened". Formulae were never quarantined, which is why this hook is new.
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/ccvault"]
+          end

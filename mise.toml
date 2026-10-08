@@ -1,2 +1,10 @@
+# Explicit versions, not "latest". CI pins the same numbers, so a clean local
+# run means a clean CI run; "latest" on either side guarantees they drift
+# apart. Bumping a version here means bumping it in the workflows too:
+#
+#   golangci-lint  ->  .github/workflows/ci.yml       (Lint job)
+#   goreleaser     ->  .github/workflows/ci.yml       (Release config job)
+#                      .github/workflows/release.yml  (Release (macOS) job)
 [tools]
-golangci-lint = "latest"
+golangci-lint = "2.11.4"
+goreleaser = "2.18.2"

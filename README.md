@@ -16,9 +16,19 @@ Inspired by [msgvault](https://github.com/wesm/msgvault), ccvault provides offli
 
 ## Installation
 
-### Homebrew (macOS/Linux)
+### Homebrew (macOS)
 
 ```bash
+brew install 2389-research/tap/ccvault
+```
+
+The tap ships a Cask, so this is macOS only — on Linux use `go install` or
+build from source. If you installed ccvault from the tap before it became a
+Cask, uninstall the old Formula once first; Homebrew will not replace one with
+the other on its own:
+
+```bash
+brew uninstall ccvault
 brew install 2389-research/tap/ccvault
 ```
 
