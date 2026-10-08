@@ -60,9 +60,10 @@ built:  2026-10-08T12:34:56Z
 ```
 
 The first line is always `ccvault <version>`, so a script can read the version
-off it. An unstamped build reports `dev` with the commit Go embeds from the
-source tree; a fact the binary does not carry reads `unknown` rather than
-being guessed at.
+off it. An unstamped source-tree build reports `dev` with the commit Go embeds
+from the tree, while one installed with `go install <module>@<version>` reports
+that module version. A fact the binary does not carry reads `unknown` rather
+than being guessed at.
 
 ## Quick Start
 
