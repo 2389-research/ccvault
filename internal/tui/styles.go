@@ -125,6 +125,12 @@ var (
 			Foreground(lipgloss.Color("#9CA3AF")). // Gray
 			PaddingLeft(4)
 
+	// tabLabelStyle dims an unselected tab. dimStyle gives the right colour
+	// but carries PaddingLeft(4), which spends 16 columns on a five-tab bar
+	// and pushes the Analytics tab bar past an 80-column terminal.
+	tabLabelStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#9CA3AF")) // Gray
+
 	linkStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#60A5FA")). // Blue
 			Underline(true).

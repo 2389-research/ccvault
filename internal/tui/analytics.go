@@ -30,6 +30,7 @@ type AnalyticsModel struct {
 	dailyTokens []analytics.DailyTokens
 	topProjects []analytics.ProjectStats
 	modelStats  []analytics.ModelStats
+	agentRoles  []analytics.AgentRoleStats
 	summary     *analytics.Summary
 	selectedTab int
 	viewport    viewport.Model
@@ -41,9 +42,10 @@ const (
 	tabDaily
 	tabProjects
 	tabModels
+	tabSubagents
 )
 
-var tabNames = []string{"Summary", "Daily Usage", "Top Projects", "By Model"}
+var tabNames = []string{"Summary", "Daily Usage", "Top Projects", "By Model", "Subagents"}
 
 // NewAnalyticsModel creates a new analytics model
 func NewAnalyticsModel(database *db.DB, cacheDir string) *AnalyticsModel {
@@ -63,6 +65,7 @@ type analyticsLoadedMsg struct {
 	dailyTokens []analytics.DailyTokens
 	topProjects []analytics.ProjectStats
 	modelStats  []analytics.ModelStats
+	agentRoles  []analytics.AgentRoleStats
 	summary     *analytics.Summary
 	err         error
 }
@@ -112,10 +115,16 @@ func (m *AnalyticsModel) loadAnalytics() tea.Msg {
 		return analyticsLoadedMsg{err: fmt.Errorf("get model stats: %w", err)}
 	}
 
+	agentRoles, err := analyzer.GetStatsByAgentRole()
+	if err != nil {
+		return analyticsLoadedMsg{err: fmt.Errorf("get agent role stats: %w", err)}
+	}
+
 	return analyticsLoadedMsg{
 		dailyTokens: dailyTokens,
 		topProjects: topProjects,
 		modelStats:  modelStats,
+		agentRoles:  agentRoles,
 		summary:     summary,
 	}
 }
@@ -132,6 +141,7 @@ func (m *AnalyticsModel) Update(msg tea.Msg) tea.Cmd {
 		m.dailyTokens = msg.dailyTokens
 		m.topProjects = msg.topProjects
 		m.modelStats = msg.modelStats
+		m.agentRoles = msg.agentRoles
 		m.summary = msg.summary
 		m.updateViewport()
 		return nil
@@ -167,6 +177,8 @@ func (m *AnalyticsModel) Update(msg tea.Msg) tea.Cmd {
 			m.selectedTab = tabProjects
 		case msg.String() == "4":
 			m.selectedTab = tabModels
+		case msg.String() == "5":
+			m.selectedTab = tabSubagents
 		}
 		// Update viewport content when tab changes
 		if oldTab != m.selectedTab {
@@ -200,6 +212,8 @@ func (m *AnalyticsModel) updateViewport() {
 		content = m.renderTopProjects()
 	case tabModels:
 		content = m.renderModelStats()
+	case tabSubagents:
+		content = m.renderSubagents()
 	}
 	m.viewport.SetContent(content)
 	m.viewport.GotoTop()
@@ -259,7 +273,7 @@ func (m *AnalyticsModel) View() string {
 	if m.ready {
 		scrollPercent = int(m.viewport.ScrollPercent() * 100)
 	}
-	b.WriteString(helpStyle.Render(fmt.Sprintf("←/→ or 1-4: tabs • ↑/↓: scroll • %d%% • r: refresh • esc/q: back • ctrl+c: quit", scrollPercent)))
+	b.WriteString(helpStyle.Render(fmt.Sprintf("←/→ or 1-5: tabs • ↑/↓: scroll • %d%% • r: refresh • esc/q: back • ctrl+c: quit", scrollPercent)))
 
 	return b.String()
 }
@@ -270,7 +284,7 @@ func (m *AnalyticsModel) renderTabs() string {
 		if i == m.selectedTab {
 			tabs = append(tabs, selectedStyle.Render(fmt.Sprintf("[%d] %s", i+1, name)))
 		} else {
-			tabs = append(tabs, dimStyle.Render(fmt.Sprintf(" %d  %s", i+1, name)))
+			tabs = append(tabs, tabLabelStyle.Render(fmt.Sprintf(" %d  %s", i+1, name)))
 		}
 	}
 	return strings.Join(tabs, "  ")
@@ -443,6 +457,111 @@ func (m *AnalyticsModel) renderModelStats() string {
 	}
 
 	return strings.Join(lines, "\n")
+}
+
+// renderSubagents splits the archive into top-level and subagent sessions.
+//
+// It leads with per-session shape rather than totals on purpose. Aggregate
+// subagent spend is a small slice — 0.8% of sessions and 7.9% of tokens on
+// the author's 47,409-session archive, not the 49% of turns #74 claimed,
+// which counted files on disk rather than archived sessions (#111). The large
+// effect is per session: a subagent transcript averages roughly six times the
+// turns and eleven times the tokens of a top-level one, so a per-session
+// average over the undivided pool reports a number true of neither
+// population. The share tables come second so nobody reads the averages as a
+// claim that subagents dominate the archive.
+func (m *AnalyticsModel) renderSubagents() string {
+	if len(m.agentRoles) == 0 {
+		return dimStyle.Render("No session data available")
+	}
+
+	var top, sub analytics.AgentRoleStats
+	for _, r := range m.agentRoles {
+		switch r.Role {
+		case analytics.AgentRoleTopLevel:
+			top = r
+		case analytics.AgentRoleSubagent:
+			sub = r
+		}
+	}
+
+	var lines []string
+
+	// The headline, where both populations exist to compare.
+	if top.SessionCount > 0 && sub.SessionCount > 0 {
+		lines = append(lines,
+			fmt.Sprintf("Subagent sessions run %s the turns and %s the tokens of a top-level",
+				formatRatio(sub.AvgTurnsPerSession(), top.AvgTurnsPerSession()),
+				formatRatio(sub.AvgTokensPerSession(), top.AvgTokensPerSession())),
+			"session — so a per-session average over both describes neither.",
+			"")
+	} else if sub.SessionCount == 0 {
+		lines = append(lines, dimStyle.Render("No subagent sessions in this archive."), "")
+	}
+
+	bold := lipgloss.NewStyle().Bold(true)
+	// Faint rather than dimStyle: dimStyle carries PaddingLeft(4), which would
+	// shift these lines out of the columns they belong to.
+	faint := lipgloss.NewStyle().Faint(true)
+
+	lines = append(lines, bold.Render("Per session"))
+	lines = append(lines, bold.Render(fmt.Sprintf("%-22s %10s %12s %14s",
+		"Population", "Sessions", "Avg Turns", "Avg Tokens")))
+	lines = append(lines, strings.Repeat("─", 61))
+	for _, r := range m.agentRoles {
+		lines = append(lines, fmt.Sprintf("%-22s %10d %12.1f %14s",
+			r.Role, r.SessionCount, r.AvgTurnsPerSession(),
+			formatCompact(int64(r.AvgTokensPerSession()))))
+	}
+	if top.SessionCount > 0 && sub.SessionCount > 0 {
+		lines = append(lines, faint.Render(fmt.Sprintf("%-22s %10s %12s %14s",
+			"subagent vs top-level", "",
+			formatRatio(sub.AvgTurnsPerSession(), top.AvgTurnsPerSession()),
+			formatRatio(sub.AvgTokensPerSession(), top.AvgTokensPerSession()))))
+	}
+
+	// Totals, for scale — the number the averages are not a claim about.
+	var totalSessions int
+	var totalTokens int64
+	for _, r := range m.agentRoles {
+		totalSessions += r.SessionCount
+		totalTokens += r.TotalTokens
+	}
+
+	lines = append(lines, "", bold.Render("Share of archive"))
+	lines = append(lines, bold.Render(fmt.Sprintf("%-22s %10s %9s %12s %9s",
+		"Population", "Sessions", "Share", "Tokens", "Share")))
+	lines = append(lines, strings.Repeat("─", 66))
+	for _, r := range m.agentRoles {
+		lines = append(lines, fmt.Sprintf("%-22s %10d %8.1f%% %12s %8.1f%%",
+			r.Role,
+			r.SessionCount, percentOf(int64(r.SessionCount), int64(totalSessions)),
+			formatCompact(r.TotalTokens), percentOf(r.TotalTokens, totalTokens)))
+	}
+
+	// What is in the token figure, said out loud: it is the sum of each
+	// session's recorded usage, so it is only as complete as that accounting.
+	lines = append(lines, "", faint.Render(
+		"Tokens count each session's recorded input, output and cache usage."))
+
+	return strings.Join(lines, "\n")
+}
+
+// formatRatio renders a multiple as "6.0x", or "—" when there is no
+// denominator to divide by.
+func formatRatio(value, base float64) string {
+	if base == 0 {
+		return "—"
+	}
+	return fmt.Sprintf("%.1fx", value/base)
+}
+
+// percentOf returns part as a percentage of total, 0 when total is 0.
+func percentOf(part, total int64) float64 {
+	if total == 0 {
+		return 0
+	}
+	return float64(part) / float64(total) * 100
 }
 
 // renderBar creates a simple ASCII bar chart

@@ -246,7 +246,7 @@ func TestHelpOverlayIsPerViewAndFitsEightyColumns(t *testing.T) {
 		// that mentions it (#102).
 		{ConversationView, []string{"Conversation", "e or x", "a", "r", "GLAMOUR_STYLE"}},
 		{SearchView, []string{"Search", "shift+tab"}},
-		{AnalyticsView, []string{"Analytics", "1-4"}},
+		{AnalyticsView, []string{"Analytics", "1-5"}},
 		{SyncingView, []string{"Sync", "esc"}},
 	}
 

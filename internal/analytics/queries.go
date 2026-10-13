@@ -329,6 +329,92 @@ func (a *Analyzer) GetSessionsBySource() ([]SourceSessionStats, error) {
 	return results, rows.Err()
 }
 
+// Agent roles a session can hold. A session either was dispatched by another
+// session or it was not; `parent_session_id` carries that and nothing else.
+const (
+	AgentRoleTopLevel = "top-level"
+	AgentRoleSubagent = "subagent"
+)
+
+// AgentRoleStats aggregates sessions by agent role. It stores counts only —
+// the averages, which are the reason the split is worth drawing, are derived
+// so no caller can arrive at a different per-session figure than another.
+type AgentRoleStats struct {
+	Role         string `json:"role"`
+	SessionCount int    `json:"session_count"`
+	TotalTurns   int64  `json:"total_turns"`
+	TotalTokens  int64  `json:"total_tokens"`
+}
+
+// AvgTurnsPerSession returns turns per session, 0 for a role with none.
+func (s AgentRoleStats) AvgTurnsPerSession() float64 {
+	if s.SessionCount == 0 {
+		return 0
+	}
+	return float64(s.TotalTurns) / float64(s.SessionCount)
+}
+
+// AvgTokensPerSession returns tokens per session, 0 for a role with none.
+func (s AgentRoleStats) AvgTokensPerSession() float64 {
+	if s.SessionCount == 0 {
+		return 0
+	}
+	return float64(s.TotalTokens) / float64(s.SessionCount)
+}
+
+// GetStatsByAgentRole splits the cache into top-level and subagent sessions.
+//
+// Aggregate share is the less interesting half: on the author's archive
+// subagents are 0.8% of sessions and 7.9% of tokens, so #74's headline claim
+// of 49% of turns described files on disk rather than the archive (#111).
+// What the split is for is that the two populations have very different
+// shapes — 128.9 turns and 31,807 tokens a session against 21.5 and 2,851 —
+// which makes any per-session average over the undivided pool a figure
+// describing neither.
+//
+// Deliberately not written defensively around a missing parent_session_id: a
+// COALESCE would report a pre-#147 cache as entirely top-level, which is a
+// wrong answer wearing a right answer's clothes. Erroring lets the caller's
+// staleness check (#149) rebuild instead.
+func (a *Analyzer) GetStatsByAgentRole() ([]AgentRoleStats, error) {
+	sessionsPath := filepath.Join(a.cacheDir, "sessions.parquet")
+
+	// Check if parquet file exists
+	if _, err := os.Stat(sessionsPath); os.IsNotExist(err) {
+		return nil, fmt.Errorf("analytics cache not found. Run 'ccvault build-cache' first")
+	}
+
+	// Alias intentionally not named `role`: see GetTokensBySource for the
+	// DuckDB binder collision this avoids.
+	query := fmt.Sprintf(`
+		SELECT
+			CASE WHEN parent_session_id <> '' THEN '%s' ELSE '%s' END as role_out,
+			COUNT(*) as session_count,
+			COALESCE(SUM(turn_count), 0) as total_turns,
+			COALESCE(SUM(total_tokens), 0) as total_tokens
+		FROM read_parquet('%s')
+		GROUP BY 1
+		ORDER BY session_count DESC
+	`, AgentRoleSubagent, AgentRoleTopLevel, sessionsPath)
+
+	rows, err := a.db.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("query: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var results []AgentRoleStats
+	for rows.Next() {
+		var s AgentRoleStats
+		if err := rows.Scan(&s.Role, &s.SessionCount, &s.TotalTurns, &s.TotalTokens); err != nil {
+			return nil, fmt.Errorf("scan: %w", err)
+		}
+		results = append(results, s)
+	}
+
+	return results, rows.Err()
+}
+
 // Summary returns overall analytics summary
 type Summary struct {
 	TotalSessions int       `json:"total_sessions"`
