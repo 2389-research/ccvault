@@ -465,6 +465,146 @@ func TestCompact_RowCountMismatchIsNotSwappedIn(t *testing.T) {
 	}
 }
 
+// TestCompact_MalformedFTSIndexIsNotSwappedIn is #104.
+//
+// The copy is structurally valid and holds exactly the right number of rows in
+// every table — because it faithfully copied a source whose search index was
+// already shredded, which is how this archive has arrived here three times
+// (#81, #93, and the incident of 2026-10-13). Both checks that were there pass,
+// and the copy's turns_fts answers queries for text no turn holds. Compaction
+// is the one operation whose bad outcome cannot be undone by re-running it: it
+// swaps and deletes, while every other path in ccvault can be repaired by
+// re-parsing.
+func TestCompact_MalformedFTSIndexIsNotSwappedIn(t *testing.T) {
+	dataDir := bloatDB(t, 60, 5)
+	corruptTurnsFTS(t, dataDir)
+
+	before := mustStorageStats(t, dataDir)
+
+	_, err := Compact(dataDir)
+	if err == nil {
+		t.Fatal("compact swapped in a copy whose search index is malformed")
+	}
+	if !strings.Contains(err.Error(), "turns_fts") {
+		t.Errorf("error %q does not name the index that failed", err)
+	}
+	if !strings.Contains(err.Error(), "sync --full") {
+		t.Errorf("error %q does not name the repair", err)
+	}
+
+	after := mustStorageStats(t, dataDir)
+	if after.FreelistCount != before.FreelistCount {
+		t.Errorf("live database changed on refusal (freelist %d -> %d); the bad copy looks swapped in",
+			before.FreelistCount, after.FreelistCount)
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, "ccvault.db.compacting")); !os.IsNotExist(err) {
+		t.Errorf("temporary copy left behind: %v", err)
+	}
+
+	// The original still holds its rows: the refusal is about the index, and
+	// the repair the message names rebuilds it from exactly these.
+	database, err := Open(dataDir)
+	if err != nil {
+		t.Fatalf("reopen original: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+	var turnCount int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM turns`).Scan(&turnCount); err != nil {
+		t.Fatalf("count turns: %v", err)
+	}
+	if turnCount != 5 {
+		t.Errorf("turns = %d, want 5", turnCount)
+	}
+
+	// And the repair the message names does clear it, so the user is not stuck
+	// with a compaction that can never succeed.
+	if err := database.RebuildTurnsFTS(); err != nil {
+		t.Fatalf("rebuild turns_fts: %v", err)
+	}
+	report, err := database.CheckFTSStrict()
+	if err != nil {
+		t.Fatalf("strict check after rebuild: %v", err)
+	}
+	if !report.OK() {
+		t.Fatalf("rebuild did not repair the index: %v", report.Err())
+	}
+	if err := database.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if _, err := Compact(dataDir); err != nil {
+		t.Errorf("compaction still refused after the repair it told the user to run: %v", err)
+	}
+}
+
+// corruptTurnsFTS strands a document in turns_fts at a rowid a live turn
+// already owns, which is the shape #93 measured: %_docsize still holds one row
+// per turn, so the cheap orphan count reads zero and Consistent() is true,
+// while the index still answers queries with the stale terms.
+func corruptTurnsFTS(t *testing.T, dataDir string) {
+	t.Helper()
+
+	database, err := Open(dataDir)
+	if err != nil {
+		t.Fatalf("open to corrupt: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+
+	var rowid int64
+	if err := database.QueryRow(`SELECT rowid FROM turns LIMIT 1`).Scan(&rowid); err != nil {
+		t.Fatalf("find a live turn rowid: %v", err)
+	}
+	if _, err := database.Exec(
+		`INSERT INTO turns_fts(rowid, content, search_period) VALUES (?, 'strandedghost', 'ccvym202610')`,
+		rowid); err != nil {
+		t.Fatalf("strand a turns_fts document: %v", err)
+	}
+
+	// The premise: nothing that was already there can see this.
+	cheap, err := database.CheckFTSIntegrity()
+	if err != nil {
+		t.Fatalf("cheap integrity check: %v", err)
+	}
+	if !cheap.Consistent() {
+		t.Fatalf("the cheap check already sees this damage (%+v), so the strict check proves nothing", cheap)
+	}
+	var check string
+	if err := database.QueryRow("PRAGMA integrity_check").Scan(&check); err != nil {
+		t.Fatalf("pragma integrity_check: %v", err)
+	}
+	if check != "ok" {
+		t.Fatalf("PRAGMA integrity_check reported %q, so the strict check proves nothing", check)
+	}
+}
+
+// TestCompact_SoundArchiveStillCompacts guards the other direction: the strict
+// check is run on a read-write handle against the copy, and if that handle were
+// wrong every compaction would fail with "attempt to write a readonly
+// database" and look like corruption.
+func TestCompact_SoundArchiveStillCompacts(t *testing.T) {
+	dataDir := bloatDB(t, 60, 5)
+
+	result, err := Compact(dataDir)
+	if err != nil {
+		t.Fatalf("compact a sound archive: %v", err)
+	}
+	if result.BytesReclaimed() <= 0 {
+		t.Errorf("reclaimed %d bytes, want a reduction", result.BytesReclaimed())
+	}
+
+	database, err := Open(dataDir)
+	if err != nil {
+		t.Fatalf("reopen compacted archive: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+	report, err := database.CheckFTSStrict()
+	if err != nil {
+		t.Fatalf("strict check after compaction: %v", err)
+	}
+	if !report.OK() {
+		t.Errorf("compaction produced a malformed search index: %v", report.Err())
+	}
+}
+
 func TestCompact_HoldsExclusiveLockWhileCopying(t *testing.T) {
 	dataDir := bloatDB(t, 60, 5)
 	dbPath := filepath.Join(dataDir, "ccvault.db")

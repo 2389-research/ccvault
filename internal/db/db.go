@@ -75,16 +75,68 @@ func connectionDSN(dbPath string) string {
 type DB struct {
 	*sql.DB
 	path string
+
+	// schemaWarning is set when OpenForRead accepted an archive written by a
+	// newer ccvault. Empty for every other open.
+	schemaWarning string
 }
 
-// Open opens or creates the ccvault database
+// archiveAccess says what the caller intends to do with the archive. It is
+// what decides whether a schema this binary does not understand is a refusal
+// or a warning: a read of a newer archive is usually fine, a write is the
+// thing that deleted 35,090 turns.
+type archiveAccess int
+
+const (
+	accessReadWrite archiveAccess = iota
+	accessRead
+)
+
+// Open opens or creates the ccvault database for reading and writing.
+//
+// It refuses an archive whose schema version is higher than the highest
+// migration this binary ships — see SchemaTooNewError for what that refusal
+// is worth. Refusing is the default for the same reason the pragma read-back
+// exists: a new code path that forgets to think about it gets the safe
+// behaviour, and the unsafe one has to be asked for by name.
 func Open(dataDir string) (*DB, error) {
+	return open(dataDir, accessReadWrite)
+}
+
+// OpenForRead opens the archive for a command that only reads it — search,
+// stats, show, export, the TUI, the MCP server.
+//
+// Same handle as Open in every respect but one: an archive written by a newer
+// ccvault is reported through SchemaWarning rather than refused, because a
+// newer schema is normally still readable and blocking a read is more
+// disruptive than useful. Migrations are skipped in that case, which costs
+// nothing — a binary that has never heard of the archive's migrations has none
+// to apply — and keeps a "read" command from writing to a file it does not
+// understand.
+func OpenForRead(dataDir string) (*DB, error) {
+	return open(dataDir, accessRead)
+}
+
+func open(dataDir string, access archiveAccess) (*DB, error) {
 	// Ensure data directory exists
 	if err := os.MkdirAll(dataDir, 0o750); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
 
 	dbPath := filepath.Join(dataDir, dbFileName)
+
+	// Asked and answered before the real connection exists, because opening
+	// that connection is already a write: its DSN carries
+	// journal_mode(WAL), and setting the journal mode of a database that is
+	// not already in it rewrites the file header. A binary that must not touch
+	// this archive must not do that either.
+	tooNew, err := inspectSchemaVersion(dbPath)
+	if err != nil {
+		return nil, err
+	}
+	if tooNew != nil && access == accessReadWrite {
+		return nil, tooNew
+	}
 
 	sqlDB, err := sql.Open("sqlite", connectionDSN(dbPath))
 	if err != nil {
@@ -112,6 +164,14 @@ func Open(dataDir string) (*DB, error) {
 		path: dbPath,
 	}
 
+	if tooNew != nil {
+		// Only a read reaches here; the write was refused above. Migrations
+		// are skipped, which costs nothing — a binary that has never heard of
+		// the archive's migrations has none to apply.
+		db.schemaWarning = tooNew.Warning()
+		return db, nil
+	}
+
 	// Initialize schema
 	if err := db.init(); err != nil {
 		_ = sqlDB.Close()
@@ -119,6 +179,14 @@ func Open(dataDir string) (*DB, error) {
 	}
 
 	return db, nil
+}
+
+// SchemaWarning is the note OpenForRead leaves when it accepted an archive
+// written by a newer ccvault, and empty otherwise. Commands should print it,
+// because the state it describes — an old binary pointed at a new archive — is
+// the one that precedes someone running a write with the same binary.
+func (db *DB) SchemaWarning() string {
+	return db.schemaWarning
 }
 
 // verifyConnectionPragmas reads back every connection setting ccvault depends

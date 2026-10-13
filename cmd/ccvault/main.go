@@ -5,6 +5,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -91,6 +92,69 @@ func loadConfig(cmd *cobra.Command) (*config.Config, error) {
 	return cfg, nil
 }
 
+// openArchiveForWrite opens the archive for a command that will modify it.
+//
+// A schema this binary does not understand is a refusal here. #105: on
+// 2026-10-13 a v0.2.0 binary still first on the author's PATH opened a
+// schema-13 archive read-write, deleted 35,090 turns with the turn key it
+// still believed in, and stranded 136,279 documents in turns_fts because it
+// predates the connection pragma that fires the cleanup trigger. Nothing
+// warned, and the mismatch was detectable at the moment the file was opened.
+func openArchiveForWrite(dataDir string) (*db.DB, error) {
+	database, err := db.Open(dataDir)
+	if err != nil {
+		return nil, nameTheBinary(err)
+	}
+	return database, nil
+}
+
+// openArchiveForRead opens the archive for a command that only reports on it.
+//
+// A newer schema is warned about rather than refused: it is normally still
+// readable, and blocking a read is more disruptive than useful. The warning is
+// the point — an old binary pointed at a new archive is the state that
+// precedes someone running a write with the same binary.
+func openArchiveForRead(dataDir string) (*db.DB, error) {
+	database, err := db.OpenForRead(dataDir)
+	if err != nil {
+		return nil, nameTheBinary(err)
+	}
+	if warning := database.SchemaWarning(); warning != "" {
+		fmt.Fprintf(os.Stderr, "%s %s\n", warning, thisBinary())
+	}
+	return database, nil
+}
+
+// nameTheBinary appends this build's identity to a schema refusal. Which
+// ccvault is running is exactly the fact the user needs and the one thing the
+// error cannot work out for itself — three installs ahead of the repo on the
+// author's PATH is how #105 happened, and "which binary is this" is how it was
+// diagnosed.
+func nameTheBinary(err error) error {
+	var tooNew *db.SchemaTooNewError
+	if errors.As(err, &tooNew) {
+		return fmt.Errorf("%w. %s", err, thisBinary())
+	}
+	return err
+}
+
+// thisBinary renders the running build for a message.
+func thisBinary() string {
+	b := currentBuild()
+	return fmt.Sprintf("(running ccvault %s, commit %s, from %s)", b.Version, b.Commit, executablePath())
+}
+
+// executablePath is where this binary lives, or a placeholder if the OS will
+// not say. The path is what tells the user they are running something other
+// than the one they just built.
+func executablePath() string {
+	path, err := os.Executable()
+	if err != nil {
+		return "an unknown path"
+	}
+	return path
+}
+
 var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "Print the version number",
@@ -125,7 +189,7 @@ var quickstartCmd = &cobra.Command{
 		}
 
 		// Open database
-		database, err := db.Open(cfg.DataDir)
+		database, err := openArchiveForWrite(cfg.DataDir)
 		if err != nil {
 			return fmt.Errorf("open database: %w", err)
 		}
@@ -292,12 +356,24 @@ func integrityJSON(f db.FTSIntegrity) map[string]interface{} {
 // held by the archive and invisible to search. Neither shows up in any row
 // count, because turns_fts is an external-content table that answers
 // COUNT(*) from the turns table itself.
-func printIntegritySection(f db.FTSIntegrity) {
+// The counts are a lower bound and the section says so. #106: 2,000 stranded
+// documents in a 235,101-turn archive, one `sync --full`, and this read
+// "Orphaned: 0" with all 2,000 still matchable and FTS5's own check reporting
+// "database disk image is malformed" — because a re-parse hands every turn a
+// fresh rowid, the stranded documents' %_docsize rows get overwritten, and the
+// two counts agree again. A user reading a zero here will reasonably conclude
+// the index is fine, so the line names what it checked and points at the one
+// thing that settles it.
+func printIntegritySection(f db.FTSIntegrity, strictRan bool) {
 	if f.Turns == 0 && f.Indexed == 0 {
 		return
 	}
 	fmt.Println("Search index:")
-	fmt.Printf("  Indexed:       %d of %d turns\n", f.Indexed-f.Orphaned, f.Turns)
+	fmt.Printf("  Indexed:       %d of %d turns (quick check)\n", f.Indexed-f.Orphaned, f.Turns)
+	if !strictRan {
+		fmt.Println("  A quick check counts documents; it cannot tell a sound index from a")
+		fmt.Println("  malformed one. Run 'ccvault stats --strict' for FTS5's own verdict.")
+	}
 	if f.Consistent() {
 		fmt.Println()
 		return
@@ -313,6 +389,52 @@ func printIntegritySection(f db.FTSIntegrity) {
 	// which is a steep price for a search index that a non-destructive
 	// re-parse rebuilds on its way past. See Syncer.repairSearchIndex.
 	fmt.Println("  Repair the index with 'ccvault sync --full'.")
+	fmt.Println()
+}
+
+// strictJSON renders the strict verdict for --json consumers.
+//
+// It names what was checked as well as what failed. An agent reading `"ok":
+// true` off a run that inspected no indexes at all would be exactly where the
+// author was on 2026-10-13: a clean-looking report over a broken index.
+func strictJSON(r db.FTSStrictReport) map[string]interface{} {
+	// A nil slice encodes as `null`, which a consumer has to special-case
+	// before it can ask for a length. An empty list says the same thing and
+	// needs no special case.
+	malformed := r.Malformed()
+	if malformed == nil {
+		malformed = []string{}
+	}
+
+	out := map[string]interface{}{
+		"checked":   r.Tables(),
+		"malformed": malformed,
+		"ok":        r.OK(),
+	}
+	if err := r.Err(); err != nil {
+		out["error"] = err.Error()
+	}
+	return out
+}
+
+// printStrictSection writes the verdict of FTS5's own integrity-check.
+//
+// It names every index it inspected, pass or fail. A strict check that
+// silently covered nothing would report clean on every archive — worse than no
+// check, because it manufactures confidence — and the only way a reader can
+// tell the difference is if the output says what it looked at.
+func printStrictSection(r db.FTSStrictReport) {
+	fmt.Println("Search index (strict):")
+	for _, res := range r.Results() {
+		if res.Err == nil {
+			fmt.Printf("  %-16s ok\n", res.Table)
+			continue
+		}
+		fmt.Printf("  %-16s MALFORMED: %v\n", res.Table, res.Err)
+	}
+	if !r.OK() {
+		fmt.Println("  Repair the index with 'ccvault sync --full'.")
+	}
 	fmt.Println()
 }
 
@@ -436,7 +558,7 @@ Use --json for machine-readable output.`,
 			return fmt.Errorf("load config: %w", err)
 		}
 
-		database, err := db.Open(cfg.DataDir)
+		database, err := openArchiveForRead(cfg.DataDir)
 		if err != nil {
 			return fmt.Errorf("open database: %w", err)
 		}
@@ -637,7 +759,7 @@ over the live DB (the path is printed at run), or merge it back in with
 		}
 
 		// Open database
-		database, err := db.Open(cfg.DataDir)
+		database, err := openArchiveForWrite(cfg.DataDir)
 		if err != nil {
 			return fmt.Errorf("open database: %w", err)
 		}
@@ -740,7 +862,7 @@ var tuiCmd = &cobra.Command{
 			return fmt.Errorf("load config: %w", err)
 		}
 
-		database, err := db.Open(cfg.DataDir)
+		database, err := openArchiveForRead(cfg.DataDir)
 		if err != nil {
 			return fmt.Errorf("open database: %w", err)
 		}
@@ -787,7 +909,7 @@ resolved on this machine's own calendar instead.`,
 			return fmt.Errorf("load config: %w", err)
 		}
 
-		database, err := db.Open(cfg.DataDir)
+		database, err := openArchiveForRead(cfg.DataDir)
 		if err != nil {
 			return fmt.Errorf("open database: %w", err)
 		}
@@ -859,6 +981,8 @@ resolved on this machine's own calendar instead.`,
 var statsCmd = &cobra.Command{
 	Use:   "stats",
 	Short: "Show archive statistics",
+	// A failed --strict check is a verdict, not a misuse of the command.
+	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		jsonOutput, _ := cmd.Flags().GetBool("json")
 
@@ -867,7 +991,7 @@ var statsCmd = &cobra.Command{
 			return fmt.Errorf("load config: %w", err)
 		}
 
-		database, err := db.Open(cfg.DataDir)
+		database, err := openArchiveForRead(cfg.DataDir)
 		if err != nil {
 			return fmt.Errorf("open database: %w", err)
 		}
@@ -907,6 +1031,21 @@ var statsCmd = &cobra.Command{
 		integrity, err := database.CheckFTSIntegrity()
 		if err != nil {
 			return fmt.Errorf("check search index integrity: %w", err)
+		}
+
+		// Opt-in, because FTS5's integrity-check tokenizes every indexed
+		// document and every row of the content table: measured at ~60% of a
+		// full rebuild, 0.6s against 1.0s on a 235,101-turn index, so a couple
+		// of seconds on a million-turn archive. Too slow for the report people
+		// run to see their token counts, and the only thing that answers the
+		// question the report raises.
+		strictWanted, _ := cmd.Flags().GetBool("strict")
+		var strict db.FTSStrictReport
+		if strictWanted {
+			strict, err = database.CheckFTSStrict()
+			if err != nil {
+				return fmt.Errorf("run the strict search-index check: %w", err)
+			}
 		}
 
 		// json_valid has to read every byte of raw_json, which is most of the
@@ -954,9 +1093,15 @@ var statsCmd = &cobra.Command{
 					"days_span":     int(last.Sub(first).Hours() / 24),
 				}
 			}
+			if strictWanted {
+				out["search_index_strict"] = strictJSON(strict)
+			}
 			enc := json.NewEncoder(os.Stdout)
 			enc.SetIndent("", "  ")
-			return enc.Encode(out)
+			if err := enc.Encode(out); err != nil {
+				return err
+			}
+			return strictVerdict(strictWanted, strict)
 		}
 
 		// Print statistics
@@ -976,7 +1121,10 @@ var statsCmd = &cobra.Command{
 		}
 
 		printStorageSection(storage)
-		printIntegritySection(integrity)
+		printIntegritySection(integrity, strictWanted)
+		if strictWanted {
+			printStrictSection(strict)
+		}
 		printRawJSONSection(rawJSON, rawWithSource, rawWithoutSource)
 		printTurnCountSection(drift)
 
@@ -1002,8 +1150,24 @@ var statsCmd = &cobra.Command{
 		// Also print _ tokens from project stats if different (shouldn't be, but just in case)
 		_ = projectTokens
 
-		return nil
+		return strictVerdict(strictWanted, strict)
 	},
+}
+
+// strictVerdict turns a failed strict check into a non-zero exit, after the
+// report has been printed.
+//
+// A verdict that only shows up in prose is a verdict a script and an agent
+// both miss — and `sqlite3` already demonstrates how that goes: it exits 0
+// when the FTS integrity-check fails, because the error goes to stderr while
+// the status stays clean. That is how a "PASS" gets printed directly above a
+// malformed-index error. `stats --strict` is an assertion, so a failed
+// assertion is a failed command.
+func strictVerdict(ran bool, report db.FTSStrictReport) error {
+	if !ran || report.OK() {
+		return nil
+	}
+	return report.Err()
 }
 
 var vacuumCmd = &cobra.Command{
@@ -1020,9 +1184,10 @@ grows relative to the data it holds. A long-lived archive can be more dead
 space than data.
 
 How it works: a compacted copy is written beside the live database with
-VACUUM INTO, checked with integrity_check and a row count per table, then
-renamed over the original in one atomic step. The original is never modified,
-so any failure before the swap leaves it exactly as it was.
+VACUUM INTO, checked with integrity_check, a row count per table and FTS5's
+own integrity-check on every search index, then renamed over the original in
+one atomic step. The original is never modified, so any failure before the
+swap leaves it exactly as it was.
 
 Requirements and caveats:
   - Free disk space for the compacted copy (roughly the size of the live
@@ -1030,6 +1195,8 @@ Requirements and caveats:
   - Exclusive access. Close the TUI, MCP server, and any running sync first;
     it refuses rather than compacting a database someone else is writing to.
   - Whole-file rewrite. On a multi-gigabyte archive, expect tens of seconds.
+  - A sound search index. A copy whose index fails FTS5's own check is
+    discarded rather than swapped in; repair with 'ccvault sync --full'.
 
 Run 'ccvault stats' to see how much there is to reclaim before committing.
 Use --json for machine-readable output.`,
@@ -1052,9 +1219,12 @@ Use --json for machine-readable output.`,
 			fmt.Printf("Compacting %s\n", filepath.Join(cfg.DataDir, "ccvault.db"))
 		}
 
+		// Compaction opens the archive itself rather than taking a handle from
+		// here, so its schema refusal is decorated here instead of in
+		// openArchiveForWrite.
 		result, err := db.Compact(cfg.DataDir, db.WithCompactProgress(progress))
 		if err != nil {
-			return err
+			return nameTheBinary(err)
 		}
 
 		if jsonOutput {
@@ -1094,7 +1264,7 @@ var listProjectsCmd = &cobra.Command{
 			return fmt.Errorf("load config: %w", err)
 		}
 
-		database, err := db.Open(cfg.DataDir)
+		database, err := openArchiveForRead(cfg.DataDir)
 		if err != nil {
 			return fmt.Errorf("open database: %w", err)
 		}
@@ -1289,7 +1459,7 @@ var listSessionsCmd = &cobra.Command{
 			return fmt.Errorf("load config: %w", err)
 		}
 
-		database, err := db.Open(cfg.DataDir)
+		database, err := openArchiveForRead(cfg.DataDir)
 		if err != nil {
 			return fmt.Errorf("open database: %w", err)
 		}
@@ -1389,7 +1559,7 @@ var showCmd = &cobra.Command{
 			return fmt.Errorf("load config: %w", err)
 		}
 
-		database, err := db.Open(cfg.DataDir)
+		database, err := openArchiveForRead(cfg.DataDir)
 		if err != nil {
 			return fmt.Errorf("open database: %w", err)
 		}
@@ -1486,7 +1656,7 @@ Examples:
 			return fmt.Errorf("load config: %w", err)
 		}
 
-		database, err := db.Open(cfg.DataDir)
+		database, err := openArchiveForRead(cfg.DataDir)
 		if err != nil {
 			return fmt.Errorf("open database: %w", err)
 		}
@@ -1575,7 +1745,7 @@ Debug mode: Set CCVAULT_MCP_DEBUG=1 for verbose logging to stderr.`,
 			return fmt.Errorf("load config: %w", err)
 		}
 
-		database, err := db.Open(cfg.DataDir)
+		database, err := openArchiveForRead(cfg.DataDir)
 		if err != nil {
 			return fmt.Errorf("open database: %w", err)
 		}
@@ -1601,7 +1771,7 @@ var buildCacheCmd = &cobra.Command{
 			return fmt.Errorf("load config: %w", err)
 		}
 
-		database, err := db.Open(cfg.DataDir)
+		database, err := openArchiveForRead(cfg.DataDir)
 		if err != nil {
 			return fmt.Errorf("open database: %w", err)
 		}
@@ -1651,7 +1821,7 @@ or to consolidate the archives of two machines into one.`,
 			return fmt.Errorf("create data dir: %w", err)
 		}
 
-		database, err := db.Open(cfg.DataDir)
+		database, err := openArchiveForWrite(cfg.DataDir)
 		if err != nil {
 			return fmt.Errorf("open database: %w", err)
 		}
@@ -1717,6 +1887,8 @@ func init() {
 
 	// Stats flags
 	statsCmd.Flags().Bool("json", false, "Output as JSON for machine parsing")
+	statsCmd.Flags().Bool("strict", false,
+		"Run FTS5's own integrity-check on every search index — the only check that can tell a sound index from a malformed one. Re-tokenizes the archive (~60% of the cost of a rebuild), and exits non-zero if an index fails")
 	statsCmd.Flags().Bool("check-raw-json", false,
 		fmt.Sprintf("Check every turn's stored payload for valid JSON instead of the newest %d. Reads the whole raw_json column — ~35s per 6 GB of archive", db.DefaultRawJSONWindow))
 

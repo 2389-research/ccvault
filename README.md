@@ -178,9 +178,10 @@ ccvault vacuum --json   # same numbers for machine consumption
 ```
 
 It writes a compacted copy beside the live database with `VACUUM INTO`, checks
-the copy with `integrity_check` and a row count per table, and renames it over
-the original in one atomic step. The original is never modified, so any failure
-leaves it exactly as it was. Consequences worth knowing:
+the copy with `integrity_check`, a row count per table and FTS5's own strict
+integrity-check on every search index, and renames it over the original in one
+atomic step. The original is never modified, so any failure leaves it exactly
+as it was. Consequences worth knowing:
 
 - It needs free disk space for the compacted copy — roughly the size of the
   live data, not of the whole file. It refuses up front if the space isn't
@@ -193,6 +194,38 @@ leaves it exactly as it was. Consequences worth knowing:
   rollback-journal database, so the mode is restored after the swap; and the
   write-ahead log is only removed once SQLite confirms every frame of it was
   folded into the main file.
+- It refuses to swap in a copy whose search index is malformed. Compaction is
+  the one ccvault operation a bad outcome cannot be undone by re-running, so a
+  copy that fails FTS5's own check is discarded and the original kept. Repair
+  the index with `ccvault sync --full` and run it again.
+
+### Verifying the search index
+
+`ccvault stats` reports how many documents the search index holds. That number
+is a lower bound, not a verdict: a stranded document is only visible in it while
+its rowid is unused, and a re-parse hands every turn a fresh rowid, so the
+counts agree again while the index still answers queries with the stale terms.
+Measured: 2,000 stranded documents in a 235,101-turn archive read as zero
+orphans while FTS5 called the index malformed.
+
+```bash
+ccvault stats --strict   # FTS5's own integrity-check on every search index
+```
+
+That is the only thing that returns a verdict. It is opt-in because it
+re-tokenizes the archive — about 60% of the cost of a full rebuild, so a couple
+of seconds on a million turns — and it exits non-zero if any index fails, so a
+script or an agent cannot read a pass off a failing run. Repair with
+`ccvault sync --full`.
+
+### Running an older ccvault against a newer archive
+
+ccvault refuses to write an archive whose schema version is higher than the
+migrations it ships, and names the binary and path it is running from. An old
+binary that still keyed turns on the uuid alone deleted 35,090 turns from a
+migrated archive before this guard existed. Reads are allowed and print a
+warning: a newer schema is normally still readable, but the state — an old
+binary pointed at a new archive — is the one that precedes the write.
 
 ## Search Syntax
 

@@ -225,6 +225,14 @@ func Compact(dataDir string, opts ...CompactOption) (CompactResult, error) {
 	}
 	defer func() { _ = closeConn() }()
 
+	// Compaction opens the file without running migrations, so it does not
+	// inherit Open's refusal and needs its own (#105). It is also the one
+	// operation a bad outcome cannot be undone by re-running, because it swaps
+	// and deletes — every other path in ccvault can be repaired by re-parsing.
+	if err := refuseIfSchemaTooNew(ctx, conn); err != nil {
+		return result, err
+	}
+
 	result.Before, err = storageStats(ctx, conn, dbPath)
 	if err != nil {
 		return result, err
@@ -253,10 +261,13 @@ func Compact(dataDir string, opts ...CompactOption) (CompactResult, error) {
 	tmpPath := dbPath + compactingSuffix
 	// A leftover copy means a previous run died before its rename. It is
 	// scratch by definition — the live database was never touched — so it
-	// can go.
+	// can go. Its sidecars go with it: verifyCompactedCopy opens the copy
+	// read-write to check its indexes, so a run killed mid-check can leave a
+	// journal behind, and a stale journal beside a fresh copy of the same name
+	// would be read as that copy's own.
 	if _, err := os.Stat(tmpPath); err == nil {
 		cfg.progress(fmt.Sprintf("removing leftover copy from an earlier run: %s", tmpPath))
-		if err := os.Remove(tmpPath); err != nil {
+		if err := removeCopyAndSidecars(tmpPath); err != nil {
 			return result, fmt.Errorf("remove leftover copy: %w", err)
 		}
 	}
@@ -264,7 +275,7 @@ func Compact(dataDir string, opts ...CompactOption) (CompactResult, error) {
 	swapped := false
 	defer func() {
 		if !swapped {
-			_ = os.Remove(tmpPath)
+			_ = removeCopyAndSidecars(tmpPath)
 		}
 	}()
 
@@ -528,9 +539,21 @@ func restoreWALMode(ctx context.Context, dbPath string) error {
 }
 
 // verifyCompactedCopy refuses to let a copy replace a good database unless
-// SQLite calls it structurally sound and every table holds the same number
-// of rows as the original. integrity_check alone would pass a copy that is
-// valid but missing rows.
+// SQLite calls it structurally sound, every table holds the same number of
+// rows as the original, and FTS5 itself calls every search index correct.
+//
+// The three are not redundant. integrity_check alone would pass a copy that is
+// valid but missing rows. Both of them together would pass a copy whose
+// turns_fts is shredded (#104): integrity_check returns clean on a malformed
+// FTS5 index because nothing is wrong with the pages, and stranded %_docsize
+// rows are counted as rows, so the counts match. Only FTS5's own
+// 'integrity-check' sees it — the same check migration 012 puts last, so a bad
+// rebuild rolls the whole migration back, which is what saved the archive the
+// day it ran.
+//
+// Compaction is the one operation whose bad outcome cannot be undone by
+// re-running it. Every other path in ccvault can be repaired by re-parsing the
+// transcripts; this one swaps and deletes.
 func verifyCompactedCopy(ctx context.Context, tmpPath string, sourceCounts map[string]int64) error {
 	pool, err := sql.Open("sqlite", "file:"+tmpPath+"?mode=ro")
 	if err != nil {
@@ -563,6 +586,47 @@ func verifyCompactedCopy(ctx context.Context, tmpPath string, sourceCounts map[s
 	for table := range copyCounts {
 		if _, ok := sourceCounts[table]; !ok {
 			return fmt.Errorf("compacted copy has unexpected table %s", table)
+		}
+	}
+
+	return verifyCompactedCopyIndexes(ctx, tmpPath)
+}
+
+// verifyCompactedCopyIndexes runs FTS5's strict integrity-check over the
+// copy's search indexes.
+//
+// On its own read-write handle, because the check is spelled as an INSERT into
+// the virtual table and the read-only pool above refuses it with "attempt to
+// write a readonly database" — an error that is not a verdict and must never
+// be reported as one. The check writes nothing: running it over the copy
+// leaves the file byte-for-byte as VACUUM INTO wrote it, so this does not
+// disturb the thing it is about to approve.
+func verifyCompactedCopyIndexes(ctx context.Context, tmpPath string) error {
+	pool, err := sql.Open("sqlite", "file:"+tmpPath)
+	if err != nil {
+		return fmt.Errorf("open compacted copy to check its search indexes: %w", err)
+	}
+	defer func() { _ = pool.Close() }()
+	pool.SetMaxOpenConns(1)
+
+	report, err := strictFTSCheck(ctx, pool)
+	if err != nil {
+		return fmt.Errorf("check the search indexes of the compacted copy: %w", err)
+	}
+	if !report.OK() {
+		return fmt.Errorf("compacted copy was not swapped in because its search index is malformed "+
+			"(the original is untouched): %w", report.Err())
+	}
+	return nil
+}
+
+// removeCopyAndSidecars deletes the compacted copy and any journal or WAL
+// files SQLite left beside it. Everything it touches carries the
+// ".compacting" suffix, so it can never reach the live database.
+func removeCopyAndSidecars(tmpPath string) error {
+	for _, suffix := range []string{"", "-journal", "-wal", "-shm"} {
+		if err := os.Remove(tmpPath + suffix); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove %s%s: %w", tmpPath, suffix, err)
 		}
 	}
 	return nil
