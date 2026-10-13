@@ -33,6 +33,17 @@ type SessionRecord struct {
 	CacheReadTokens int64  `parquet:"name=cache_read_tokens, type=INT64"`
 	TotalTokens     int64  `parquet:"name=total_tokens, type=INT64"`
 	Source          string `parquet:"name=source, type=BYTE_ARRAY, convertedtype=UTF8"`
+
+	// ParentSessionID is the id of the transcript that dispatched this one,
+	// empty for a top-level session — the same "" means top-level that
+	// models.Session uses, rather than a nullable parquet column that every
+	// reader would have to COALESCE. Appended rather than placed next to ID
+	// so the existing column order is undisturbed.
+	//
+	// Without it the cache counts subagent sessions but cannot separate
+	// them (#74), and a parquet file copied away from the archive has no
+	// join back to SQLite to recover the split.
+	ParentSessionID string `parquet:"name=parent_session_id, type=BYTE_ARRAY, convertedtype=UTF8"`
 }
 
 // Exporter exports data to Parquet format
@@ -118,6 +129,7 @@ func (e *Exporter) exportSessions() error {
 			CacheReadTokens: s.CacheReadTokens,
 			TotalTokens:     s.InputTokens + s.OutputTokens + s.CacheReadTokens + s.CacheWriteTokens,
 			Source:          s.Source,
+			ParentSessionID: s.ParentSessionID,
 		}
 		if err := pw.Write(record); err != nil {
 			return fmt.Errorf("write record: %w", err)
