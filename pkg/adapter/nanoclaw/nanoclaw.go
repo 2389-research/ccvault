@@ -152,12 +152,7 @@ func parseParent(path string) (*adapter.ParsedSession, error) {
 	if group != "" {
 		meta["nanoclaw_group"] = group
 	}
-	if stats.SkippedLines > 0 {
-		meta["skipped_lines"] = stats.SkippedLines
-	}
-	if stats.TurnsWithTruncatedRawJSON > 0 {
-		meta["turns_with_truncated_raw_json"] = stats.TurnsWithTruncatedRawJSON
-	}
+	addParseDiagnostics(meta, stats)
 
 	projectPath, display := nanoclawProjectPath(group)
 
@@ -198,12 +193,7 @@ func parseSubagent(path string) (*adapter.ParsedSession, error) {
 	if group != "" {
 		meta["nanoclaw_group"] = group
 	}
-	if stats.SkippedLines > 0 {
-		meta["skipped_lines"] = stats.SkippedLines
-	}
-	if stats.TurnsWithTruncatedRawJSON > 0 {
-		meta["turns_with_truncated_raw_json"] = stats.TurnsWithTruncatedRawJSON
-	}
+	addParseDiagnostics(meta, stats)
 	// parent_session_id points at whatever ccvault stored the parent under —
 	// keep it namespaced so cross-source joins can't collide.
 	if parentUUID != "" {
@@ -319,6 +309,33 @@ func extractGroup(path string) string {
 		}
 	}
 	return ""
+}
+
+// addParseDiagnostics copies the parser's anomaly counts into a session's
+// metadata, where the sync layer aggregates and reports them. Only non-zero
+// counts are written, so the key's presence is itself the signal.
+//
+// One function rather than a copy in parseParent and another in parseSubagent:
+// the two had already been written twice, and a diagnostic that reaches one
+// branch of Parse and not the other is worse than none — it reports a clean
+// archive over a dirty one.
+func addParseDiagnostics(meta map[string]any, stats parser.ParseStats) {
+	if stats.SkippedLines > 0 {
+		meta["skipped_lines"] = stats.SkippedLines
+	}
+	if stats.TurnsWithTruncatedRawJSON > 0 {
+		meta["turns_with_truncated_raw_json"] = stats.TurnsWithTruncatedRawJSON
+	}
+	// Reported from the parser's count rather than adapter.
+	// ReportUnreadableTimestamps, because pkg/parser substitutes time.Now()
+	// for a timestamp it cannot read, not the zero time — so the turn itself
+	// no longer shows the substitution and only the parser knows it happened.
+	if stats.TurnsWithUnparsableTimestamp > 0 {
+		meta[adapter.UnreadableTimestampsKey] = stats.TurnsWithUnparsableTimestamp
+		if stats.UnparsableTimestampSample != "" {
+			meta[adapter.UnreadableTimestampSampleKey] = stats.UnparsableTimestampSample
+		}
+	}
 }
 
 // turnHasError reports whether the raw turn carries a tool_result with is_error: true.

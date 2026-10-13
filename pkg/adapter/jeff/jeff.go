@@ -213,6 +213,11 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 		// tool_id on both halves but leaves it empty on 633 of 742 real
 		// requests, so an id alone cannot link them — see attachJeffResult.
 		pending []jeffCallSite
+
+		// The first timestamp string the layout below could not read, kept
+		// verbatim. A count says something is unreadable; the sample says
+		// which layout is missing (#146).
+		unreadableSample string
 	)
 
 	turnCounter := 0
@@ -244,7 +249,17 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 			convID = line.ConvID
 		}
 
-		ts, _ := time.Parse(time.RFC3339Nano, line.Timestamp)
+		// Jeff writes RFC3339Nano and nothing else, so this stays a
+		// one-layout list rather than joining pkg/parser's or codex's — those
+		// read different tools' transcripts and change independently of this
+		// one. What was missing is a signal when the layout stops matching:
+		// a line jeff wrote in some other shape becomes a turn at the zero
+		// time, which sorts to the very start of the archive and escapes
+		// every date filter while looking like a real epoch value (#146).
+		ts, tsErr := time.Parse(time.RFC3339Nano, line.Timestamp)
+		if tsErr != nil && unreadableSample == "" && line.Timestamp != "" {
+			unreadableSample = line.Timestamp
+		}
 
 		// Track session time range
 		if !ts.IsZero() {
@@ -342,6 +357,7 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 	if hasError {
 		metadata["has_error"] = true
 	}
+	adapter.ReportUnreadableTimestamps(metadata, turns, unreadableSample)
 
 	sessionID := ""
 	if convID != "" {

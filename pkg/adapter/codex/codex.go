@@ -228,6 +228,11 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 		// not something the format promises.
 		outputs   = make(map[string]string)
 		callSites []codexCallSite
+
+		// The first timestamp string the layout above could not read, kept
+		// verbatim. A count says something is unreadable; the sample says
+		// which layout is missing (#146).
+		unreadableSample string
 	)
 
 	turnCounter := 0
@@ -255,7 +260,17 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 			continue
 		}
 
-		ts, _ := time.Parse(time.RFC3339Nano, line.Timestamp)
+		// Codex writes RFC3339Nano and nothing else, so this stays a
+		// one-layout list rather than joining pkg/parser's or jeff's — those
+		// read different tools' transcripts and change independently of this
+		// one. What was missing is a signal when the layout stops matching:
+		// a line codex wrote in some other shape becomes a turn at the zero
+		// time, which sorts to the very start of the archive and escapes
+		// every date filter while looking like a real epoch value (#146).
+		ts, tsErr := time.Parse(time.RFC3339Nano, line.Timestamp)
+		if tsErr != nil && unreadableSample == "" && line.Timestamp != "" {
+			unreadableSample = line.Timestamp
+		}
 
 		// Track session time range
 		if !ts.IsZero() {
@@ -420,6 +435,9 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 
 	attachCodexOutputs(turns, callSites, outputs)
 
+	metadata := make(map[string]any)
+	adapter.ReportUnreadableTimestamps(metadata, turns, unreadableSample)
+
 	return &adapter.ParsedSession{
 		ID:          sessionID,
 		ProjectPath: projectPath,
@@ -430,7 +448,7 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 		StartedAt:   startedAt,
 		EndedAt:     endedAt,
 		SourceName:  "codex",
-		Metadata:    make(map[string]any),
+		Metadata:    metadata,
 	}, nil
 }
 

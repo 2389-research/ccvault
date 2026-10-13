@@ -29,6 +29,28 @@ type ParseStats struct {
 	// replaced with a placeholder because the original line exceeded the
 	// raw_json size threshold. See strippedRawJSON.
 	TurnsWithTruncatedRawJSON int
+
+	// TurnsWithUnparsableTimestamp is the number of turns whose transcript
+	// timestamp matched none of parseTimestamp's layouts (or was absent) and
+	// so carries a fallback time rather than a recorded one.
+	//
+	// The turn is kept — dropping a conversation over a clock is the wrong
+	// trade — but the substitution used to be completely silent, which is
+	// #146. A fallback timestamp is indistinguishable from a real value on
+	// inspection: it sorts somewhere arbitrary in the archive, it answers
+	// date predicates, and nothing about the row says it was invented. The
+	// count is what makes it answerable.
+	//
+	// Non-zero here means a producer's format moved and this list has not.
+	// It is not consolidated with the codex and jeff lists on purpose: each
+	// reads a different tool's transcript, those tools change independently,
+	// and a shared list would couple them (and point pkg/ at internal/db).
+	TurnsWithUnparsableTimestamp int
+
+	// UnparsableTimestampSample is the first timestamp string that failed to
+	// parse, verbatim, empty when none did. A count says something is
+	// unreadable; the sample says which layout is missing.
+	UnparsableTimestampSample string
 }
 
 // Package-level parser limits. Hard-coded on purpose; see the design doc at
@@ -91,10 +113,16 @@ func parseSessionReaderWithLimits(r io.Reader, sourcePath string, maxLine, maxRa
 		if oversized {
 			stats.SkippedLines++
 		} else if len(line) > 0 {
-			turn, raw, parseErr := parseTurnInternal(line)
+			turn, raw, tsOK, parseErr := parseTurnInternal(line)
 			if parseErr != nil {
 				stats.SkippedLines++
 			} else if turn != nil {
+				if !tsOK {
+					stats.TurnsWithUnparsableTimestamp++
+					if stats.UnparsableTimestampSample == "" && raw.Timestamp != "" {
+						stats.UnparsableTimestampSample = raw.Timestamp
+					}
+				}
 				if len(line) > maxRaw {
 					turn.RawJSON = strippedRawJSON(raw, len(line))
 					stats.TurnsWithTruncatedRawJSON++
@@ -213,7 +241,7 @@ func drainToNewline(r *bufio.Reader) error {
 
 // ParseTurn parses a single JSONL line into a Turn
 func ParseTurn(data []byte) (*models.Turn, error) {
-	turn, _, err := parseTurnInternal(data)
+	turn, _, _, err := parseTurnInternal(data)
 	return turn, err
 }
 
@@ -256,22 +284,28 @@ func strippedRawJSON(raw *models.RawTurn, originalSize int) []byte {
 	return out
 }
 
-// parseTurnInternal parses a JSONL line and returns both the Turn and the
-// intermediate RawTurn so callers can reuse it without re-unmarshalling.
-func parseTurnInternal(data []byte) (*models.Turn, *models.RawTurn, error) {
+// parseTurnInternal parses a JSONL line and returns the Turn, the intermediate
+// RawTurn so callers can reuse it without re-unmarshalling, and whether the
+// line's timestamp was readable.
+//
+// The third return value is false when the turn's Timestamp is a fallback
+// rather than the value the transcript recorded — reported here because this
+// is the only place that knows, and silently substituting one is #146.
+func parseTurnInternal(data []byte) (*models.Turn, *models.RawTurn, bool, error) {
 	var raw models.RawTurn
 	if err := json.Unmarshal(data, &raw); err != nil {
-		return nil, nil, fmt.Errorf("unmarshal turn: %w", err)
+		return nil, nil, false, fmt.Errorf("unmarshal turn: %w", err)
 	}
 
 	// Skip entries without UUID (like file-history-snapshot)
 	if raw.UUID == "" {
-		return nil, &raw, nil
+		return nil, &raw, true, nil
 	}
 
 	// Parse timestamp
-	ts, err := parseTimestamp(raw.Timestamp)
-	if err != nil {
+	ts, tsErr := parseTimestamp(raw.Timestamp)
+	timestampOK := tsErr == nil
+	if !timestampOK {
 		ts = time.Now() // Fallback
 	}
 
@@ -305,7 +339,7 @@ func parseTurnInternal(data []byte) (*models.Turn, *models.RawTurn, error) {
 		}
 	}
 
-	return turn, &raw, nil
+	return turn, &raw, timestampOK, nil
 }
 
 // extractContent extracts searchable text content from a turn
