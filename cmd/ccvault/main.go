@@ -438,6 +438,75 @@ func printStrictSection(r db.FTSStrictReport) {
 	fmt.Println()
 }
 
+// timestampLayoutJSON renders the canonical-layout count for --json consumers.
+//
+// Every column, not only the ones with a finding, for the same reason
+// strictJSON names what it checked: a consumer reading `"ok": true` off a scan
+// that covered no columns is being told nothing, confidently.
+func timestampLayoutJSON(r db.TimestampLayoutReport) map[string]interface{} {
+	columns := make([]map[string]interface{}, 0, len(r.Columns()))
+	for _, c := range r.Columns() {
+		col := map[string]interface{}{
+			"table":      c.Table,
+			"column":     c.Column,
+			"rows":       c.Rows,
+			"off_layout": c.OffLayout,
+		}
+		if c.Sample != "" {
+			col["sample"] = c.Sample
+		}
+		columns = append(columns, col)
+	}
+	return map[string]interface{}{
+		"ok":         r.OK(),
+		"rows":       r.Rows(),
+		"off_layout": r.OffLayout(),
+		"columns":    columns,
+	}
+}
+
+// printTimestampLayoutSection writes how many DATETIME values are not in the
+// layout everything else assumes (#144).
+//
+// Reported, never refused. The values this finds are readable — SQLite's date
+// functions parse them — so nothing is broken in a way the user has to fix
+// right now, and an import could legitimately have carried them in. What they
+// do break is silent: ORDER BY, MIN()/MAX() and the date predicate all compare
+// this text, so a row whose bytes sort nowhere near its instant lands wherever
+// its bytes land, and search_period slices its calendar date out by character
+// position and bakes the wrong answer into an FTS index. Both show up as
+// "search missed a row", which is why the count exists at all.
+//
+// It names the columns it scanned even when they are all clean. A clean line
+// over a scan that covered nothing is the failure mode printStrictSection
+// already exists to avoid.
+func printTimestampLayoutSection(r db.TimestampLayoutReport) {
+	fmt.Println("Timestamp layout:")
+
+	scanned := make([]string, 0, len(r.Columns()))
+	for _, c := range r.Columns() {
+		scanned = append(scanned, c.Table+"."+c.Column)
+	}
+	fmt.Printf("  Canonical:     %d of %d values, across %d DATETIME columns\n",
+		r.Rows()-r.OffLayout(), r.Rows(), len(scanned))
+	fmt.Printf("  Checked:       %s\n", strings.Join(scanned, ", "))
+
+	if r.OK() {
+		fmt.Println()
+		return
+	}
+
+	for _, c := range r.Findings() {
+		fmt.Printf("  %s.%s: %d of %d values are not the layout ccvault writes, e.g. %q\n",
+			c.Table, c.Column, c.OffLayout, c.Rows, c.Sample)
+	}
+	fmt.Println("  These are readable, so nothing refuses them — but ordering, MIN()/MAX()")
+	fmt.Println("  and the date filter all compare this text, and search_period slices its")
+	fmt.Println("  date out by character position. Rewrite them with 'ccvault sync --full'")
+	fmt.Println("  if ccvault wrote them, or check what else has written to this archive.")
+	fmt.Println()
+}
+
 // printTurnCountSection reports a disagreement between sessions.turn_count and
 // the turns the archive holds, and says nothing at all when they agree.
 //
@@ -1042,10 +1111,19 @@ var statsCmd = &cobra.Command{
 		// question the report raises.
 		strictWanted, _ := cmd.Flags().GetBool("strict")
 		var strict db.FTSStrictReport
+		var layout db.TimestampLayoutReport
 		if strictWanted {
 			strict, err = database.CheckFTSStrict()
 			if err != nil {
 				return fmt.Errorf("run the strict search-index check: %w", err)
+			}
+			// Opt-in for the same reason: a full scan of every DATETIME
+			// column, which on a million-turn archive means reading every row
+			// of turns and tool_uses. --strict is where the checks that cost
+			// something and answer something live.
+			layout, err = database.CheckTimestampLayout()
+			if err != nil {
+				return fmt.Errorf("check the timestamp layout: %w", err)
 			}
 		}
 
@@ -1096,6 +1174,7 @@ var statsCmd = &cobra.Command{
 			}
 			if strictWanted {
 				out["search_index_strict"] = strictJSON(strict)
+				out["timestamp_layout"] = timestampLayoutJSON(layout)
 			}
 			enc := json.NewEncoder(os.Stdout)
 			enc.SetIndent("", "  ")
@@ -1125,6 +1204,7 @@ var statsCmd = &cobra.Command{
 		printIntegritySection(integrity, strictWanted)
 		if strictWanted {
 			printStrictSection(strict)
+			printTimestampLayoutSection(layout)
 		}
 		printRawJSONSection(rawJSON, rawWithSource, rawWithoutSource)
 		printTurnCountSection(drift)
@@ -1892,7 +1972,7 @@ func init() {
 	// Stats flags
 	statsCmd.Flags().Bool("json", false, "Output as JSON for machine parsing")
 	statsCmd.Flags().Bool("strict", false,
-		"Run FTS5's own integrity-check on every search index — the only check that can tell a sound index from a malformed one. Re-tokenizes the archive (~60% of the cost of a rebuild), and exits non-zero if an index fails")
+		"Run the checks that need a full pass over the archive: FTS5's own integrity-check on every search index — the only one that can tell a sound index from a malformed one — and a count of DATETIME values outside the layout ordering and search_period depend on. Re-tokenizes the archive (~60% of the cost of a rebuild). Exits non-zero if an index fails; a non-canonical timestamp is reported, not refused")
 	statsCmd.Flags().Bool("check-raw-json", false,
 		fmt.Sprintf("Check every turn's stored payload for valid JSON instead of the newest %d. Reads the whole raw_json column — ~35s per 6 GB of archive", db.DefaultRawJSONWindow))
 

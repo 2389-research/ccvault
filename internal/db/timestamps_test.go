@@ -181,3 +181,85 @@ func TestFormatTimestamp_DropsTheMonotonicClock(t *testing.T) {
 		t.Errorf("round trip of time.Now() lost the instant: %v vs %v", now, parsed)
 	}
 }
+
+// TestParseTimestamp_AcceptsEveryEraTheArchiveHolds pins the one accepted
+// list (#143).
+//
+// Each case names why its layout is on the list. The two marked "only
+// internal/search had this" are the consolidation's regression guard: before
+// #143 they parsed in one package and not the other, which is a row a search
+// finds and a direct read does not.
+func TestParseTimestamp_AcceptsEveryEraTheArchiveHolds(t *testing.T) {
+	want := time.Date(2026, 1, 14, 20, 15, 0, 134000000, time.UTC)
+
+	for _, tc := range []struct {
+		name  string
+		input string
+		want  time.Time
+	}{
+		{"canonical, what ccvault writes today",
+			"2026-01-14T20:15:00.134000000Z", want},
+		{"RFC3339 with a trimmed fraction",
+			"2026-01-14T20:15:00.134Z", want},
+		{"RFC3339 with no fraction at all",
+			"2026-01-14T20:15:00Z", want.Add(-134 * time.Millisecond)},
+		{"RFC3339 at an offset, normalised to UTC",
+			"2026-01-14T15:15:00.134-05:00", want},
+		{"time.Time.String(), the pre-014 era",
+			"2026-01-14 20:15:00.134 +0000 UTC", want},
+		{"time.Time.String() with a monotonic tail",
+			"2026-01-14 20:15:00.134 +0000 UTC m=+48.861813543", want},
+		{"time.Time.String() at an offset with a zone name",
+			"2026-01-14 15:15:00.134 -0500 CDT", want},
+		{"numeric offset, no zone name — only internal/search had this",
+			"2026-01-14 15:15:00.134 -0500", want},
+		{"the driver's sqlite rendering, numeric offset",
+			"2026-01-14 15:15:00.134-05:00", want},
+		{"the driver's sqlite rendering, Z",
+			"2026-01-14 20:15:00.134Z", want},
+		{"no zone at all, read as UTC the way SQLite reads it",
+			"2026-01-14 20:15:00.134", want},
+		{"seconds only — only internal/search had this spelling",
+			"2026-01-14 20:15:00", time.Date(2026, 1, 14, 20, 15, 0, 0, time.UTC)},
+		{"date only, midnight UTC",
+			"2026-01-14", time.Date(2026, 1, 14, 0, 0, 0, 0, time.UTC)},
+		{"surrounding whitespace is not information",
+			"  2026-01-14T20:15:00.134000000Z\n", want},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ParseTimestamp(tc.input)
+			if err != nil {
+				t.Fatalf("ParseTimestamp(%q): %v", tc.input, err)
+			}
+			if !got.Equal(tc.want) {
+				t.Errorf("ParseTimestamp(%q) = %v, want %v", tc.input, got, tc.want)
+			}
+			if got.Location() != time.UTC {
+				t.Errorf("ParseTimestamp(%q) returned %v, want UTC", tc.input, got.Location())
+			}
+		})
+	}
+}
+
+// TestParseTimestamp_RefusesWhatItCannotRead. Tolerant is not the same as
+// silent: a caller that can act on the difference has to be told.
+func TestParseTimestamp_RefusesWhatItCannotRead(t *testing.T) {
+	for _, input := range []string{"", "   ", "whenever", "2026-13-45", "1736886900"} {
+		if got, err := ParseTimestamp(input); err == nil {
+			t.Errorf("ParseTimestamp(%q) = %v, want an error", input, got)
+		}
+	}
+}
+
+// TestParseStoredTimestampOrZero_SwallowsOneBadRow is #85's requirement: a
+// search over a million turns must not fail because one of them holds a value
+// nothing can read.
+func TestParseStoredTimestampOrZero_SwallowsOneBadRow(t *testing.T) {
+	if got := ParseStoredTimestampOrZero("whenever"); !got.IsZero() {
+		t.Errorf("ParseStoredTimestampOrZero(\"whenever\") = %v, want the zero time", got)
+	}
+	want := time.Date(2026, 1, 14, 20, 15, 0, 134000000, time.UTC)
+	if got := ParseStoredTimestampOrZero(FormatTimestamp(want)); !got.Equal(want) {
+		t.Errorf("ParseStoredTimestampOrZero round trip = %v, want %v", got, want)
+	}
+}

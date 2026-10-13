@@ -556,33 +556,18 @@ func coerceTimestamp(v any) time.Time {
 	case time.Time:
 		return t
 	case string:
-		return parseStoredTimestamp(t)
+		// db.ParseStoredTimestampOrZero, not a layout list of our own. This
+		// package kept its own for as long as the archive had one on-disk
+		// format and two lists agreeing was cheap luck; migration 014 left two
+		// eras in the wild, both of which every reader has to accept, and a
+		// layout present in one list and missing from the other does not
+		// error — it drops the row out of a result set (#143).
+		return db.ParseStoredTimestampOrZero(t)
 	case []byte:
-		return parseStoredTimestamp(string(t))
+		return db.ParseStoredTimestampOrZero(string(t))
 	default:
 		return time.Time{}
 	}
-}
-
-func parseStoredTimestamp(s string) time.Time {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return time.Time{}
-	}
-	formats := []string{
-		time.RFC3339Nano,
-		time.RFC3339,
-		"2006-01-02 15:04:05.999999999 -0700 MST", // time.Time.String()
-		"2006-01-02 15:04:05.999999999 -0700",
-		"2006-01-02 15:04:05",
-		"2006-01-02",
-	}
-	for _, f := range formats {
-		if t, err := time.Parse(f, s); err == nil {
-			return t
-		}
-	}
-	return time.Time{}
 }
 
 // makeSnippet creates a snippet from content with the search term highlighted
