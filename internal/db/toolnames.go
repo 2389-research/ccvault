@@ -10,7 +10,7 @@ import (
 )
 
 // SessionToolNamesByTurn groups a session's recorded tool calls by the turn
-// that issued them, in the order they were issued.
+// that issued them.
 //
 // This is where a caller learns what a turn called. Reading raw_json for it
 // only ever worked for claude-code and nanoclaw, whose entries carry a
@@ -26,12 +26,24 @@ import (
 //
 // Duplicates are kept: a turn that made three Bash calls says Bash three
 // times, because the count is the fact.
+//
+// Names within a turn come back in no particular order, and a caller that
+// renders them wants ToolNamesForTurns instead. The one caller here —
+// get_session_summary — counts them, and the ORDER BY it did not need cost a
+// temp B-tree over every row of the session, because idx_tool_uses_session
+// carries no ordering (#157). That sort was about half of what the read
+// cost, measured by BenchmarkSessionToolNameReadSort over the same rows:
+//
+//	1,871 calls    1.5ms -> 0.8ms
+//	133,039 calls  109ms -> 53ms
+//
+// The first is the archive's largest session; the second is the synthetic
+// scale #141 quoted.
+//
+// The SQL is a named constant so a test can put EXPLAIN QUERY PLAN in front of
+// the query this actually runs rather than in front of a copy of it.
 func (db *DB) SessionToolNamesByTurn(sessionID string) (map[string][]string, error) {
-	rows, err := db.Query(`
-		SELECT turn_id, tool_name
-		FROM tool_uses
-		WHERE session_id = ? AND turn_id IS NOT NULL
-		ORDER BY turn_id, turn_ordinal`, sessionID)
+	rows, err := db.Query(sessionToolNamesSQL, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("query tool calls for session %s: %w", sessionID, err)
 	}
@@ -68,11 +80,7 @@ func (db *DB) ToolNamesForTurns(sessionID string, turnIDs []string) (map[string]
 
 	for _, batch := range chunkTurnIDs(turnIDs) {
 		args := turnIDArgs(sessionID, batch)
-		rows, err := db.Query(`
-			SELECT turn_id, tool_name
-			FROM tool_uses
-			WHERE session_id = ? AND turn_id IN (`+inPlaceholders(len(batch))+`)
-			ORDER BY turn_id, turn_ordinal`, args...)
+		rows, err := db.Query(toolNamesForTurnsSQL(len(batch)), args...)
 		if err != nil {
 			return nil, fmt.Errorf("query tool calls for %d turns of session %s: %w", len(turnIDs), sessionID, err)
 		}
@@ -86,6 +94,24 @@ func (db *DB) ToolNamesForTurns(sessionID string, turnIDs []string) (map[string]
 	}
 
 	return byTurn, nil
+}
+
+// sessionToolNamesSQL reads every call of a session, deliberately unordered:
+// see SessionToolNamesByTurn on why the ORDER BY came off (#157).
+const sessionToolNamesSQL = `
+	SELECT turn_id, tool_name
+	FROM tool_uses
+	WHERE session_id = ? AND turn_id IS NOT NULL`
+
+// toolNamesForTurnsSQL reads the calls of n named turns, in the order they
+// were issued. A function rather than a constant because the IN list's width
+// is the caller's page size.
+func toolNamesForTurnsSQL(n int) string {
+	return `
+	SELECT turn_id, tool_name
+	FROM tool_uses
+	WHERE session_id = ? AND turn_id IN (` + inPlaceholders(n) + `)
+	ORDER BY turn_id, turn_ordinal`
 }
 
 // scanToolNamesByTurn groups the rows of a (turn_id, tool_name) query.

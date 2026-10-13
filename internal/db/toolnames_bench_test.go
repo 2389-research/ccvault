@@ -194,3 +194,59 @@ func TestMeasureToolNameRead(t *testing.T) {
 		})
 	}
 }
+
+// orderedSessionToolNamesSQL is the session-wide read as it stood before
+// #157: the same seek, plus the ORDER BY whose only effect was a temp B-tree
+// over every row the seek found. Kept here so the cost of that sort stays a
+// measured number rather than a story about indexes.
+const orderedSessionToolNamesSQL = sessionToolNamesSQL + `
+	ORDER BY turn_id, turn_ordinal`
+
+// BenchmarkSessionToolNameReadSort measures what get_session_summary was
+// paying for an ordering it does not use (#157). Both forms read the same
+// rows; only one sorts them.
+func BenchmarkSessionToolNameReadSort(b *testing.B) {
+	for _, sc := range benchSessions {
+		database, err := Open(b.TempDir())
+		if err != nil {
+			b.Fatalf("open db: %v", err)
+		}
+		buildToolHeavySession(b, database, "bench-session", sc.turns, sc.calls)
+
+		b.Run("ordered/"+sc.name, func(b *testing.B) {
+			rows := 0
+			for i := 0; i < b.N; i++ {
+				rows = countNames(mustToolNames(b, database, orderedSessionToolNamesSQL))
+			}
+			b.ReportMetric(float64(rows), "rows/op")
+		})
+		b.Run("unordered/"+sc.name, func(b *testing.B) {
+			rows := 0
+			for i := 0; i < b.N; i++ {
+				byTurn, err := database.SessionToolNamesByTurn("bench-session")
+				if err != nil {
+					b.Fatal(err)
+				}
+				rows = countNames(byTurn)
+			}
+			b.ReportMetric(float64(rows), "rows/op")
+		})
+
+		_ = database.Close()
+	}
+}
+
+// mustToolNames runs a (turn_id, tool_name) query over the bench session and
+// groups it the way the readers do, so a benchmark measures the same work.
+func mustToolNames(tb testing.TB, database *DB, query string) map[string][]string {
+	tb.Helper()
+	rows, err := database.Query(query, "bench-session")
+	if err != nil {
+		tb.Fatal(err)
+	}
+	byTurn, err := scanToolNamesByTurn(rows)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return byTurn
+}
