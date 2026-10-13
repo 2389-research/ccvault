@@ -110,7 +110,7 @@ func TestStrictVerdict_FailsTheCommandOnlyWhenTheCheckRanAndFailed(t *testing.T)
 	if verdict == nil {
 		t.Fatal("a failed check returned nil, so the command would exit 0 over a malformed index")
 	}
-	if !strings.Contains(verdict.Error(), "sync --full") {
+	if !strings.Contains(verdict.Error(), "repair-index") {
 		t.Errorf("the verdict does not name the repair: %v", verdict)
 	}
 }
@@ -134,7 +134,7 @@ func TestPrintStrictSection_NamesEveryIndexItInspected(t *testing.T) {
 			t.Errorf("strict section does not mention %q:\n%s", want, out)
 		}
 	}
-	if strings.Contains(out, "sync --full") {
+	if strings.Contains(out, "repair-index") {
 		t.Errorf("a passing strict section suggests a repair:\n%s", out)
 	}
 }

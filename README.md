@@ -93,6 +93,7 @@ ccvault stats
 | `orient` | Database state summary for AI agents (use `--json`) |
 | `sync` | Sync conversations from Claude Code (see [Sync modes](#sync-modes)) |
 | `import [db-path]` | Merge another ccvault database into this archive |
+| `repair-index` | Rebuild the full-text search indexes from the archive's own rows |
 | `tui` | Launch interactive terminal UI |
 | `search [query]` | Full-text search across conversations |
 | `stats` | Show archive statistics, including reclaimable space |
@@ -135,6 +136,13 @@ ccvault import ~/.ccvault/backups/ccvault-20260905-140418.db
 tool uses; a session present in both is kept as-is unless the incoming copy
 ended later. The source database is only read, and the whole merge is one
 transaction.
+
+A source written by a newer ccvault than the one you are running is refused.
+Reading it cannot damage it; the risk is reading columns whose meaning has
+changed — migration 012 re-keyed `turns` without renaming a column, which a
+column check cannot catch — and writing the misreading into this archive.
+Importing from a newer archive is legitimate, so `--allow-newer-schema` goes
+ahead anyway.
 
 ### One-time counter correction
 
@@ -197,7 +205,7 @@ as it was. Consequences worth knowing:
 - It refuses to swap in a copy whose search index is malformed. Compaction is
   the one ccvault operation a bad outcome cannot be undone by re-running, so a
   copy that fails FTS5's own check is discarded and the original kept. Repair
-  the index with `ccvault sync --full` and run it again.
+  the index with `ccvault repair-index` and run it again.
 
 ### Verifying the search index
 
@@ -216,7 +224,28 @@ That is the only thing that returns a verdict. It is opt-in because it
 re-tokenizes the archive — about 60% of the cost of a full rebuild, so a couple
 of seconds on a million turns — and it exits non-zero if any index fails, so a
 script or an agent cannot read a pass off a failing run. Repair with
-`ccvault sync --full`.
+`ccvault repair-index`.
+
+### Repairing the search index
+
+```bash
+ccvault repair-index
+```
+
+The indexes are FTS5 external-content tables, so each one is a pure function of
+the table it indexes: rebuilding reads nothing off disk and changes nothing but
+the index. Measured on a 1,049,544-turn archive whose `turns_fts` held 136,279
+stranded documents — about 20 seconds for that index, and the strict check clean
+afterwards. `ccvault sync --full` also rebuilds them, but it re-reads every
+transcript on disk to do it: tens of thousands of files, to repair a structure
+derived entirely from rows already in the archive.
+
+It runs no migrations, deliberately. An index malformed badly enough aborts
+migration 012, which ends in FTS5's integrity-check — and because every other
+command migrates the archive as it opens it, the damage otherwise stands in
+front of its own repair. It exits non-zero if an index is still malformed after
+the rebuild, which means the damage is in the content tables and those do need
+re-reading with `ccvault sync --full`.
 
 `--strict` also counts how many values in the archive's `DATETIME` columns are
 outside the layout ccvault writes (RFC3339, UTC, nine fraction digits). That

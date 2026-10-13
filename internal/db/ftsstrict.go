@@ -14,10 +14,26 @@ import (
 )
 
 // ftsRepairAdvice names the one repair for a malformed index, in the spelling
-// the user has to type. `sync --full` re-parses every transcript and rebuilds
-// the index on the way past; `sync --rebuild` would also fix it and wipes the
-// archive first, which is a steep price for a search index.
-const ftsRepairAdvice = "repair the index with 'ccvault sync --full'"
+// the user has to type.
+//
+// It used to say `ccvault sync --full`, which re-parses every transcript and
+// rebuilds the index on the way past — on the author's archive that is ~47,000
+// files read from disk to repair a structure derived entirely from rows
+// already in the database. #135: the repair that actually fixed the live
+// archive was FTS5's own 'rebuild', measured at 22 seconds against 1,049,544
+// turns. Pointing a user at the most expensive available option makes them put
+// the repair off, and an unrepaired index is the state that blocks a
+// migration.
+const ftsRepairAdvice = "repair the index with 'ccvault repair-index'"
+
+// errNoFTSIndexes is what both the strict check and the rebuild say when the
+// archive holds no full-text index at all. Neither may report success in that
+// state: a check that inspected nothing passes on every file ever handed to
+// it, and a repair that rebuilt nothing leaves the user believing a broken
+// index was fixed.
+var errNoFTSIndexes = errors.New(
+	"no fts5 indexes found, so there was nothing to check: this is not a ccvault archive, " +
+		"or its search indexes have been dropped")
 
 // FTSTableResult is one index's verdict.
 type FTSTableResult struct {
@@ -135,9 +151,7 @@ func strictFTSCheck(ctx context.Context, q sqlRunner) (FTSStrictReport, error) {
 		return FTSStrictReport{}, err
 	}
 	if len(tables) == 0 {
-		return FTSStrictReport{}, errors.New(
-			"no fts5 indexes found, so there was nothing to check: this is not a ccvault archive, " +
-				"or its search indexes have been dropped")
+		return FTSStrictReport{}, errNoFTSIndexes
 	}
 
 	report := FTSStrictReport{results: make([]FTSTableResult, 0, len(tables))}
@@ -165,13 +179,34 @@ func strictFTSCheck(ctx context.Context, q sqlRunner) (FTSStrictReport, error) {
 // listFTSTables names every fts5 virtual table in the schema. Discovered
 // rather than hardcoded, so an index added later is checked by everything that
 // checks indexes, instead of by whichever call sites someone remembered.
+//
+// Discovered structurally rather than by reading the CREATE statement, which
+// is #137. The text match it replaces was `lower(sql) LIKE '%using fts5%'`, so
+// an index declared `USING  fts5` — two spaces, or a newline — dropped out of
+// --strict's coverage with no error and no visible change beyond one fewer
+// table in a list nobody reads closely. The failure mode is the one the strict
+// check exists to eliminate: a check that silently covers less than you think
+// it does. Formatting cannot defeat a structural test.
+//
+// The structure, in two parts. A virtual table carries rootpage 0 in
+// sqlite_master, which is what separates the index from the ordinary tables
+// around it — including its own shadow tables, which have real roots. And
+// every fts5 table, whatever its options, owns shadow tables named
+// <name>_data, <name>_idx and <name>_config; fts3 and fts4 own a different set
+// (_content, _segdir, _segments) and so are not mistaken for fts5 here.
+// %_docsize is deliberately not required: columnsize=0 omits it.
 func listFTSTables(ctx context.Context, q sqlRunner) ([]string, error) {
 	rows, err := q.QueryContext(ctx, `
-		SELECT name FROM sqlite_master
-		WHERE type = 'table'
-		  AND sql LIKE 'CREATE VIRTUAL TABLE%'
-		  AND lower(sql) LIKE '%using fts5%'
-		ORDER BY name`)
+		SELECT m.name FROM sqlite_master m
+		WHERE m.type = 'table'
+		  AND COALESCE(m.rootpage, 0) = 0
+		  AND EXISTS (SELECT 1 FROM sqlite_master s
+		              WHERE s.type = 'table' AND s.name = m.name || '_data')
+		  AND EXISTS (SELECT 1 FROM sqlite_master s
+		              WHERE s.type = 'table' AND s.name = m.name || '_idx')
+		  AND EXISTS (SELECT 1 FROM sqlite_master s
+		              WHERE s.type = 'table' AND s.name = m.name || '_config')
+		ORDER BY m.name`)
 	if err != nil {
 		return nil, fmt.Errorf("list fts5 indexes: %w", err)
 	}

@@ -4,6 +4,7 @@
 package db
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -182,7 +183,7 @@ func TestCheckFTSStrict_NamesTheRepair(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run strict check: %v", err)
 	}
-	if !strings.Contains(report.Err().Error(), "sync --full") {
+	if !strings.Contains(report.Err().Error(), "repair-index") {
 		t.Errorf("failure does not name the repair: %v", report.Err())
 	}
 }
@@ -214,4 +215,73 @@ func TestCheckFTSStrict_SurvivesPlainIntegrityCheck(t *testing.T) {
 	if report.OK() {
 		t.Error("PRAGMA integrity_check says ok and so does the strict check, so nothing can see this damage")
 	}
+}
+
+// TestListFTSTables_FindsAnIndexDeclaredWithOddWhitespace is #137. Discovery
+// used to match `lower(sql) LIKE '%using fts5%'`, so an index whose
+// declaration put a newline or a second space between USING and fts5 fell out
+// of --strict's coverage silently: the report simply listed one fewer table.
+// Formatting cannot defeat a structural test.
+func TestListFTSTables_FindsAnIndexDeclaredWithOddWhitespace(t *testing.T) {
+	database := seedStrictFixture(t, t.TempDir())
+
+	if _, err := database.Exec("CREATE VIRTUAL TABLE oddly_fts USING\n  fts5(body)"); err != nil {
+		t.Fatalf("create an oddly-formatted fts5 index: %v", err)
+	}
+
+	tables, err := listFTSTables(context.Background(), database.DB)
+	if err != nil {
+		t.Fatalf("list fts5 indexes: %v", err)
+	}
+	if !containsString(tables, "oddly_fts") {
+		t.Errorf("listFTSTables found %v, missing the oddly-formatted index oddly_fts", tables)
+	}
+}
+
+// TestListFTSTables_IgnoresEverythingThatIsNotAnFTS5Index. The other half of
+// the guarantee: a structural test that over-reported would send the strict
+// check at a table whose integrity-check does not exist.
+func TestListFTSTables_IgnoresEverythingThatIsNotAnFTS5Index(t *testing.T) {
+	database := seedStrictFixture(t, t.TempDir())
+
+	if _, err := database.Exec("CREATE TABLE plain_fts (body TEXT)"); err != nil {
+		t.Fatalf("create a plain table: %v", err)
+	}
+	if _, err := database.Exec("CREATE VIEW turns_fts_view AS SELECT 1"); err != nil {
+		t.Fatalf("create a view: %v", err)
+	}
+	// An fts4 index is a virtual table with shadow tables of its own, and the
+	// one case a careless structural test would swallow. It has no
+	// 'integrity-check', so the strict check must not be pointed at it.
+	fts4Created := true
+	if _, err := database.Exec("CREATE VIRTUAL TABLE legacy_fts USING fts4(body)"); err != nil {
+		fts4Created = false
+		t.Logf("this build has no fts4, so that half of the assertion is untested: %v", err)
+	}
+	if fts4Created {
+		defer func() { _, _ = database.Exec("DROP TABLE legacy_fts") }()
+	}
+
+	tables, err := listFTSTables(context.Background(), database.DB)
+	if err != nil {
+		t.Fatalf("list fts5 indexes: %v", err)
+	}
+	unwanted := []string{"plain_fts", "turns_fts_view", "turns_fts_data", "turns_fts_idx", "turns_fts_config", "turns_fts_docsize"}
+	if fts4Created {
+		unwanted = append(unwanted, "legacy_fts")
+	}
+	for _, name := range unwanted {
+		if containsString(tables, name) {
+			t.Errorf("listFTSTables reported %q as an fts5 index: %v", name, tables)
+		}
+	}
+}
+
+func containsString(haystack []string, needle string) bool {
+	for _, s := range haystack {
+		if s == needle {
+			return true
+		}
+	}
+	return false
 }

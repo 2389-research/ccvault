@@ -488,7 +488,7 @@ func TestCompact_MalformedFTSIndexIsNotSwappedIn(t *testing.T) {
 	if !strings.Contains(err.Error(), "turns_fts") {
 		t.Errorf("error %q does not name the index that failed", err)
 	}
-	if !strings.Contains(err.Error(), "sync --full") {
+	if !strings.Contains(err.Error(), "repair-index") {
 		t.Errorf("error %q does not name the repair", err)
 	}
 
