@@ -467,9 +467,12 @@ func (s *Server) handleToolsList(req *jsonRPCRequest) {
 		{
 			Name: "get_session_summary",
 			Description: "Get a quick overview of a session: metadata, stats, tools used, and first/last " +
-				"messages. Use this first before get_turns. tools_used is counted from each assistant " +
-				"turn's raw_json; when some turns cannot be read the count is incomplete, and the " +
-				"response says so with unreadable_turns and a 'tools_used incomplete' warnings[] entry. " +
+				"messages. Use this first before get_turns. tools_used is counted from the tool calls " +
+				"stored for the session, which every source records — so it is right for codex, hex and " +
+				"jeff, whose calls never appear in a turn's raw_json. An assistant turn that recorded no " +
+				"calls and whose raw_json cannot be read may still have called something nothing can " +
+				"name; the response counts those in unreadable_turns with a 'tools_used incomplete' " +
+				"warnings[] entry. " +
 				"failed_tool_calls and failed_tools report the calls whose result said they failed, " +
 				"read from a stored column rather than raw_json, so they stay correct on a session " +
 				"whose tools_used is incomplete. Both are absent when nothing failed.",
@@ -489,10 +492,13 @@ func (s *Server) handleToolsList(req *jsonRPCRequest) {
 			Description: "Get paginated turns from a session, in conversation order. Every turn reports its " +
 				"ordinal — its position in the session, counting from 0, stable across calls. To walk a " +
 				"session, pass the response's next_after_ordinal back as after_ordinal; offset also works " +
-				"but counts rows in the last response rather than naming a turn. An assistant turn whose " +
-				"raw_json could not be read carries raw_unavailable: true and omits tools and " +
-				"has_thinking — absence of tools on such a turn is not evidence it called none. The page " +
-				"reports how many in unreadable_turns plus one warnings[] entry. A turn that issued a " +
+				"but counts rows in the last response rather than naming a turn. An assistant turn's " +
+				"tools come from the session's stored tool calls, so they are reported for every source " +
+				"and survive a turn whose raw_json cannot be read. has_thinking is read from raw_json and " +
+				"is present only when it could be determined: a turn whose raw_json could not be read " +
+				"carries raw_unavailable: true and omits it, and so does a source that records no " +
+				"thinking at all — absence is not a false. The page reports how many turns were " +
+				"unreadable in unreadable_turns plus one warnings[] entry. A turn that issued a " +
 				"call whose result said it failed carries failed_tools with that call's tool name; it " +
 				"comes from a stored column, so it is present even on a raw_unavailable turn, and it is " +
 				"absent rather than empty when nothing failed.",
@@ -933,24 +939,55 @@ func (s *Server) lookupProjectPathAndName(projectID int64) (path, name, warning 
 	}
 }
 
-// readTurnEnrichment pulls the tool names and the thinking flag out of an
-// assistant turn's raw_json. ok is false when raw_json cannot be read at
-// all — absent, because db.GetTurns dropped bytes that were not valid
-// JSON, or present in a shape these fields do not live in. Callers must
-// branch on ok rather than on an empty tool list: no tools and no answer
-// are different facts, and conflating them is the defect this returns ok
-// to prevent.
+// turnEnrichment is what an assistant turn's raw_json could be made to
+// say. The two flags are separate because they fail separately, and a
+// caller that collapsed them would reintroduce the defect they exist to
+// prevent.
+type turnEnrichment struct {
+	// tools names the calls recorded in message.content[], in order.
+	// Only ever a partial picture — see readTurnEnrichment.
+	tools []string
+
+	// rawReadable is false when raw_json could not be read at all:
+	// absent, because db.GetTurns dropped bytes that were not valid JSON,
+	// or valid JSON in a shape where message.content is not a list of
+	// blocks. A turn like this is marked raw_unavailable.
+	rawReadable bool
+
+	// shapeCarriesThinking is true only when the raw entry holds the
+	// top-level `message` object thinking blocks live in. claude-code and
+	// nanoclaw write it; codex, hex and jeff write raw entries with no
+	// such key, and Go's json.Unmarshal ignores unknown keys, so the
+	// parse succeeds against them and finds nothing. "Found nothing" in
+	// a shape that could not have held it is not a reading (#100), so
+	// callers omit has_thinking rather than answering false.
+	shapeCarriesThinking bool
+
+	// hasThinking is meaningful only when shapeCarriesThinking.
+	hasThinking bool
+}
+
+// readTurnEnrichment reads what it can out of an assistant turn's raw_json.
+//
+// Tools recovered here are a fallback, not the source of truth: calls are
+// stored in tool_uses by every adapter, and toolNamesByTurn reads them from
+// there. The fallback exists for a turn that holds tool_use blocks and has
+// no stored rows — measured as zero turns across the author's 47k-session
+// archive, so it is insurance against an archive written by an older
+// ccvault rather than a path anything takes today.
 //
 // The parse stays tolerant of unknown keys because raw_json's shape
-// differs across the source adapters; only a shape that cannot yield
-// these fields at all counts as a failure.
-func readTurnEnrichment(rawJSON []byte) (tools []string, hasThinking, ok bool) {
+// differs across the source adapters.
+func readTurnEnrichment(rawJSON []byte) turnEnrichment {
 	if len(rawJSON) == 0 {
-		return nil, false, false
+		return turnEnrichment{}
 	}
 
+	// A pointer, so an entry with no `message` key at all is distinguishable
+	// from one whose message held nothing. That distinction is the whole
+	// fix for has_thinking in #100.
 	var raw struct {
-		Message struct {
+		Message *struct {
 			Content []struct {
 				Type     string `json:"type"`
 				Name     string `json:"name,omitempty"`
@@ -959,18 +996,83 @@ func readTurnEnrichment(rawJSON []byte) (tools []string, hasThinking, ok bool) {
 		} `json:"message"`
 	}
 	if err := json.Unmarshal(rawJSON, &raw); err != nil {
-		return nil, false, false
+		return turnEnrichment{}
 	}
 
+	e := turnEnrichment{rawReadable: true}
+	if raw.Message == nil {
+		return e
+	}
+
+	e.shapeCarriesThinking = true
 	for _, c := range raw.Message.Content {
 		switch c.Type {
 		case "tool_use":
-			tools = append(tools, c.Name)
+			if c.Name != "" {
+				e.tools = append(e.tools, c.Name)
+			}
 		case "thinking":
-			hasThinking = true
+			e.hasThinking = true
 		}
 	}
-	return tools, hasThinking, true
+	return e
+}
+
+// toolNamesByTurn groups a session's recorded tool calls by the turn that
+// issued them, in the order they were issued.
+//
+// This is where the MCP layer learns what a turn called. Reading raw_json
+// for it only ever worked for claude-code and nanoclaw, whose entries carry
+// a top-level `message` object; codex and jeff record a turn's calls on
+// their own transcript lines, so a codex turn's calls are not in that
+// turn's raw_json at all and no amount of re-parsing recovers them (#100).
+// The adapters already extract every source's calls into tool_uses — the
+// column existed, this layer just was not reading it.
+//
+// Measured over the author's 47k-session archive: of the 287,557 assistant
+// turns whose raw_json the old parse could read, not one names a tool the
+// stored rows do not, and 501 of them name fewer. The column dominates
+// wherever both have an answer.
+//
+// Duplicates are kept, as failedToolsByTurn keeps them: a turn that made
+// three Bash calls says Bash three times, because the count is the fact.
+func toolNamesByTurn(database *db.DB, sessionID string) (map[string][]string, error) {
+	rows, err := database.Query(`
+		SELECT turn_id, tool_name
+		FROM tool_uses
+		WHERE session_id = ? AND turn_id IS NOT NULL
+		ORDER BY turn_id, turn_ordinal`, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("query tool calls for session %s: %w", sessionID, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	byTurn := make(map[string][]string)
+	for rows.Next() {
+		var turnID, toolName string
+		if err := rows.Scan(&turnID, &toolName); err != nil {
+			return nil, fmt.Errorf("scan tool call: %w", err)
+		}
+		if toolName == "" {
+			continue
+		}
+		byTurn[turnID] = append(byTurn[turnID], toolName)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read tool calls: %w", err)
+	}
+
+	return byTurn, nil
+}
+
+// turnTools is what a turn called: the stored rows, falling back to
+// whatever its raw_json names when it has none. The fallback can never
+// double-count, because it only runs for a turn with no stored calls.
+func turnTools(stored []string, e turnEnrichment) []string {
+	if len(stored) > 0 {
+		return stored
+	}
+	return e.tools
 }
 
 // topCountsByName renders a name-to-count map as the {tool, count} list the
@@ -1051,30 +1153,37 @@ func (s *Server) getSessionSummary(args map[string]interface{}) (interface{}, er
 	// the Class C {name, path} doctrine shape.
 	projectPath, projectName, projectWarning := s.lookupProjectPathAndName(session.ProjectID)
 
+	// What each turn called, read once for the session from the stored
+	// rows. Every adapter writes them, which is what makes tools_used
+	// correct for codex, hex and jeff rather than silently empty (#100).
+	storedTools, err := toolNamesByTurn(s.db, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get tool calls: %w", err)
+	}
+
 	// Count turn types and extract tool usage
 	turnTypeCounts := make(map[string]int)
 	toolCounts := make(map[string]int)
 	var firstUserMsg, lastUserMsg string
 
-	// tools_used aggregates tool calls over every assistant turn, so a turn
-	// whose raw_json cannot be read silently undercounts it — and an empty
-	// tools_used otherwise reads as a session that called no tools. Count
-	// the turns that did not contribute so the response can say so.
+	// An assistant turn with no stored calls and raw_json we cannot read
+	// is the one case tools_used is silently short by: it may have called
+	// something, and nothing here can say what. Count those turns so the
+	// response can say tools_used is incomplete — an empty tools_used
+	// otherwise reads as a session that called nothing.
 	unreadableTurns := 0
 
 	for _, t := range turns {
 		turnTypeCounts[t.Type]++
 
-		// Track tool usage from raw JSON
 		if t.Type == "assistant" {
-			tools, _, ok := readTurnEnrichment(t.RawJSON)
-			if !ok {
+			enrichment := readTurnEnrichment(t.RawJSON)
+			tools := turnTools(storedTools[t.ID], enrichment)
+			if len(tools) == 0 && !enrichment.rawReadable {
 				unreadableTurns++
 			}
 			for _, name := range tools {
-				if name != "" {
-					toolCounts[name]++
-				}
+				toolCounts[name]++
 			}
 		}
 
@@ -1180,13 +1289,13 @@ func (s *Server) getSessionSummary(args map[string]interface{}) (interface{}, er
 	}
 	// This warning names a field that is present but incomplete, not
 	// absent: dropping tools_used outright would cost a caller every tool
-	// the readable turns did report, which on a half-corrupt session is
-	// most of them.
+	// the other turns did report, which on a half-corrupt session is most
+	// of them.
 	if unreadableTurns > 0 {
 		result["unreadable_turns"] = unreadableTurns
 		warnings = append(warnings, fmt.Sprintf(
-			"tools_used incomplete: %d of %d assistant turns have unreadable raw_json, "+
-				"so the tools they called are not counted",
+			"tools_used incomplete: %d of %d assistant turns recorded no tool calls and have "+
+				"unreadable raw_json, so anything they called is not counted",
 			unreadableTurns, turnTypeCounts["assistant"]))
 	}
 	if len(warnings) > 0 {
@@ -1281,6 +1390,13 @@ func (s *Server) getTurns(args map[string]interface{}) (interface{}, error) {
 	}
 	failedTools := failedToolsByTurn(failures)
 
+	// What each turn called, read once for the session for the same reason
+	// and against the same session index.
+	storedTools, err := toolNamesByTurn(s.db, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get tool calls: %w", err)
+	}
+
 	// Transform to compact representation
 	compactTurns := make([]map[string]interface{}, 0, len(turns))
 	unreadableTurns := 0
@@ -1303,27 +1419,35 @@ func (s *Server) getTurns(args map[string]interface{}) (interface{}, error) {
 			"content":   content,
 		}
 
-		// tools and has_thinking are read out of the turn's raw_json. When
-		// that cannot be read the fields are omitted, and the turn says so
-		// — otherwise a turn we could not read is indistinguishable from a
-		// turn that used no tools, and a caller has no way to know which
-		// of its results to distrust.
+		// tools comes from the stored tool_uses rows, which every adapter
+		// writes — so it is right for codex, hex and jeff, whose calls are
+		// recorded on transcript lines of their own and were never in the
+		// turn's raw_json for the old reader to find (#100). It also
+		// survives a turn whose raw_json cannot be read, which is where it
+		// is worth the most.
 		//
-		// Both failure routes are real. Measured over the 46k-session
-		// archive (493,908 assistant turns): 52,851 reach here with no
-		// raw_json at all, because db.GetTurns drops bytes that are not
-		// valid JSON, and those rows are the mid-document fragments left
-		// by claude-code syncs predating the oversized-line fix. Zero
-		// turns had valid raw_json in a shape this struct would not fit,
-		// so that route is guarded rather than observed.
+		// has_thinking can only come from raw_json, and only from the
+		// `message` object claude-code and nanoclaw write. It is omitted
+		// when raw_json cannot be read, and omitted again when the raw
+		// shape has no such object: answering false there would be a claim
+		// about a source that records no thinking at all, not a reading.
+		//
+		// raw_unavailable marks the first of those, and is still worth
+		// saying. Measured over the 46k-session archive (493,908 assistant
+		// turns): 52,851 reach here with no raw_json at all, because
+		// db.GetTurns drops bytes that are not valid JSON — the
+		// mid-document fragments left by claude-code syncs predating the
+		// oversized-line fix.
 		if t.Type == "assistant" {
-			tools, hasThinking, ok := readTurnEnrichment(t.RawJSON)
-			if ok {
-				if len(tools) > 0 {
-					turn["tools"] = tools
-				}
-				turn["has_thinking"] = hasThinking
-			} else {
+			enrichment := readTurnEnrichment(t.RawJSON)
+
+			if tools := turnTools(storedTools[t.ID], enrichment); len(tools) > 0 {
+				turn["tools"] = tools
+			}
+			if enrichment.shapeCarriesThinking {
+				turn["has_thinking"] = enrichment.hasThinking
+			}
+			if !enrichment.rawReadable {
 				turn["raw_unavailable"] = true
 				unreadableTurns++
 			}
@@ -1363,7 +1487,8 @@ func (s *Server) getTurns(args map[string]interface{}) (interface{}, error) {
 		response["unreadable_turns"] = unreadableTurns
 		response["warnings"] = []string{fmt.Sprintf(
 			"turn enrichment unavailable: %d of %d returned turns have unreadable raw_json, "+
-				"so tools and has_thinking are omitted for them; those turns carry raw_unavailable: true",
+				"so has_thinking is omitted for them; those turns carry raw_unavailable: true. "+
+				"Their tools come from the stored tool calls and are unaffected",
 			unreadableTurns, len(compactTurns))}
 	}
 
