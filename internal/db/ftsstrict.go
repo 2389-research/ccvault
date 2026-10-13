@@ -165,13 +165,34 @@ func strictFTSCheck(ctx context.Context, q sqlRunner) (FTSStrictReport, error) {
 // listFTSTables names every fts5 virtual table in the schema. Discovered
 // rather than hardcoded, so an index added later is checked by everything that
 // checks indexes, instead of by whichever call sites someone remembered.
+//
+// Discovered structurally rather than by reading the CREATE statement, which
+// is #137. The text match it replaces was `lower(sql) LIKE '%using fts5%'`, so
+// an index declared `USING  fts5` — two spaces, or a newline — dropped out of
+// --strict's coverage with no error and no visible change beyond one fewer
+// table in a list nobody reads closely. The failure mode is the one the strict
+// check exists to eliminate: a check that silently covers less than you think
+// it does. Formatting cannot defeat a structural test.
+//
+// The structure, in two parts. A virtual table carries rootpage 0 in
+// sqlite_master, which is what separates the index from the ordinary tables
+// around it — including its own shadow tables, which have real roots. And
+// every fts5 table, whatever its options, owns shadow tables named
+// <name>_data, <name>_idx and <name>_config; fts3 and fts4 own a different set
+// (_content, _segdir, _segments) and so are not mistaken for fts5 here.
+// %_docsize is deliberately not required: columnsize=0 omits it.
 func listFTSTables(ctx context.Context, q sqlRunner) ([]string, error) {
 	rows, err := q.QueryContext(ctx, `
-		SELECT name FROM sqlite_master
-		WHERE type = 'table'
-		  AND sql LIKE 'CREATE VIRTUAL TABLE%'
-		  AND lower(sql) LIKE '%using fts5%'
-		ORDER BY name`)
+		SELECT m.name FROM sqlite_master m
+		WHERE m.type = 'table'
+		  AND COALESCE(m.rootpage, 0) = 0
+		  AND EXISTS (SELECT 1 FROM sqlite_master s
+		              WHERE s.type = 'table' AND s.name = m.name || '_data')
+		  AND EXISTS (SELECT 1 FROM sqlite_master s
+		              WHERE s.type = 'table' AND s.name = m.name || '_idx')
+		  AND EXISTS (SELECT 1 FROM sqlite_master s
+		              WHERE s.type = 'table' AND s.name = m.name || '_config')
+		ORDER BY m.name`)
 	if err != nil {
 		return nil, fmt.Errorf("list fts5 indexes: %w", err)
 	}
