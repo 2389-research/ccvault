@@ -107,7 +107,7 @@ var viewHelp = map[View]helpSection{
 	AnalyticsView: {
 		title: "Analytics",
 		bindings: []helpBinding{
-			{"←/→, 1-4", "switch tab"},
+			{"←/→, 1-5", "switch tab"},
 			{"↑/↓, k/j", "scroll one line"},
 			{"pgup/pgdn", "scroll half a page"},
 			{"wheel", "scroll"},

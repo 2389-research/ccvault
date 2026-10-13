@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 
 	"github.com/2389-research/ccvault/internal/db"
 	"github.com/xitongsys/parquet-go-source/local"
@@ -44,6 +46,40 @@ type SessionRecord struct {
 	// them (#74), and a parquet file copied away from the archive has no
 	// join back to SQLite to recover the split.
 	ParentSessionID string `parquet:"name=parent_session_id, type=BYTE_ARRAY, convertedtype=UTF8"`
+}
+
+// sessionRecordColumns returns the parquet column names SessionRecord
+// declares, in declaration order, read off the struct tags.
+//
+// This is how the cache staleness check stays honest. It used to ask whether
+// the cached file had one named column, so the column added after that check
+// was written (`parent_session_id`, #149) was invisible to it and a stale
+// cache was never refreshed. Deriving the expectation from the struct means a
+// new field is covered the moment it is declared — there is no second list to
+// remember to edit, and no schema version number to remember to bump.
+func sessionRecordColumns() []string {
+	t := reflect.TypeOf(SessionRecord{})
+	columns := make([]string, 0, t.NumField())
+	for i := 0; i < t.NumField(); i++ {
+		name := parquetColumnName(t.Field(i).Tag.Get("parquet"))
+		if name != "" {
+			columns = append(columns, name)
+		}
+	}
+	return columns
+}
+
+// parquetColumnName pulls the `name=` value out of a parquet struct tag such
+// as `name=started_at, type=INT64, convertedtype=TIMESTAMP_MILLIS`, returning
+// "" for a field with no parquet name.
+func parquetColumnName(tag string) string {
+	for _, part := range strings.Split(tag, ",") {
+		part = strings.TrimSpace(part)
+		if after, ok := strings.CutPrefix(part, "name="); ok {
+			return after
+		}
+	}
+	return ""
 }
 
 // Exporter exports data to Parquet format
