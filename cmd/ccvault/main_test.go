@@ -484,7 +484,7 @@ func TestPrintIntegritySection(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			out := captureStdout(t, func() { printIntegritySection(tt.integrity) })
+			out := captureStdout(t, func() { printIntegritySection(tt.integrity, false) })
 			for _, want := range tt.wantLines {
 				if !strings.Contains(out, want) {
 					t.Errorf("output does not contain %q:\n%s", want, out)

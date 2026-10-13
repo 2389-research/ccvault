@@ -4,6 +4,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"embed"
 	"fmt"
@@ -20,6 +21,15 @@ var migrationFS embed.FS
 // If the database has existing tables but no schema_version, it detects the
 // existing state and bootstraps version records accordingly.
 func RunMigrations(db *sql.DB) error {
+	// The half of #105's guard that cannot be walked around. Open checks too,
+	// and Open is a convenience: this is what every path that establishes or
+	// advances the schema has to go through, so a caller that opens its own
+	// *sql.DB still meets the refusal. It runs before the CREATE TABLE below,
+	// so a database this binary must not touch is not touched.
+	if err := refuseIfSchemaTooNew(context.Background(), db); err != nil {
+		return err
+	}
+
 	// Create schema_version table if it doesn't exist
 	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS schema_version (
 		version INTEGER NOT NULL,
