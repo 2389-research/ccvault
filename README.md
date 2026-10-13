@@ -345,11 +345,12 @@ so the query is gone and the style comes from this variable instead.
 
 ### Pointing ccvault at another archive
 
-Two persistent flags are available on every command:
+Three persistent flags are available on every command:
 
 | Flag | Answers |
 |------|---------|
 | `--data-dir <path>` | Where the database lives |
+| `--claude-home <path>` | Where conversations are read from |
 | `--config <path>` | Which config file to read |
 
 `data_dir` is resolved highest precedence first:
@@ -359,29 +360,36 @@ Two persistent flags are available on every command:
 3. `data_dir = "..."` in the config file
 4. `~/.ccvault`
 
+`claude_home` follows the identical chain: `--claude-home`,
+`CCVAULT_CLAUDE_HOME`, `claude_home = "..."`, `~/.claude`.
+
 `--data-dir` also **replaces** the config search path, so `~/.ccvault` is not
-read at all when it is given — which is what makes the CLI runnable against a
-throwaway archive in a sandbox that must not touch the real one:
+read at all when it is given.
+
+The two flags are deliberately **independent**: `--data-dir` redirects the
+archive, not the source it is built from, because relocating the archive while
+still indexing the real transcripts is the common case. A run isolated from
+the user's real data needs both:
 
 ```bash
-mkdir -p /tmp/fixture
-printf 'claude_home = "/tmp/fixture/claude"\n' > /tmp/fixture/config.toml
-ccvault --data-dir /tmp/fixture sync
+mkdir -p /tmp/fixture/claude
+ccvault --data-dir /tmp/fixture --claude-home /tmp/fixture/claude sync
 ccvault --data-dir /tmp/fixture stats --json
 ```
+
+`--claude-home` also **replaces** any `[[sources]]` list the config file
+declares, collapsing it to the single claude-code tree named on the flag. A
+partial override would leave a configured source pointing at the real
+transcript directory, which is the hole the flag exists to close. A config
+file that declares both `claude_home` and `[[sources]]` is hand-authored and
+keeps its list — only the flag and `CCVAULT_CLAUDE_HOME` replace it.
 
 `--config` names a single file instead of searching for one, and a path that
 does not exist is an error rather than a silent fall-back to defaults. Given
 both, `--config` decides where settings come from and `--data-dir` still wins
-for `data_dir` itself.
-
-Note that `--data-dir` redirects the **archive**, not the **source** it reads.
-`claude_home` still defaults to `~/.claude`, so a sandbox that must not read
-the real conversation files needs to redirect that too — via `claude_home` (or
-a `sources` list) in the fixture config, as above, or `CCVAULT_CLAUDE_HOME`.
-A config file that exists but cannot be parsed is now an error for the same
-reason: silently falling back to defaults would send a fixture run at the real
-`~/.claude`.
+for `data_dir` itself. A config file that exists but cannot be parsed is an
+error for the same reason: silently falling back to defaults would send a
+fixture run at the real `~/.claude`.
 
 ## Data Storage
 

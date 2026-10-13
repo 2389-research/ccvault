@@ -201,3 +201,132 @@ func TestLoadWith_DataDirBeatsExplicitConfigFile(t *testing.T) {
 		t.Errorf("backward-compat source path = %q, want it derived from claude_home", cfg.Sources[0].Path)
 	}
 }
+
+// --- claude_home isolation (#68) ---
+
+// Precedence for claude_home mirrors data_dir's: flag, then environment,
+// then the config file, then the built-in default.
+func TestLoadWith_ClaudeHomePrecedence(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	fixture := filepath.Join(home, "fixture")
+	writeConfig(t, fixture, "claude_home = \"/from-config-file\"\n")
+
+	t.Run("config file beats default", func(t *testing.T) {
+		cfg, err := LoadWith(Options{DataDir: fixture})
+		if err != nil {
+			t.Fatalf("LoadWith: %v", err)
+		}
+		if cfg.ClaudeHome != "/from-config-file" {
+			t.Errorf("claude_home = %q, want the config-file value", cfg.ClaudeHome)
+		}
+	})
+
+	t.Run("env beats config file", func(t *testing.T) {
+		t.Setenv("CCVAULT_CLAUDE_HOME", "/from-env")
+		cfg, err := LoadWith(Options{DataDir: fixture})
+		if err != nil {
+			t.Fatalf("LoadWith: %v", err)
+		}
+		if cfg.ClaudeHome != "/from-env" {
+			t.Errorf("claude_home = %q, want /from-env", cfg.ClaudeHome)
+		}
+	})
+
+	t.Run("flag beats env", func(t *testing.T) {
+		t.Setenv("CCVAULT_CLAUDE_HOME", "/from-env")
+		cfg, err := LoadWith(Options{DataDir: fixture, ClaudeHome: "/from-flag"})
+		if err != nil {
+			t.Fatalf("LoadWith: %v", err)
+		}
+		if cfg.ClaudeHome != "/from-flag" {
+			t.Errorf("claude_home = %q, want /from-flag", cfg.ClaudeHome)
+		}
+	})
+
+	t.Run("default when nothing set", func(t *testing.T) {
+		cfg, err := LoadWith(Options{DataDir: t.TempDir()})
+		if err != nil {
+			t.Fatalf("LoadWith: %v", err)
+		}
+		if cfg.ClaudeHome != filepath.Join(home, ".claude") {
+			t.Errorf("claude_home = %q, want the default under the swapped HOME", cfg.ClaudeHome)
+		}
+	})
+}
+
+// The flag has to reach the source list, not just the ClaudeHome field: sync
+// reads cfg.Sources, so a [[sources]] entry left pointing at the real
+// ~/.claude would scan it regardless of what claude_home says. This is the
+// hole that made --data-dir's isolation incomplete.
+func TestLoadWith_ClaudeHomeReplacesConfiguredSources(t *testing.T) {
+	fixture := t.TempDir()
+	scratch := t.TempDir()
+	writeConfig(t, fixture, "[[sources]]\nname = \"claude-code\"\ntype = \"claude-code\"\npath = \"/real/claude/home\"\n\n[[sources]]\nname = \"codex\"\ntype = \"codex\"\npath = \"/real/codex/home\"\n")
+
+	cfg, err := LoadWith(Options{DataDir: fixture, ClaudeHome: scratch})
+	if err != nil {
+		t.Fatalf("LoadWith: %v", err)
+	}
+
+	if len(cfg.Sources) != 1 {
+		t.Fatalf("explicit claude home should leave exactly one source, got %d: %+v", len(cfg.Sources), cfg.Sources)
+	}
+	if cfg.Sources[0].Path != scratch {
+		t.Errorf("source path = %q, want the scratch claude home %q", cfg.Sources[0].Path, scratch)
+	}
+	if cfg.Sources[0].Type != "claude-code" {
+		t.Errorf("source type = %q, want claude-code", cfg.Sources[0].Type)
+	}
+}
+
+// Same rule for the environment variable, which is the form a test harness
+// or sandbox is most likely to use.
+func TestLoadWith_EnvClaudeHomeReplacesConfiguredSources(t *testing.T) {
+	fixture := t.TempDir()
+	scratch := t.TempDir()
+	writeConfig(t, fixture, "[[sources]]\nname = \"claude-code\"\ntype = \"claude-code\"\npath = \"/real/claude/home\"\n")
+	t.Setenv("CCVAULT_CLAUDE_HOME", scratch)
+
+	cfg, err := LoadWith(Options{DataDir: fixture})
+	if err != nil {
+		t.Fatalf("LoadWith: %v", err)
+	}
+	if len(cfg.Sources) != 1 || cfg.Sources[0].Path != scratch {
+		t.Fatalf("CCVAULT_CLAUDE_HOME should replace the source list with the scratch tree, got %+v", cfg.Sources)
+	}
+}
+
+// A config file that names BOTH claude_home and sources is hand-authored and
+// internally consistent; the sources list it declares is kept. Only overrides
+// from outside the file (flag, env) replace it.
+func TestLoadWith_ConfigFileClaudeHomeKeepsItsOwnSources(t *testing.T) {
+	fixture := t.TempDir()
+	writeConfig(t, fixture, "claude_home = \"/claude-from-file\"\n\n[[sources]]\nname = \"a\"\ntype = \"claude-code\"\npath = \"/source-a\"\n\n[[sources]]\nname = \"b\"\ntype = \"codex\"\npath = \"/source-b\"\n")
+
+	cfg, err := LoadWith(Options{DataDir: fixture})
+	if err != nil {
+		t.Fatalf("LoadWith: %v", err)
+	}
+	if len(cfg.Sources) != 2 {
+		t.Fatalf("config-file sources should survive, got %+v", cfg.Sources)
+	}
+}
+
+// The decision recorded: --data-dir redirects the archive only. It does NOT
+// imply a scratch claude_home, because the common real use is relocating the
+// archive while still indexing the real transcripts. --claude-home is the
+// separate knob for the other half.
+func TestLoadWith_DataDirDoesNotImplyScratchClaudeHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	cfg, err := LoadWith(Options{DataDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("LoadWith: %v", err)
+	}
+	if cfg.ClaudeHome != filepath.Join(home, ".claude") {
+		t.Errorf("claude_home = %q, want the default; --data-dir must not move it", cfg.ClaudeHome)
+	}
+}

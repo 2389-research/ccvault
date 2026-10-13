@@ -45,14 +45,26 @@ func DefaultDataDir() string {
 	return filepath.Join(home, ".ccvault")
 }
 
+// ClaudeHomeEnvVar is the environment variable that overrides claude_home.
+// Named here because the override has to be detectable as *explicit* — an
+// env-supplied claude home replaces the config file's source list, which
+// viper's merged view can no longer tell apart from a file-supplied one.
+const ClaudeHomeEnvVar = "CCVAULT_CLAUDE_HOME"
+
 // Options names the configuration sources explicitly, so a caller can point
-// ccvault at a throwaway archive without the default data directory being
-// consulted at all.
+// ccvault at a throwaway archive AND a throwaway transcript tree without
+// either default being consulted at all.
 //
-// They answer two different questions. ConfigFile is which file to read —
+// They answer three different questions. ConfigFile is which file to read —
 // which sources to scan, which claude_home, and possibly a data_dir of its
 // own. DataDir is where the database lives, and it wins over whatever the
-// file says.
+// file says. ClaudeHome is where conversations are read from, and it wins
+// the same way.
+//
+// DataDir and ClaudeHome are independent on purpose: relocating the archive
+// while still indexing the real transcripts is the common case, so --data-dir
+// does not imply a scratch claude home. Isolating a run from the user's real
+// data takes both.
 type Options struct {
 	// ConfigFile is the one file to read. When set, no directory is
 	// searched and a missing file is an error rather than a fallback.
@@ -61,6 +73,12 @@ type Options struct {
 	// DataDir overrides the data directory. It also REPLACES the config
 	// search path, so the default data directory is not stat'd at all.
 	DataDir string
+
+	// ClaudeHome overrides the Claude Code transcript directory. It also
+	// REPLACES any [[sources]] list the config file declares — see
+	// applyExplicitClaudeHome for why a partial override would be a
+	// foot-gun rather than a feature.
+	ClaudeHome string
 }
 
 // Load reads configuration from the default search path and environment.
@@ -81,6 +99,9 @@ func LoadFrom(configFile string) (*Config, error) {
 //  2. CCVAULT_DATA_DIR
 //  3. data_dir in the config file
 //  4. DefaultDataDir()
+//
+// claude_home follows the identical chain with opts.ClaudeHome (the
+// --claude-home flag) and CCVAULT_CLAUDE_HOME.
 //
 // Rung 1 is viper's explicit-Set layer, which sits above AutomaticEnv; the
 // rest is viper's own ordering. All four rungs are pinned by tests rather
@@ -123,13 +144,45 @@ func LoadWith(opts Options) (*Config, error) {
 		}
 	}
 
-	// Applied after the file is read so it outranks the file's own data_dir
+	// Applied after the file is read so they outrank the file's own values
 	// as well as the environment.
 	if opts.DataDir != "" {
 		v.Set("data_dir", opts.DataDir)
 	}
+	if opts.ClaudeHome != "" {
+		v.Set("claude_home", opts.ClaudeHome)
+	}
 
-	return unmarshalAndApplyDefaults(v)
+	cfg, err := unmarshalAndApplyDefaults(v)
+	if err != nil {
+		return nil, err
+	}
+
+	// Done after defaults so it overwrites a synthesized source as well as a
+	// declared one.
+	if opts.ClaudeHome != "" || os.Getenv(ClaudeHomeEnvVar) != "" {
+		applyExplicitClaudeHome(cfg)
+	}
+
+	return cfg, nil
+}
+
+// applyExplicitClaudeHome collapses the source list to the single claude-code
+// source rooted at cfg.ClaudeHome.
+//
+// The point of naming a claude home from outside the config file is that
+// nothing reads the real ~/.claude. A [[sources]] entry with an explicit path
+// would survive a claude_home-only override and scan it anyway, which is the
+// isolation hole --claude-home exists to close — so the override is total
+// rather than partial. A config file that declares both claude_home and
+// sources is hand-authored and internally consistent, so it keeps its list;
+// only the flag and the environment variable replace it.
+func applyExplicitClaudeHome(cfg *Config) {
+	cfg.Sources = []SourceConfig{{
+		Name: "claude-code",
+		Type: "claude-code",
+		Path: cfg.ClaudeHome,
+	}}
 }
 
 // configSearchPaths returns the directories to search for config.toml.
