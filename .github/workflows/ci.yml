@@ -124,11 +124,31 @@ jobs:
         if: matrix.go-version != 'stable'
         run: make test-coverage
 
+      # v7 is the Node 24 major, and getting here from v4 crosses a rewrite,
+      # so this is not the drop-in the other action bumps were. v5 replaced the
+      # action's own uploader with a wrapper around the Codecov CLI, and
+      # renamed inputs in the process: `file` became `files`, and `file` is
+      # simply absent from v7's action.yml.
+      #
+      # That rename is the whole risk, because GitHub only *warns* about an
+      # input an action does not declare. Left as `file`, this step would keep
+      # passing, keep saying it uploaded, and never be told which file to
+      # upload -- the CLI would fall back to searching the tree, so the
+      # outcome would depend on what it happened to find rather than on what
+      # `make test-coverage` just wrote. A silent change of meaning is worse
+      # here than a failure would be.
+      #
+      # v6 is Node 24 by default; v7 only changes which account holds
+      # Codecov's GPG signing key. No token is set, and none is needed: this
+      # repo is public, and tokenless upload for public repositories is the
+      # path v5 made explicit. `fail_ci_if_error: false` is kept, so a Codecov
+      # outage or an upload rate-limit still cannot redden a PR that has
+      # nothing wrong with it.
       - name: Upload coverage to Codecov
         if: matrix.go-version != 'stable'
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v7
         with:
-          file: ./coverage.out
+          files: ./coverage.out
           flags: unittests
           fail_ci_if_error: false
 
