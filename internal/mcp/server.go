@@ -5,6 +5,7 @@ package mcp
 
 import (
 	"bufio"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1046,6 +1047,73 @@ func toolNamesByTurn(database *db.DB, sessionID string) (map[string][]string, er
 	if err != nil {
 		return nil, fmt.Errorf("query tool calls for session %s: %w", sessionID, err)
 	}
+	return scanToolNamesByTurn(rows)
+}
+
+// toolNamesForTurns is toolNamesByTurn scoped to named turns, for a caller
+// rendering a page rather than summarising a session (#141).
+//
+// Naming the turns changes which index answers the query, and that is where
+// the cost goes. Session-wide, SQLite seeks idx_tool_uses_session and then
+// sorts every row it found in a temp B-tree, because that index does not
+// carry the ORDER BY. Per turn it seeks idx_tool_uses_turn_ordinal — which
+// leads on turn_id and already holds the rows in the order asked for — once
+// per turn, and sorts nothing.
+//
+// Measured by BenchmarkToolNameReadForOnePage on a session of 7,034 turns,
+// for one 50-turn page, session-wide -> page-bounded:
+//
+//	1,871 calls     1,871 rows, 1.3ms  ->   50 rows, 0.07ms
+//	133,039 calls  133,039 rows, 205ms ->  950 rows, 0.81ms
+//
+// The first is the largest real session in the author's archive; the second
+// is the scale #141 quoted. Either way the point is the shape: a per-page
+// cost proportional to the session is what undoes paging a long one (#79).
+func toolNamesForTurns(database *db.DB, sessionID string, turnIDs []string) (map[string][]string, error) {
+	if len(turnIDs) == 0 {
+		// `turn_id IN ()` is not valid SQL, and there is nothing to ask about.
+		return map[string][]string{}, nil
+	}
+
+	byTurn := make(map[string][]string, len(turnIDs))
+
+	// Chunked so a caller asking about more turns than get_turns' 50-row page
+	// can't exceed SQLite's bound-parameter ceiling.
+	const chunk = 500
+	for start := 0; start < len(turnIDs); start += chunk {
+		batch := turnIDs[start:min(start+chunk, len(turnIDs))]
+
+		placeholders := make([]string, len(batch))
+		args := make([]interface{}, 0, len(batch)+1)
+		args = append(args, sessionID)
+		for i, id := range batch {
+			placeholders[i] = "?"
+			args = append(args, id)
+		}
+
+		rows, err := database.Query(`
+			SELECT turn_id, tool_name
+			FROM tool_uses
+			WHERE session_id = ? AND turn_id IN (`+strings.Join(placeholders, ", ")+`)
+			ORDER BY turn_id, turn_ordinal`, args...)
+		if err != nil {
+			return nil, fmt.Errorf("query tool calls for %d turns of session %s: %w", len(turnIDs), sessionID, err)
+		}
+		part, err := scanToolNamesByTurn(rows)
+		if err != nil {
+			return nil, err
+		}
+		for turnID, names := range part {
+			byTurn[turnID] = append(byTurn[turnID], names...)
+		}
+	}
+
+	return byTurn, nil
+}
+
+// scanToolNamesByTurn groups the rows of a (turn_id, tool_name) query, which
+// both readers above produce in the order the calls were issued.
+func scanToolNamesByTurn(rows *sql.Rows) (map[string][]string, error) {
 	defer func() { _ = rows.Close() }()
 
 	byTurn := make(map[string][]string)
@@ -1391,9 +1459,20 @@ func (s *Server) getTurns(args map[string]interface{}) (interface{}, error) {
 	}
 	failedTools := failedToolsByTurn(failures)
 
-	// What each turn called, read once for the session for the same reason
-	// and against the same session index.
-	storedTools, err := toolNamesByTurn(s.db, sessionID)
+	// What each turn called, read for the turns this page is about to render
+	// and no others. Only assistant turns are labelled, so only those are
+	// asked about — and a page of nothing but user turns asks nothing.
+	//
+	// Scoped rather than session-wide because the session is the wrong unit
+	// for a page: the read used to cost what the whole session's tool calls
+	// cost, however few rows it was labelling (#141).
+	pageTurnIDs := make([]string, 0, len(turns))
+	for _, t := range turns {
+		if t.Type == "assistant" {
+			pageTurnIDs = append(pageTurnIDs, t.ID)
+		}
+	}
+	storedTools, err := toolNamesForTurns(s.db, sessionID, pageTurnIDs)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get tool calls: %w", err)
 	}
