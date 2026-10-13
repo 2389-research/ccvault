@@ -13,6 +13,62 @@ import (
 	"time"
 )
 
+// MergeOptions carries the decisions a caller can make about a merge. The
+// zero value is the safe one, so a new call site that has not thought about
+// any of this gets the refusals rather than having to ask for them.
+type MergeOptions struct {
+	// AllowNewerSchema imports from a source archive written by a newer
+	// ccvault, which is refused by default. See MergeSourceTooNewError.
+	AllowNewerSchema bool
+}
+
+// MergeSourceTooNewError reports that the archive an import reads FROM carries
+// a migration this binary has never heard of.
+//
+// #105 guards the archive a command writes to, and verifyMergeSchema checks
+// the columns the two databases share. Neither sees this one: ATTACH opens the
+// source, the source is only ever read, and the column check passes.
+//
+// The exposure is narrower than #105's and worth stating precisely rather than
+// overselling. Reading cannot delete the source. The risk is reading columns
+// whose meaning has changed and writing the misreading into the destination.
+// Migration 012 is the concrete precedent: it re-keyed turns from id to
+// (session_id, id) without renaming a single column, so a binary that predated
+// it would read both columns happily and draw the wrong conclusion about row
+// identity. That is the class of mistake a column-name check cannot catch,
+// because the columns match.
+//
+// A refusal with an override rather than a hard block, because the question
+// here is "may I believe what this file says?" rather than #105's "may I write
+// this?" — and importing from a newer archive is a legitimate thing to want to
+// do. It is how the author's archive was recovered in September 2026.
+type MergeSourceTooNewError struct {
+	// Path is the source archive that was refused.
+	Path string
+	// SourceVersion is the highest migration recorded in the source.
+	SourceVersion int
+	// KnownVersion is the highest migration this binary ships.
+	KnownVersion int
+}
+
+func (e *MergeSourceTooNewError) Error() string {
+	return fmt.Sprintf(
+		"the archive at %s is at schema version %d and this ccvault only knows up to %d, "+
+			"so it was written by a newer ccvault than the one you are running. "+
+			"Importing from it can read columns whose meaning has changed and write the "+
+			"misreading into this archive — migration 012 re-keyed turns from id to "+
+			"(session_id, id) without renaming a column, which a column check cannot catch. "+
+			"Upgrade ccvault, or pass --allow-newer-schema to import from it anyway",
+		e.Path, e.SourceVersion, e.KnownVersion)
+}
+
+// Is makes errors.Is(err, ErrSchemaTooNew) true for this refusal too, so a
+// caller recognising "an archive is from the future" by sentinel does not have
+// to know which archive.
+func (e *MergeSourceTooNewError) Is(target error) bool {
+	return target == ErrSchemaTooNew
+}
+
 // MergeStats reports what a merge brought in.
 type MergeStats struct {
 	ProjectsInserted int64 `json:"projects_inserted"`
@@ -56,6 +112,12 @@ var mergeRequiredColumns = map[string][]string{
 // mean that archive is already inconsistent) imports with a NULL project_id
 // rather than being dropped — the turns are the part worth keeping.
 func (db *DB) MergeFrom(path string) (*MergeStats, error) {
+	return db.MergeFromWithOptions(path, MergeOptions{})
+}
+
+// MergeFromWithOptions is MergeFrom with the refusals a caller may waive. See
+// MergeOptions; the zero value is MergeFrom.
+func (db *DB) MergeFromWithOptions(path string, opts MergeOptions) (*MergeStats, error) {
 	src, err := resolveMergeSource(path, db.path)
 	if err != nil {
 		return nil, err
@@ -86,6 +148,14 @@ func (db *DB) MergeFrom(path string) (*MergeStats, error) {
 
 	if err := verifyMergeSchema(ctx, conn); err != nil {
 		return nil, err
+	}
+
+	// After verifyMergeSchema, so a file that is not a ccvault archive at all
+	// is told that rather than being told about schema versions.
+	if !opts.AllowNewerSchema {
+		if err := refuseIfMergeSourceTooNew(ctx, conn, src); err != nil {
+			return nil, err
+		}
 	}
 
 	columns := make(map[string][]string, len(mergeTables))
@@ -225,6 +295,44 @@ func verifyMergeSchema(ctx context.Context, conn *sql.Conn) error {
 		if n == 0 {
 			return fmt.Errorf("incoming database has no %q table; it does not look like a ccvault archive", table)
 		}
+	}
+	return nil
+}
+
+// refuseIfMergeSourceTooNew reads the attached source's schema version and
+// refuses the merge if it is ahead of this binary.
+//
+// Read off the attachment rather than by opening the file again, so the
+// version that is checked is the one the merge will actually read from — a
+// second open could see a different file, and the statements below have the
+// source attached anyway.
+func refuseIfMergeSourceTooNew(ctx context.Context, conn *sql.Conn, srcPath string) error {
+	known, err := MaxKnownSchemaVersion()
+	if err != nil {
+		return fmt.Errorf("determine the highest migration this binary ships: %w", err)
+	}
+
+	// No schema_version table means the source predates the migration system,
+	// which makes it older rather than newer. That archive is the main thing
+	// `ccvault import` is pointed at — a copy off another machine, or a backup
+	// predating a column — so it reads as version 0 and passes.
+	var tables int
+	if err := conn.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM incoming.sqlite_master WHERE type = 'table' AND name = 'schema_version'",
+	).Scan(&tables); err != nil {
+		return fmt.Errorf("look for the source's schema_version table: %w", err)
+	}
+	if tables == 0 {
+		return nil
+	}
+
+	var source int
+	if err := conn.QueryRowContext(ctx,
+		"SELECT COALESCE(MAX(version), 0) FROM incoming.schema_version").Scan(&source); err != nil {
+		return fmt.Errorf("read the source's schema version: %w", err)
+	}
+	if source > known {
+		return &MergeSourceTooNewError{Path: srcPath, SourceVersion: source, KnownVersion: known}
 	}
 	return nil
 }

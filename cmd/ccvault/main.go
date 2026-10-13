@@ -130,9 +130,13 @@ func openArchiveForRead(dataDir string) (*db.DB, error) {
 // error cannot work out for itself — three installs ahead of the repo on the
 // author's PATH is how #105 happened, and "which binary is this" is how it was
 // diagnosed.
+//
+// Matched on the ErrSchemaTooNew sentinel rather than on one concrete type, so
+// every refusal of this kind is decorated. #136 added a second one for the
+// archive an import reads FROM, and a guard that reaches the user undecorated
+// costs them the hour the decoration exists to save.
 func nameTheBinary(err error) error {
-	var tooNew *db.SchemaTooNewError
-	if errors.As(err, &tooNew) {
+	if errors.Is(err, db.ErrSchemaTooNew) {
 		return fmt.Errorf("%w. %s", err, thisBinary())
 	}
 	return err
@@ -2006,6 +2010,13 @@ read, never modified.
 The whole merge runs in one transaction, so a failure leaves this archive
 exactly as it was.
 
+A source written by a newer ccvault than this one is refused. Reading it
+cannot damage it; the risk is reading columns whose meaning has changed —
+migration 012 re-keyed turns without renaming a column, which a column check
+cannot catch — and writing the misreading into this archive. Importing from a
+newer archive is legitimate, and is how this archive was recovered in
+September, so --allow-newer-schema goes ahead anyway.
+
 Use it to recover from a destructive rebuild:
 
   ccvault import ~/.ccvault/backups/ccvault-20260905-140418.db
@@ -2030,9 +2041,13 @@ or to consolidate the archives of two machines into one.`,
 		}
 		defer func() { _ = database.Close() }()
 
-		stats, err := database.MergeFrom(args[0])
+		allowNewerSchema, _ := cmd.Flags().GetBool("allow-newer-schema")
+
+		stats, err := database.MergeFromWithOptions(args[0], db.MergeOptions{
+			AllowNewerSchema: allowNewerSchema,
+		})
 		if err != nil {
-			return fmt.Errorf("import: %w", err)
+			return fmt.Errorf("import: %w", nameTheBinary(err))
 		}
 
 		if asJSON {
@@ -2112,6 +2127,8 @@ func init() {
 
 	// Import flags
 	importCmd.Flags().Bool("json", false, "Output merge counts as JSON")
+	importCmd.Flags().Bool("allow-newer-schema", false,
+		"Import from an archive written by a newer ccvault, which is refused by default. The source is only read, so this cannot damage it — the risk is reading columns whose meaning has changed and writing the misreading into this archive. Pass it when recovering from a backup a newer ccvault wrote")
 
 	// Search flags
 	searchCmd.Flags().Bool("json", false, "Output results as JSON")
