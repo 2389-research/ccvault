@@ -1,6 +1,18 @@
 -- ABOUTME: Reference copy of the SQLite schema for ccvault database
 -- ABOUTME: Migrations in internal/db/migrations/ are the source of truth for schema changes
 
+-- Every DATETIME column holds RFC3339 in UTC with a padded nanosecond field:
+--
+--   2026-01-14T20:15:00.134000000Z
+--
+-- so date(), datetime(), strftime() and julianday() all work on it, and so it
+-- sorts as text in the order it happened. internal/db's FormatTimestamp is the
+-- only thing that writes one; migration 014 converted the archives that held
+-- Go's time.Time.String() instead, which none of those functions could read
+-- (#33). Characters 1-10 are the calendar date, which the search_period
+-- columns below slice out — a different rendering is a rebuild of two FTS
+-- indexes, not just a storage change.
+
 -- Projects table
 CREATE TABLE IF NOT EXISTS projects (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

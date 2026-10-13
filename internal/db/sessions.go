@@ -102,8 +102,8 @@ func upsertSession(w sessionWriter, s *models.Session) error {
 	_, err = w.Exec(upsertSessionSQL,
 		s.ID,
 		s.ProjectID,
-		s.StartedAt,
-		s.EndedAt,
+		FormatTimestamp(s.StartedAt),
+		FormatTimestamp(s.EndedAt),
 		s.Model,
 		s.GitBranch,
 		s.TurnCount,
@@ -112,7 +112,7 @@ func upsertSession(w sessionWriter, s *models.Session) error {
 		s.CacheReadTokens,
 		s.CacheWriteTokens,
 		s.SourceFile,
-		time.Now(),
+		FormatTimestamp(time.Now()),
 		s.HasError,
 		s.HasSubagent,
 		source,
@@ -686,7 +686,7 @@ func (db *DB) UpsertSourceFileMtime(path string, mtime time.Time, source ...stri
 	}
 	_, err := db.Exec(
 		"INSERT INTO source_files (path, source, mtime, synced_at) VALUES (?, ?, ?, ?) ON CONFLICT(path, source) DO UPDATE SET mtime = excluded.mtime, synced_at = excluded.synced_at",
-		path, src, mtime, time.Now(),
+		path, src, FormatTimestamp(mtime), FormatTimestamp(time.Now()),
 	)
 	return err
 }
@@ -700,7 +700,7 @@ func (db *DB) UpsertSourceFileMtimeTx(tx *sql.Tx, path string, mtime time.Time, 
 	}
 	_, err := tx.Exec(
 		"INSERT INTO source_files (path, source, mtime, synced_at) VALUES (?, ?, ?, ?) ON CONFLICT(path, source) DO UPDATE SET mtime = excluded.mtime, synced_at = excluded.synced_at",
-		path, src, mtime, time.Now(),
+		path, src, FormatTimestamp(mtime), FormatTimestamp(time.Now()),
 	)
 	return err
 }

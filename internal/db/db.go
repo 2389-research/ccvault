@@ -66,6 +66,21 @@ const (
 // all. Nothing noticed, because an ignored option looks exactly like a
 // honoured one from the calling code. verifyConnectionPragmas exists so the
 // next such mistake cannot be silent.
+//
+// `_time_format=` is deliberately not set, and it is the obvious thing to
+// reach for: it is the driver-level lever that decides how a bound time.Time
+// becomes text, so it would cover every write site at once, including ones a
+// later change forgets. It is not used because the driver offers exactly one
+// value for it — "sqlite", meaning "2006-01-02 15:04:05.999999999-07:00" —
+// and that rendering is wrong twice over for this archive. It keeps the
+// writer's local offset rather than normalising to UTC, which is the half of
+// #90 that makes a date filter compare instants; and its fraction is trimmed
+// rather than padded, so the text stops sorting chronologically once values
+// of different precision meet. The archive's rendering is internal/db's
+// FormatTimestamp, applied at each write site, and
+// TestDatetimeColumns_WritePathStoresReadableInstants is what catches a site
+// that forgets it — it discovers the DATETIME columns from the schema rather
+// than from a list someone has to remember to extend.
 func connectionDSN(dbPath string) string {
 	return fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(%d)&_pragma=synchronous(NORMAL)&_pragma=recursive_triggers(%d)",
 		dbPath, busyTimeoutMS, recursiveTriggersOn)

@@ -165,18 +165,23 @@ func TestPeriodTermsAreTheTokensTheIndexHolds(t *testing.T) {
 }
 
 // TestPeriodFilterDate pins how a date filter's bound becomes a calendar date.
-// It has to be the date SQLite will compare, which is the date in the bound's
-// own location — the driver binds a time.Time as its Go String() rendering, and
-// turns.timestamp holds the same rendering, so the comparison is on that text.
-// Converting to UTC first would shift the bound by the offset and could drop a
-// whole day of results at the edge of the window.
+// It has to be the date SQLite will compare, which since #90 is the UTC date:
+// turns.timestamp holds db.FormatTimestamp's rendering — RFC3339 in UTC — and
+// buildQuery renders the bound with the same function, so the predicate
+// compares UTC text against UTC text.
+//
+// This used to assert the opposite, and was right to, while both sides were
+// Go's String() rendering and the comparison resolved on the wall-clock digits
+// without ever reaching the offset. Taking the bound's local date now would
+// name a day the predicate does not use, and the index would prune rows the
+// predicate would have kept.
 func TestPeriodFilterDate(t *testing.T) {
 	plus14 := time.FixedZone("plus14", 14*60*60)
 	// 2026-10-05 01:00 +14:00 is 2026-10-04 11:00 UTC: a different date.
 	bound := time.Date(2026, 10, 5, 1, 0, 0, 0, plus14)
 
-	if got := periodFilterDate(bound); got != "2026-10-05" {
-		t.Errorf("periodFilterDate(%s) = %q, want 2026-10-05 — the date in the bound's own zone, which is what the driver binds and SQLite compares",
+	if got := periodFilterDate(bound); got != "2026-10-04" {
+		t.Errorf("periodFilterDate(%s) = %q, want 2026-10-04 — the UTC date, which is the text SQLite compares",
 			bound, got)
 	}
 	if got := periodFilterDate(time.Time{}); got != "" {

@@ -248,10 +248,12 @@ a result count. `before:` stops at the named date without reaching it, so
 `after:2026-01-01 before:2026-01-31` covers the 1st through the 30th and not
 the 31st. To include a day, name the one after it: `before:2026-02-01`.
 
-A written-out date is a UTC calendar day, because that is the zone turns are
-stamped in. The relative forms — `today`, `yesterday`, `week`, `month` — are
-resolved on your own calendar instead, so `after:today` means the day it is
-where you are.
+Every date is read on your own calendar. A written-out date names local
+midnight of that day, and the relative forms — `today`, `yesterday`, `week`,
+`month` — are resolved the same way, so `after:today` and `after:2026-01-15`
+both mean the day it is where you are. Turns are stamped in UTC; the filter
+converts your bound to UTC before comparing, rather than comparing the two
+wall clocks against each other.
 
 Examples:
 ```bash

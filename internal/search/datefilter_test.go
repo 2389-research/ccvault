@@ -297,16 +297,22 @@ func TestSearch_DateFilterReturnsTheSameRowsAtPeriodBoundaries(t *testing.T) {
 		want  []string
 	}{
 		{
-			// The month boundary from below. The September turn is 1 ns short
-			// of October and must not come back; the October turn is 1 ns past
-			// midnight and must.
+			// The month boundary from below, read in the caller's zone.
+			//
+			// boundaryZone is UTC+05:30, so local midnight on 1 October is
+			// 18:30 UTC on 30 September, and turn-sep-last at 23:59:59.999…
+			// UTC is already past it. Before #90 the comparison never reached
+			// the offset and this returned the two October turns at every
+			// offset on earth; the bound now means the day the caller named.
 			query: "boundaryneedle after:2026-10-01",
-			want:  []string{"turn-oct-noon", "turn-oct-first"},
+			want:  []string{"turn-oct-noon", "turn-oct-first", "turn-sep-last"},
 		},
 		{
-			// The same boundary from above.
+			// The same boundary from above, and the same shift: turn-sep-last
+			// is past 18:30 UTC on the 30th, so it is no longer before the
+			// caller's 1 October.
 			query: "boundaryneedle before:2026-10-01",
-			want:  []string{"turn-sep-last", "turn-sep-mid", "turn-aug"},
+			want:  []string{"turn-sep-mid", "turn-aug"},
 		},
 		{
 			// A window whose ends are both inside partial days, spanning the
@@ -315,9 +321,13 @@ func TestSearch_DateFilterReturnsTheSameRowsAtPeriodBoundaries(t *testing.T) {
 			want:  []string{"turn-oct-noon", "turn-oct-first", "turn-sep-last"},
 		},
 		{
-			// A single day.
+			// A single day — the caller's 30 September, which at UTC+05:30
+			// runs from 18:30 UTC on the 29th to 18:30 UTC on the 30th. None
+			// of the fixture's instants fall in it, and that emptiness is the
+			// assertion: a bare date names a twenty-four hour window in the
+			// caller's zone, not the UTC day with the same digits.
 			query: "boundaryneedle after:2026-09-30 before:2026-10-01",
-			want:  []string{"turn-sep-last"},
+			want:  nil,
 		},
 		{
 			// A whole month, which compiles to a single month term. Its last
@@ -339,7 +349,7 @@ func TestSearch_DateFilterReturnsTheSameRowsAtPeriodBoundaries(t *testing.T) {
 			// turn content, which is the branch the period token had to be
 			// added to tool_uses for.
 			query: "payloadneedle after:2026-10-01",
-			want:  []string{"turn-oct-noon", "turn-oct-first"},
+			want:  []string{"turn-oct-noon", "turn-oct-first", "turn-sep-last"},
 		},
 		{
 			query: "payloadneedle after:2026-09-30 before:2026-10-02",
