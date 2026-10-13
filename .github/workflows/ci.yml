@@ -8,17 +8,58 @@ on:
   pull_request:
     branches: [ main ]
 
+# Action majors here and in release.yml are the Node 24 ones. The previous
+# pins all targeted Node 20, which GitHub already force-runs on Node 24, so
+# they were being migrated for us -- the same unprompted-change shape the
+# runner-image pin below exists to stop. What each bump changed beyond the
+# runtime, checked against what this repo uses:
+#
+#   actions/checkout  v4 -> v7  v6.0.0 persists git credentials to a separate
+#                               file; v6.0.2 fixed tag handling so annotated
+#                               tags stay annotated, which goreleaser reads for
+#                               the changelog; v7 blocks checking out a fork PR
+#                               head under `pull_request_target` /
+#                               `workflow_run`, neither of which we trigger on.
+#   actions/setup-go  v5 -> v7  v6 sets GOTOOLCHAIN=local itself, matching what
+#                               the `env:` below already asserts, and prefers
+#                               go.mod's `toolchain` directive over its `go`
+#                               directive -- a no-op here, go.mod declares no
+#                               toolchain line. v7 is ESM plus a cache-library
+#                               bump.
+#
+# The golangci-lint and goreleaser bumps are noted at their own steps.
+
 # GOTOOLCHAIN=local is what makes every go-version below mean what it says.
 # Left unset, the toolchain silently downloads whatever go.mod asks for and
 # runs that instead, so a job labelled with one version can be compiling with
 # another. With it set, a version too old for go.mod fails the job.
+#
+# setup-go v6 and later export GOTOOLCHAIN=local themselves, so this is now
+# belt-and-braces rather than the only thing holding the property. Keep it: it
+# is what the `Verify the toolchain` step asserts, it covers the jobs that
+# never call setup-go, and it keeps the guarantee ours rather than the
+# action's to withdraw.
 env:
   GOTOOLCHAIN: local
 
 jobs:
   test:
     name: Test
-    runs-on: ubuntu-latest
+    # Pinned image, not `ubuntu-latest`. ccvault is a cgo build -- DuckDB and
+    # go-sqlite3 are both cgo packages -- so every job here compiles against
+    # the runner's gcc, glibc and libstdc++, and a runner-image major swaps all
+    # three out from under us with no commit from this repo. GitHub migrates
+    # the `ubuntu-latest` label to Ubuntu 26 starting 2026-10-19
+    # (actions/runner-images#14748). Pinning means that migration lands on a PR
+    # we open, with a CI run to read, instead of arriving unannounced -- and it
+    # keeps CI compiling on the same image the release job uses. `ubuntu-latest`
+    # resolved to ubuntu-24.04 for the v0.3.0 release, so this pin freezes the
+    # image rather than changing it.
+    #
+    # Do not "modernise" this back to `ubuntu-latest`. To move images, bump
+    # every `ubuntu-24.04` in .github/workflows together, on a PR, and read the
+    # resulting CI run before merging.
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         # go.mod declares `go 1.25.5`, so that is the supported floor and the
@@ -28,12 +69,12 @@ jobs:
         go-version: ['1.25.5', 'stable']
     steps:
       - name: Check out code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: ${{ matrix.go-version }}
           cache: true
@@ -74,19 +115,27 @@ jobs:
 
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    # Pinned for the cgo reason documented on the `test` job above; all jobs
+    # in this repo stay on one image so CI and the release agree.
+    runs-on: ubuntu-24.04
     steps:
       - name: Check out code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
 
+      # v9 is the Node 24 major; v7 targeted Node 20 and was already being
+      # force-migrated. Checked against what this step uses: v8 made
+      # `working-directory` resolve to absolute paths (not set here) and
+      # requires golangci-lint >= v2.1.0 (pinned below at v2.11.4); v9 only
+      # adds `install-only` and module-plugin support. `version`, `args` and
+      # `verify` all survive unchanged.
       - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@v7
+        uses: golangci/golangci-lint-action@v9
         with:
           # Must match mise.toml's golangci-lint pin, or a developer and CI
           # lint with different rule sets and disagree in both directions.
@@ -106,16 +155,27 @@ jobs:
 
   release-config:
     name: Release config
-    runs-on: ubuntu-latest
+    # No cgo in this job, but it is pinned with the rest so one image governs
+    # the repo -- see the note on the `test` job above. A workflow where some
+    # jobs float and others do not is the version nobody can reason about.
+    runs-on: ubuntu-24.04
     steps:
       - name: Check out code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # `goreleaser check` catches deprecated and invalid keys in seconds. It
       # belongs on every PR because the alternative is finding out at tag time,
       # when the fix costs a deleted tag and a re-cut release.
+      #
+      # This step also serves a second purpose now: it is the only place the
+      # goreleaser-action v7 install path runs on a PR. v7 is more than a Node
+      # 24 bump -- since v7.1.0 the action downloads checksums.txt and verifies
+      # the SHA-256 of the archive it just fetched, and verifies the sigstore
+      # bundle too when cosign is on PATH. That is a new way for the release to
+      # fail, so it is worth exercising here, against the same v2.18.2 pin, on
+      # every PR rather than first on a tag.
       - name: Install GoReleaser
-        uses: goreleaser/goreleaser-action@v6
+        uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
           # Must match the pin in release.yml, so this job validates the config
@@ -167,13 +227,15 @@ jobs:
 
   build:
     name: Build
-    runs-on: ubuntu-latest
+    # Pinned for the cgo reason documented on the `test` job above; all jobs
+    # in this repo stay on one image so CI and the release agree.
+    runs-on: ubuntu-24.04
     steps:
       - name: Check out code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true

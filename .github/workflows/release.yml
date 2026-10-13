@@ -11,6 +11,11 @@ permissions:
   contents: write
   packages: write
 
+# checkout and setup-go are on their Node 24 majors, matching ci.yml. What
+# those bumps changed beyond the runtime is written out once, at the top of
+# ci.yml; bump the two files together so a tag never runs an action major that
+# no PR has exercised.
+
 # GOTOOLCHAIN=local, for the same reason CI sets it: setup-go below installs
 # the version go.mod names, and left unset the toolchain would quietly
 # download and use a different one if that install ever came up short. A
@@ -25,20 +30,30 @@ jobs:
     runs-on: macos-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           # Release with the toolchain go.mod declares, not a hardcoded
           # version that the auto-download then replaces.
           go-version-file: go.mod
           cache: true
 
+      # goreleaser-action v7 is the Node 24 major, and it carries one change
+      # beyond the runtime: from v7.1.0 the action verifies what it downloads.
+      # It fetches checksums.txt for the pinned release, hard-fails on a
+      # SHA-256 mismatch or a missing entry, and additionally verifies
+      # checksums.txt.sigstore.json with cosign when cosign is on PATH --
+      # degrading to a warning when an artifact or the tool is absent. The
+      # v2.18.2 release publishes both checksums.txt and the sigstore bundle,
+      # and CI's `Release config` job runs this same install path, against this
+      # same pin, on every PR. So the verification is proven green before any
+      # tag reaches this job.
       - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v6
+        uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
           # Explicit version, never `latest`. With `latest` the release used
@@ -55,16 +70,27 @@ jobs:
 
   release-linux:
     name: Release (Linux)
-    runs-on: ubuntu-latest
+    # Pinned image, not `ubuntu-latest`. The build step below is
+    # CGO_ENABLED=1, so the released binary is compiled by this runner's gcc
+    # and linked against its glibc -- the runner-image major therefore decides
+    # which Linux systems the artifact we publish will actually run on. GitHub
+    # migrates the `ubuntu-latest` label to Ubuntu 26 starting 2026-10-19
+    # (actions/runner-images#14748), and this job only ever runs on a tag, so
+    # with a floating label that migration would first be observed after the
+    # tag is pushed -- the most expensive place to find it. ubuntu-24.04 is
+    # what `ubuntu-latest` resolved to for the v0.3.0 release, so this pin
+    # freezes the image rather than changing it. Keep it in step with the pins
+    # in ci.yml, and move both on a PR.
+    runs-on: ubuntu-24.04
     needs: release-darwin
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           # Release with the toolchain go.mod declares, not a hardcoded
           # version that the auto-download then replaces.
