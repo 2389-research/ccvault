@@ -255,12 +255,23 @@ func TestMigrator_BootstrapPartial(t *testing.T) {
 	// turns.parent_id, input_tokens and output_tokens, and the sessions
 	// counters, were missing until migration 012, which rebuilds turns column
 	// by column and reads sessions.turn_count to decide which transcripts need
-	// re-parsing.
+	// re-parsing. The projects date columns and the source_files table were
+	// missing until migration 014, which converts every DATETIME column in the
+	// schema and so reads all of them.
 	stmts := []string{
 		`CREATE TABLE projects (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			path TEXT UNIQUE NOT NULL,
-			display_name TEXT NOT NULL
+			display_name TEXT NOT NULL,
+			first_seen_at DATETIME,
+			last_activity_at DATETIME,
+			session_count INTEGER DEFAULT 0,
+			total_tokens INTEGER DEFAULT 0
+		)`,
+		`CREATE TABLE source_files (
+			path TEXT PRIMARY KEY,
+			mtime DATETIME NOT NULL,
+			synced_at DATETIME NOT NULL
 		)`,
 		`CREATE TABLE sessions (
 			id TEXT PRIMARY KEY,

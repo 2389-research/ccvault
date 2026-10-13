@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/2389-research/ccvault/internal/db"
 	"github.com/2389-research/ccvault/pkg/models"
 )
 
@@ -318,15 +319,32 @@ func (s *Searcher) buildQuery(q *Query, limit int, periods []string) (string, []
 		argNum++
 	}
 
-	// Date filters
+	// Date filters.
+	//
+	// The bound goes in as text, rendered by the same function that rendered
+	// every value in the column, and that is the whole of issue #90.
+	//
+	// What it used to do was bind the time.Time and let the driver render it,
+	// which produced Go's String() form — "2026-10-01 00:00:00 +0530 IST" —
+	// against a column holding the same form. Both sides agreed on shape, so
+	// the comparison was self-consistent and sorted correctly; it just
+	// compared the wall-clock digits and stopped before ever reaching the
+	// offset. Local midnight renders its digits as "2026-10-01 00:00:00" in
+	// every zone on earth, so `after:2026-10-01` admitted exactly the same
+	// rows at UTC-12 as at UTC+14 and time.ParseInLocation on a bare date was
+	// a no-op at the predicate.
+	//
+	// db.FormatTimestamp converts to UTC before rendering, so both sides of
+	// the comparison are the same instant expressed the same way and the
+	// offset is applied rather than ignored.
 	if !q.Before.IsZero() {
 		conditions = append(conditions, fmt.Sprintf("t.timestamp < $%d", argNum))
-		args = append(args, q.Before)
+		args = append(args, db.FormatTimestamp(q.Before))
 		argNum++
 	}
 	if !q.After.IsZero() {
 		conditions = append(conditions, fmt.Sprintf("t.timestamp > $%d", argNum))
-		args = append(args, q.After)
+		args = append(args, db.FormatTimestamp(q.After))
 		argNum++
 	}
 

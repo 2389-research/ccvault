@@ -895,9 +895,10 @@ Both date bounds land on midnight starting the day they name, so
 "after:2026-01-01 before:2026-01-31" covers the 1st through the 30th. Name
 the day after to include the last one: "before:2026-02-01".
 
-A written-out date (2026-01-15, 2026/01/15, "Jan 15, 2026") is a UTC calendar
-day, matching how turns are stamped. today, yesterday, week and month are
-resolved on this machine's own calendar instead.`,
+Every date is read on this machine's own calendar. A written-out date
+(2026-01-15, 2026/01/15, "Jan 15, 2026") names midnight local to you, and
+today, yesterday, week and month are resolved the same way, so a day means the
+day it is where you are rather than where the turn was stamped.`,
 	Args: cobra.MinimumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		queryStr := strings.Join(args, " ")

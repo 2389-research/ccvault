@@ -55,17 +55,22 @@ const (
 // periodFilterDate renders a date filter's bound as the calendar date SQLite
 // will compare it against, or "" for an unset filter.
 //
-// In the bound's own location, deliberately. The driver binds a time.Time as
-// its Go String() rendering and turns.timestamp holds the same rendering, so
-// the filter is a lexicographic comparison of that text; `date(bound.UTC())`
-// would name a different day than the one the comparison uses whenever the
-// bound carries an offset, and a date-filtered search would lose the rows in
-// between.
+// In UTC, because that is the day the comparison uses. turns.timestamp holds
+// db.FormatTimestamp's rendering — RFC3339 in UTC — and buildQuery renders the
+// bound with the same function, so the predicate compares UTC text against UTC
+// text and the token sliced out of that text has to name the same UTC day. It
+// used to be the bound's own local day, which was right while both sides were
+// Go's String() rendering and the offset was never reached (#90); taking the
+// local day now would name a different day than the predicate for any caller
+// outside UTC, and the index would prune rows the predicate would have kept.
+//
+// The terms this feeds may over-admit — the outer WHERE trims them — but must
+// never under-admit, which is what that would be.
 func periodFilterDate(bound time.Time) string {
 	if bound.IsZero() {
 		return ""
 	}
-	return bound.Format(periodDateLayout)
+	return bound.UTC().Format(periodDateLayout)
 }
 
 // periodTerms compiles an inclusive range of calendar dates into the period

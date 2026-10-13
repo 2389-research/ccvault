@@ -73,7 +73,7 @@ func (db *DB) InsertTurnsTx(tx *sql.Tx, turns []models.Turn) error {
 			t.SessionID,
 			t.ParentID,
 			t.Type,
-			t.Timestamp,
+			FormatTimestamp(t.Timestamp),
 			t.Ordinal,
 			t.Content,
 			t.RawJSON,
@@ -492,7 +492,7 @@ func (db *DB) InsertToolUsesTx(tx *sql.Tx, toolUses []models.ToolUse) error {
 		if _, err := del.Exec(tu.TurnID, tu.SessionID, ordinal); err != nil {
 			return fmt.Errorf("delete tool_use conflicting with call %d of turn %s: %w", ordinal, tu.TurnID, err)
 		}
-		_, err := stmt.Exec(tu.TurnID, tu.SessionID, tu.ToolName, tu.FilePath, tu.Timestamp,
+		_, err := stmt.Exec(tu.TurnID, tu.SessionID, tu.ToolName, tu.FilePath, FormatTimestamp(tu.Timestamp),
 			nullIfEmpty(tu.ToolUseID), nullIfEmpty(tu.InputJSON), nullIfZero(tu.InputLength),
 			nullIfEmpty(tu.ResultContent), resultLengthValue(tu), nullIfEmpty(tu.ResultOmittedReason),
 			isErrorValue(tu), ordinal)

@@ -40,8 +40,8 @@ func (db *DB) UpsertProject(p *models.Project) error {
 	err := db.QueryRow(query,
 		p.Path,
 		p.DisplayName,
-		p.FirstSeenAt,
-		p.LastActivityAt,
+		FormatTimestamp(p.FirstSeenAt),
+		FormatTimestamp(p.LastActivityAt),
 		p.SessionCount,
 		p.TotalTokens,
 		source,
@@ -78,8 +78,8 @@ func (db *DB) UpsertProjectTx(tx *sql.Tx, p *models.Project) error {
 	err := tx.QueryRow(query,
 		p.Path,
 		p.DisplayName,
-		p.FirstSeenAt,
-		p.LastActivityAt,
+		FormatTimestamp(p.FirstSeenAt),
+		FormatTimestamp(p.LastActivityAt),
 		p.SessionCount,
 		p.TotalTokens,
 		source,
@@ -277,38 +277,16 @@ func (db *DB) GetFirstAndLastActivity() (first, last time.Time, err error) {
 	if err != nil {
 		return time.Time{}, time.Time{}, fmt.Errorf("get activity range: %w", err)
 	}
+	// MIN()/MAX() produce a result column with no declared type, so the driver
+	// hands the text through rather than parsing it the way it parses the
+	// DATETIME column underneath. An unparseable value reads as the zero time,
+	// which is what this has always done and what `ccvault stats` renders as
+	// "no activity" rather than failing on.
 	if firstStr.Valid {
-		first = parseTimeString(firstStr.String)
+		first, _ = ParseTimestamp(firstStr.String)
 	}
 	if lastStr.Valid {
-		last = parseTimeString(lastStr.String)
+		last, _ = ParseTimestamp(lastStr.String)
 	}
 	return first, last, nil
-}
-
-// parseTimeString tries multiple formats to parse a time string from SQLite
-func parseTimeString(s string) time.Time {
-	// Handle Go's time.Time String() format from SQLite aggregates
-	// e.g., "2026-02-13 17:50:43.387338 -0600 CST m=+0.003560667"
-	if idx := strings.Index(s, " m="); idx > 0 {
-		s = s[:idx]
-	}
-
-	formats := []string{
-		time.RFC3339Nano,
-		time.RFC3339,
-		"2006-01-02T15:04:05.999999999Z07:00",
-		"2006-01-02T15:04:05.999999-07:00",
-		"2006-01-02 15:04:05.999999999-07:00",
-		"2006-01-02 15:04:05.999999 -0700 MST",
-		"2006-01-02 15:04:05.999999999Z",
-		"2006-01-02 15:04:05.999999999",
-		"2006-01-02 15:04:05",
-	}
-	for _, format := range formats {
-		if t, err := time.Parse(format, s); err == nil {
-			return t
-		}
-	}
-	return time.Time{}
 }
