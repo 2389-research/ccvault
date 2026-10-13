@@ -4,6 +4,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"sort"
@@ -14,39 +15,23 @@ import (
 	"github.com/2389-research/ccvault/pkg/models"
 )
 
-// datetimeColumns names every column the schema declares DATETIME, read out of
-// the schema rather than listed here.
+// datetimeColumns names every column the schema declares DATETIME, grouped by
+// table.
 //
-// Discovered rather than hardcoded for the reason listFTSTables is: a DATETIME
-// column added by a later migration is covered by everything that covers
-// DATETIME columns, instead of by whichever call sites someone remembered.
+// It asks listDatetimeColumns rather than re-querying the schema, so these
+// tests and CheckTimestampLayout cover exactly the same set of columns. Two
+// discoveries that could drift is the shape of bug #143 is about, one level up.
 func datetimeColumns(t *testing.T, database *DB) map[string][]string {
 	t.Helper()
 
-	var tables []string
-	eachRow(t, database,
-		`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name`,
-		func(rows *sql.Rows) {
-			var name string
-			if err := rows.Scan(&name); err != nil {
-				t.Fatalf("scan table name: %v", err)
-			}
-			tables = append(tables, name)
-		})
+	cols, err := listDatetimeColumns(context.Background(), database.DB)
+	if err != nil {
+		t.Fatalf("list DATETIME columns: %v", err)
+	}
 
 	found := make(map[string][]string)
-	for _, table := range tables {
-		eachRow(t, database, "PRAGMA table_info("+quoteSQLiteIdent(table)+")", func(rows *sql.Rows) {
-			var cid, notNull, pk int
-			var name, colType string
-			var dflt sql.NullString
-			if err := rows.Scan(&cid, &name, &colType, &notNull, &dflt, &pk); err != nil {
-				t.Fatalf("scan table_info for %s: %v", table, err)
-			}
-			if strings.EqualFold(colType, "DATETIME") {
-				found[table] = append(found[table], name)
-			}
-		})
+	for _, col := range cols {
+		found[col.Table] = append(found[col.Table], col.Column)
 	}
 	return found
 }
@@ -211,12 +196,6 @@ func TestDatetimeColumns_WritePathStoresReadableInstants(t *testing.T) {
 		}
 	}
 }
-
-// canonicalTimestampGlob matches the canonical layout and nothing shorter or
-// longer. Kept beside the test rather than exported, because production code
-// should be producing the layout, not pattern-matching it.
-const canonicalTimestampGlob = "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T" +
-	"[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]Z"
 
 // legacyRendering is what every DATETIME column held before migration 014:
 // Go's time.Time.String(), which SQLite's date functions cannot parse.

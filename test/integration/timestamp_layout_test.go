@@ -4,6 +4,7 @@
 package integration
 
 import (
+	"database/sql"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -11,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	_ "modernc.org/sqlite"
 )
 
 // timestampLayoutAllowlist lists the files allowed to spell a timestamp
@@ -170,4 +173,138 @@ func hasPrefixIn(rel string, prefixes []string) bool {
 		}
 	}
 	return false
+}
+
+// TestCLI_StatsStrictReportsNonCanonicalTimestamps is #144 through the real
+// binary.
+//
+// Migration 014 leaves a value it does not recognise exactly as it found it —
+// the right call for a migration, and the reason a readable-but-non-canonical
+// row can sit in the archive forever with nothing noticing. Everything built
+// on the layout assumes it away: ORDER BY, MIN()/MAX() and the date predicate
+// compare this text, and search_period slices the calendar date out of it by
+// character position.
+//
+// So --strict reports it. It does not refuse it: the value is readable, an
+// import could legitimately carry it, and the archive has repeatedly been
+// better served by the user seeing a problem than by a guard that blocks a
+// legitimate operation.
+func TestCLI_StatsStrictReportsNonCanonicalTimestamps(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds the binary")
+	}
+	f := newCLIFixture(t)
+	f.Run(t, "sync")
+
+	// A freshly synced archive is canonical, and the report says what it
+	// covered rather than only that it found nothing.
+	clean := f.Run(t, "stats", "--strict")
+	for _, want := range []string{"Timestamp layout:", "turns.timestamp"} {
+		if !strings.Contains(clean.Stdout, want) {
+			t.Errorf("stats --strict does not mention %q on a clean archive:\n%s", want, clean.Stdout)
+		}
+	}
+
+	const odd = "2026-01-01 00:00:01"
+	setTurnTimestamp(t, f.DataDir, odd)
+
+	// The existing checks have nothing to say about it: SQLite reads it, so
+	// the #33 guard passes, and the index is sound, so --strict's FTS verdict
+	// passes. That is what makes it worth reporting separately.
+	bad := f.TryRun(t, "stats", "--strict")
+	if bad.Err != nil {
+		t.Fatalf("stats --strict failed over a readable non-canonical value; "+
+			"#144 chose reporting over enforcement:\nstdout:\n%s\nstderr:\n%s", bad.Stdout, bad.Stderr)
+	}
+	for _, want := range []string{"turns.timestamp", odd} {
+		if !strings.Contains(bad.Stdout, want) {
+			t.Errorf("stats --strict does not surface %q:\n%s", want, bad.Stdout)
+		}
+	}
+
+	// --json has to carry the same finding, or an agent reading the report is
+	// told nothing.
+	var report struct {
+		TimestampLayout struct {
+			OK        bool  `json:"ok"`
+			OffLayout int64 `json:"off_layout"`
+			Columns   []struct {
+				Table     string `json:"table"`
+				Column    string `json:"column"`
+				Rows      int64  `json:"rows"`
+				OffLayout int64  `json:"off_layout"`
+				Sample    string `json:"sample,omitempty"`
+			} `json:"columns"`
+		} `json:"timestamp_layout"`
+	}
+	f.Run(t, "stats", "--strict", "--json").JSON(t, &report)
+	if report.TimestampLayout.OK {
+		t.Errorf("stats --strict --json reports ok over a non-canonical row: %+v", report.TimestampLayout)
+	}
+	if report.TimestampLayout.OffLayout != 1 {
+		t.Errorf("off_layout = %d, want 1", report.TimestampLayout.OffLayout)
+	}
+
+	// Every DATETIME column, not just turns.timestamp.
+	covered := map[string]bool{}
+	var found bool
+	for _, c := range report.TimestampLayout.Columns {
+		covered[c.Table+"."+c.Column] = true
+		if c.Table == "turns" && c.Column == "timestamp" {
+			found = true
+			if c.Sample != odd {
+				t.Errorf("turns.timestamp sample = %q, want %q", c.Sample, odd)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("the JSON report does not name turns.timestamp: %+v", report.TimestampLayout.Columns)
+	}
+	for _, want := range []string{
+		"sessions.started_at", "sessions.source_mtime", "tool_uses.timestamp",
+		"source_files.mtime", "projects.first_seen_at",
+	} {
+		if !covered[want] {
+			t.Errorf("the JSON report does not cover %s; #144 is about every DATETIME column", want)
+		}
+	}
+
+	// And the default report stays cheap: this is a full scan of turns and
+	// tool_uses, so it is opt-in like the strict FTS check it sits beside.
+	if plain := f.Run(t, "stats"); strings.Contains(plain.Stdout, "Timestamp layout:") {
+		t.Errorf("the default report runs the layout scan; it should be --strict only:\n%s", plain.Stdout)
+	}
+}
+
+// setTurnTimestamp writes a raw value straight into turns.timestamp, the way
+// an import or a hand repair would, bypassing db.FormatTimestamp. The update
+// triggers still fire, so the FTS index stays consistent with the column —
+// which is the point: nothing is broken, the value is just not canonical.
+func setTurnTimestamp(t *testing.T, dataDir, value string) {
+	t.Helper()
+
+	pool, err := sql.Open("sqlite", "file:"+filepath.Join(dataDir, "ccvault.db"))
+	if err != nil {
+		t.Fatalf("open archive: %v", err)
+	}
+	defer func() { _ = pool.Close() }()
+
+	res, err := pool.Exec(
+		"UPDATE turns SET timestamp = ? WHERE rowid = (SELECT MIN(rowid) FROM turns)", value)
+	if err != nil {
+		t.Fatalf("seed a non-canonical turns.timestamp: %v", err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		t.Fatalf("seeded %d rows, want 1", n)
+	}
+
+	// It has to be readable, or it proves something weaker than #144 claims.
+	var readable any
+	if err := pool.QueryRow(
+		"SELECT date(timestamp) FROM turns WHERE timestamp = ?", value).Scan(&readable); err != nil {
+		t.Fatalf("date() on the seeded value: %v", err)
+	}
+	if readable == nil {
+		t.Fatalf("%q is unreadable, so it is not a readable-but-non-canonical row", value)
+	}
 }

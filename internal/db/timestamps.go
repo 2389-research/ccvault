@@ -49,6 +49,22 @@ import (
 // storage change that both million-document indexes do not notice.
 const timestampLayout = "2006-01-02T15:04:05.000000000Z"
 
+// canonicalTimestampGlob matches timestampLayout's rendering and nothing
+// shorter, longer or differently spelled — a SQLite GLOB, so the comparison
+// happens against the bytes on disk rather than against whatever the driver
+// re-renders on the way out.
+//
+// A second description of timestampLayout, which is a thing that can disagree
+// with the first; TestCanonicalTimestampGlob_AgreesWithTheLayout is what stops
+// it. It lives here rather than beside its caller so there is one of it.
+//
+// Nothing in the write path consults this. Production code should be
+// *producing* the layout, not pattern-matching it — the one legitimate reader
+// is CheckTimestampLayout, which exists to report the rows that got into the
+// archive some other way (#144).
+const canonicalTimestampGlob = "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T" +
+	"[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]Z"
+
 // FormatTimestamp renders an instant the way every DATETIME column stores it.
 //
 // .UTC() both normalises the zone and drops the monotonic clock reading that
