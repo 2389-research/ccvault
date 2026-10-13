@@ -32,7 +32,10 @@ func writeManyTestSessions(t *testing.T, dir string, count int) {
 		msg := map[string]any{
 			"uuid":      sessionID + "-turn-1",
 			"sessionId": sessionID,
-			"type":      "human",
+			// "user", not "human": the claude-code adapter parses the latter
+			// to empty content, so these sessions would be indexed as
+			// contentless rows (#107).
+			"type":      "user",
 			"timestamp": now.Format(time.RFC3339Nano),
 			"cwd":       "/Users/test/cancel",
 			"message": map[string]any{
