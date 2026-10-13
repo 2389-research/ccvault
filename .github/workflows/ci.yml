@@ -276,8 +276,15 @@ jobs:
       - name: Verify binary
         run: ./ccvault --help
 
+      # v7 is the Node 24 major; v4 targeted Node 20. Checked against the three
+      # inputs this step sets, all of which survive unchanged: v5 was a
+      # preliminary Node 24 build that still defaulted to Node 20; v6 made Node
+      # 24 the default and raised the minimum Actions runner to 2.327.1, which
+      # only matters for self-hosted runners and this repo has none; v7 moved
+      # the action to ESM and added an optional `archive` input that defaults
+      # to true, i.e. the v4 behaviour of zipping the upload.
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ccvault-linux-amd64
           path: ccvault
