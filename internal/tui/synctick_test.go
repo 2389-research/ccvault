@@ -58,7 +58,7 @@ func TestSyncTickSurvivesPushingTheSearchView(t *testing.T) {
 	startSyncAndStall(t, m)
 
 	// Baseline: on the syncing view, a tick schedules the next one.
-	if _, cmd := m.Update(syncTickMsg{}); cmd == nil {
+	if _, cmd := m.Update(m.syncing.tickMsg()); cmd == nil {
 		t.Fatal("setup: the tick chain was already dead on the syncing view")
 	}
 
@@ -67,7 +67,7 @@ func TestSyncTickSurvivesPushingTheSearchView(t *testing.T) {
 		t.Fatalf("expected / to push SearchView, got %v", m.view)
 	}
 
-	if _, cmd := m.Update(syncTickMsg{}); cmd == nil {
+	if _, cmd := m.Update(m.syncing.tickMsg()); cmd == nil {
 		t.Fatal("the search view swallowed syncTickMsg: the sync's tick chain is dead and its goroutine will block on a full channel forever (#99)")
 	}
 
@@ -80,7 +80,7 @@ func TestSyncTickSurvivesPushingTheSearchView(t *testing.T) {
 	if m.view != SyncingView {
 		t.Fatalf("esc should come back to SyncingView, got %v", m.view)
 	}
-	if _, cmd := m.Update(syncTickMsg{}); cmd == nil {
+	if _, cmd := m.Update(m.syncing.tickMsg()); cmd == nil {
 		t.Error("the tick chain did not survive the round trip through the search view")
 	}
 }

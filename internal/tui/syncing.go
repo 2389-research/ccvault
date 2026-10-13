@@ -23,6 +23,12 @@ type syncCountProgress struct {
 	total   int
 }
 
+// syncGenerations hands out the identity each SyncingModel stamps on its
+// ticks. Package-level and atomic because a generation has to be unique
+// across every model the process ever builds, not just the two that happen
+// to overlap.
+var syncGenerations atomic.Uint64
+
 // SyncingModel holds syncing view state
 type SyncingModel struct {
 	db        *db.DB
@@ -35,6 +41,13 @@ type SyncingModel struct {
 	bar       progress.Model
 	current   int
 	total     int
+
+	// generation identifies this model's tick chain. A tick scheduled by a
+	// model that has since been replaced is still in flight when its
+	// replacement takes over, and without an identity on the message the
+	// replacement cannot tell that tick from its own — it re-arms for both
+	// and ends up running two chains (#112).
+	generation uint64
 
 	// Channels for communicating with the sync goroutine
 	progressCh chan string
@@ -64,6 +77,7 @@ func NewSyncingModel(database *db.DB, sources []config.SourceConfig) *SyncingMod
 	return &SyncingModel{
 		db:         database,
 		sources:    sources,
+		generation: syncGenerations.Add(1),
 		progress:   []string{},
 		startTime:  time.Now(),
 		bar:        bar,
@@ -82,8 +96,15 @@ type syncCompleteMsg struct {
 	err   error
 }
 
-// syncTickMsg triggers a UI refresh to show elapsed time and new progress
-type syncTickMsg struct{}
+// syncTickMsg triggers a UI refresh to show elapsed time and new progress.
+//
+// generation names the SyncingModel that scheduled it. It is on the message
+// because the message outlives the model: a tick is handed to Bubble Tea 200ms
+// before it arrives, and the model that asked for it may have been replaced in
+// the meantime.
+type syncTickMsg struct {
+	generation uint64
+}
 
 // Init starts the sync operation
 func (m *SyncingModel) Init() tea.Cmd {
@@ -149,10 +170,18 @@ func (m *SyncingModel) WaitForExit(timeout time.Duration) bool {
 	}
 }
 
+// tickMsg is the tick this model would schedule, stamped with its identity.
+// Separate from tick so a test can hold the message a model has in flight
+// without waiting out the delay that would deliver it.
+func (m *SyncingModel) tickMsg() syncTickMsg {
+	return syncTickMsg{generation: m.generation}
+}
+
 // tick returns a command that fires a syncTickMsg after a short delay
 func (m *SyncingModel) tick() tea.Cmd {
+	msg := m.tickMsg()
 	return tea.Tick(200*time.Millisecond, func(t time.Time) tea.Msg {
-		return syncTickMsg{}
+		return msg
 	})
 }
 
@@ -160,6 +189,16 @@ func (m *SyncingModel) tick() tea.Cmd {
 func (m *SyncingModel) Update(msg tea.Msg) tea.Cmd {
 	switch msg := msg.(type) {
 	case syncTickMsg:
+		// A tick from a model that has since been replaced is not this
+		// model's to answer. Re-arming for it would leave two chains running
+		// over the same channels, each re-arming itself every 200ms, and
+		// another pair for every further push of the syncing view (#112).
+		// Dropping it ends the retired chain, which is what should happen to
+		// a chain whose model is gone.
+		if msg.generation != m.generation {
+			return nil
+		}
+
 		// Drain any pending progress messages
 		for {
 			select {
