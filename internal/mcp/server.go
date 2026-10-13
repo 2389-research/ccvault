@@ -5,7 +5,6 @@ package mcp
 
 import (
 	"bufio"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -972,8 +971,9 @@ type turnEnrichment struct {
 // readTurnEnrichment reads what it can out of an assistant turn's raw_json.
 //
 // Tools recovered here are a fallback, not the source of truth: calls are
-// stored in tool_uses by every adapter, and toolNamesByTurn reads them from
-// there. The fallback exists for a turn that holds tool_use blocks and has
+// stored in tool_uses by every adapter, and the db package's tool-name
+// readers return them from there. The fallback exists for a turn that holds
+// tool_use blocks and has
 // no stored rows — measured as zero turns across the author's 47k-session
 // archive, so it is insurance against an archive written by an older
 // ccvault rather than a path anything takes today.
@@ -1020,120 +1020,6 @@ func readTurnEnrichment(rawJSON []byte) turnEnrichment {
 	return e
 }
 
-// toolNamesByTurn groups a session's recorded tool calls by the turn that
-// issued them, in the order they were issued.
-//
-// This is where the MCP layer learns what a turn called. Reading raw_json
-// for it only ever worked for claude-code and nanoclaw, whose entries carry
-// a top-level `message` object; codex and jeff record a turn's calls on
-// their own transcript lines, so a codex turn's calls are not in that
-// turn's raw_json at all and no amount of re-parsing recovers them (#100).
-// The adapters already extract every source's calls into tool_uses — the
-// column existed, this layer just was not reading it.
-//
-// Measured over the author's 47k-session archive: of the 287,557 assistant
-// turns whose raw_json the old parse could read, not one names a tool the
-// stored rows do not, and 501 of them name fewer. The column dominates
-// wherever both have an answer.
-//
-// Duplicates are kept, as failedToolsByTurn keeps them: a turn that made
-// three Bash calls says Bash three times, because the count is the fact.
-func toolNamesByTurn(database *db.DB, sessionID string) (map[string][]string, error) {
-	rows, err := database.Query(`
-		SELECT turn_id, tool_name
-		FROM tool_uses
-		WHERE session_id = ? AND turn_id IS NOT NULL
-		ORDER BY turn_id, turn_ordinal`, sessionID)
-	if err != nil {
-		return nil, fmt.Errorf("query tool calls for session %s: %w", sessionID, err)
-	}
-	return scanToolNamesByTurn(rows)
-}
-
-// toolNamesForTurns is toolNamesByTurn scoped to named turns, for a caller
-// rendering a page rather than summarising a session (#141).
-//
-// Naming the turns changes which index answers the query, and that is where
-// the cost goes. Session-wide, SQLite seeks idx_tool_uses_session and then
-// sorts every row it found in a temp B-tree, because that index does not
-// carry the ORDER BY. Per turn it seeks idx_tool_uses_turn_ordinal — which
-// leads on turn_id and already holds the rows in the order asked for — once
-// per turn, and sorts nothing.
-//
-// Measured by BenchmarkToolNameReadForOnePage on a session of 7,034 turns,
-// for one 50-turn page, session-wide -> page-bounded:
-//
-//	1,871 calls     1,871 rows, 1.3ms  ->   50 rows, 0.07ms
-//	133,039 calls  133,039 rows, 205ms ->  950 rows, 0.81ms
-//
-// The first is the largest real session in the author's archive; the second
-// is the scale #141 quoted. Either way the point is the shape: a per-page
-// cost proportional to the session is what undoes paging a long one (#79).
-func toolNamesForTurns(database *db.DB, sessionID string, turnIDs []string) (map[string][]string, error) {
-	if len(turnIDs) == 0 {
-		// `turn_id IN ()` is not valid SQL, and there is nothing to ask about.
-		return map[string][]string{}, nil
-	}
-
-	byTurn := make(map[string][]string, len(turnIDs))
-
-	// Chunked so a caller asking about more turns than get_turns' 50-row page
-	// can't exceed SQLite's bound-parameter ceiling.
-	const chunk = 500
-	for start := 0; start < len(turnIDs); start += chunk {
-		batch := turnIDs[start:min(start+chunk, len(turnIDs))]
-
-		placeholders := make([]string, len(batch))
-		args := make([]interface{}, 0, len(batch)+1)
-		args = append(args, sessionID)
-		for i, id := range batch {
-			placeholders[i] = "?"
-			args = append(args, id)
-		}
-
-		rows, err := database.Query(`
-			SELECT turn_id, tool_name
-			FROM tool_uses
-			WHERE session_id = ? AND turn_id IN (`+strings.Join(placeholders, ", ")+`)
-			ORDER BY turn_id, turn_ordinal`, args...)
-		if err != nil {
-			return nil, fmt.Errorf("query tool calls for %d turns of session %s: %w", len(turnIDs), sessionID, err)
-		}
-		part, err := scanToolNamesByTurn(rows)
-		if err != nil {
-			return nil, err
-		}
-		for turnID, names := range part {
-			byTurn[turnID] = append(byTurn[turnID], names...)
-		}
-	}
-
-	return byTurn, nil
-}
-
-// scanToolNamesByTurn groups the rows of a (turn_id, tool_name) query, which
-// both readers above produce in the order the calls were issued.
-func scanToolNamesByTurn(rows *sql.Rows) (map[string][]string, error) {
-	defer func() { _ = rows.Close() }()
-
-	byTurn := make(map[string][]string)
-	for rows.Next() {
-		var turnID, toolName string
-		if err := rows.Scan(&turnID, &toolName); err != nil {
-			return nil, fmt.Errorf("scan tool call: %w", err)
-		}
-		if toolName == "" {
-			continue
-		}
-		byTurn[turnID] = append(byTurn[turnID], toolName)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("read tool calls: %w", err)
-	}
-
-	return byTurn, nil
-}
-
 // turnTools is what a turn called: the stored rows, falling back to
 // whatever its raw_json names when it has none. The fallback can never
 // double-count, because it only runs for a turn with no stored calls.
@@ -1177,8 +1063,9 @@ func topCountsByName(counts map[string]int) []map[string]interface{} {
 // failedToolsByTurn groups a session's failed calls by the turn that issued
 // them, so a response can label each turn with what broke in it.
 //
-// Reads the stored is_error column through db.GetFailedToolCalls rather than
-// re-deriving the flag from raw_json, and that is the whole point of the
+// Reads the stored is_error column through the db package's failed-call
+// readers rather than re-deriving the flag from raw_json, and that is the
+// whole point of the
 // column. readTurnEnrichment above fails on 216,978 of the author's turns
 // (#101) and reports nothing on any source whose raw shape has no top-level
 // message key (#100); a failure flag recovered by the backfill or written by
@@ -1225,7 +1112,7 @@ func (s *Server) getSessionSummary(args map[string]interface{}) (interface{}, er
 	// What each turn called, read once for the session from the stored
 	// rows. Every adapter writes them, which is what makes tools_used
 	// correct for codex, hex and jeff rather than silently empty (#100).
-	storedTools, err := toolNamesByTurn(s.db, sessionID)
+	storedTools, err := s.db.SessionToolNamesByTurn(sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get tool calls: %w", err)
 	}
@@ -1450,29 +1337,34 @@ func (s *Server) getTurns(args map[string]interface{}) (interface{}, error) {
 		turns = turns[:limit]
 	}
 
-	// Which calls failed, read once for the session rather than per turn.
-	// One indexed query against idx_tool_uses_is_error costs less than fifty
-	// lookups, and a page shows at most fifty turns.
-	failures, err := s.db.GetFailedToolCalls(sessionID)
+	// The two tool_uses reads this page needs, both scoped to the turns it is
+	// about to render and no others. Scoped rather than session-wide because
+	// the session is the wrong unit for a page: either read used to cost what
+	// the whole session's rows cost, however few turns it was labelling (#141
+	// for the names, #157 for the failures).
+	//
+	// Failures are asked about every turn on the page and tool names only
+	// about the assistant ones. tools labels assistant turns alone, so asking
+	// about a user turn would be asking a question whose answer is never
+	// rendered — while failed_tools is set on whatever turn owns the failing
+	// call, and narrowing that to assistant turns would turn a stored row
+	// hanging off some other turn type into a label that silently vanished.
+	pageTurnIDs := make([]string, 0, len(turns))
+	assistantTurnIDs := make([]string, 0, len(turns))
+	for _, t := range turns {
+		pageTurnIDs = append(pageTurnIDs, t.ID)
+		if t.Type == "assistant" {
+			assistantTurnIDs = append(assistantTurnIDs, t.ID)
+		}
+	}
+
+	failures, err := s.db.GetFailedToolCallsForTurns(sessionID, pageTurnIDs)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get failed tool calls: %w", err)
 	}
 	failedTools := failedToolsByTurn(failures)
 
-	// What each turn called, read for the turns this page is about to render
-	// and no others. Only assistant turns are labelled, so only those are
-	// asked about — and a page of nothing but user turns asks nothing.
-	//
-	// Scoped rather than session-wide because the session is the wrong unit
-	// for a page: the read used to cost what the whole session's tool calls
-	// cost, however few rows it was labelling (#141).
-	pageTurnIDs := make([]string, 0, len(turns))
-	for _, t := range turns {
-		if t.Type == "assistant" {
-			pageTurnIDs = append(pageTurnIDs, t.ID)
-		}
-	}
-	storedTools, err := toolNamesForTurns(s.db, sessionID, pageTurnIDs)
+	storedTools, err := s.db.ToolNamesForTurns(sessionID, assistantTurnIDs)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get tool calls: %w", err)
 	}

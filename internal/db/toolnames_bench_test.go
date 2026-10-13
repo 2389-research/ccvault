@@ -1,14 +1,13 @@
-// ABOUTME: Benchmarks the tool-name read behind get_turns, session-wide against page-bounded (#141).
-// ABOUTME: Exists so the claim in #141's fix is a measured number rather than an argument about indexes.
+// ABOUTME: Benchmarks the per-page reads behind get_turns, session-wide against page-bounded (#141, #157).
+// ABOUTME: Exists so the claims in those fixes are measured numbers rather than arguments about indexes.
 
-package mcp
+package db
 
 import (
 	"fmt"
 	"testing"
 	"time"
 
-	"github.com/2389-research/ccvault/internal/db"
 	"github.com/2389-research/ccvault/pkg/models"
 )
 
@@ -16,7 +15,7 @@ import (
 // calls tool_uses rows spread evenly over them, which is the shape that makes
 // the session-wide read expensive: many rows attached to many turns, of which
 // a page wants fifty.
-func buildToolHeavySession(tb testing.TB, database *db.DB, sessionID string, turns, calls int) []string {
+func buildToolHeavySession(tb testing.TB, database *DB, sessionID string, turns, calls int) []string {
 	tb.Helper()
 
 	p := &models.Project{Path: "/bench/proj", DisplayName: "bench"}
@@ -117,7 +116,7 @@ var benchSessions = []struct {
 
 func BenchmarkToolNameReadForOnePage(b *testing.B) {
 	for _, sc := range benchSessions {
-		database, err := db.Open(b.TempDir())
+		database, err := Open(b.TempDir())
 		if err != nil {
 			b.Fatalf("open db: %v", err)
 		}
@@ -127,7 +126,7 @@ func BenchmarkToolNameReadForOnePage(b *testing.B) {
 		b.Run("session_wide/"+sc.name, func(b *testing.B) {
 			rows := 0
 			for i := 0; i < b.N; i++ {
-				byTurn, err := toolNamesByTurn(database, "bench-session")
+				byTurn, err := database.SessionToolNamesByTurn("bench-session")
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -138,7 +137,7 @@ func BenchmarkToolNameReadForOnePage(b *testing.B) {
 		b.Run("page_bounded/"+sc.name, func(b *testing.B) {
 			rows := 0
 			for i := 0; i < b.N; i++ {
-				byTurn, err := toolNamesForTurns(database, "bench-session", page)
+				byTurn, err := database.ToolNamesForTurns("bench-session", page)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -167,7 +166,7 @@ func TestMeasureToolNameRead(t *testing.T) {
 	}
 	for _, sc := range benchSessions {
 		t.Run(sc.name, func(t *testing.T) {
-			database, err := db.Open(t.TempDir())
+			database, err := Open(t.TempDir())
 			if err != nil {
 				t.Fatalf("open db: %v", err)
 			}
@@ -177,14 +176,14 @@ func TestMeasureToolNameRead(t *testing.T) {
 			page := ids[:50]
 
 			start := time.Now()
-			wide, err := toolNamesByTurn(database, "bench-session")
+			wide, err := database.SessionToolNamesByTurn("bench-session")
 			if err != nil {
 				t.Fatal(err)
 			}
 			wideElapsed := time.Since(start)
 
 			start = time.Now()
-			scoped, err := toolNamesForTurns(database, "bench-session", page)
+			scoped, err := database.ToolNamesForTurns("bench-session", page)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -193,5 +192,121 @@ func TestMeasureToolNameRead(t *testing.T) {
 			t.Logf("session-wide: %d rows, %d turns, %s", countNames(wide), len(wide), wideElapsed)
 			t.Logf("page-bounded: %d rows, %d turns, %s", countNames(scoped), len(scoped), scopedElapsed)
 		})
+	}
+}
+
+// orderedSessionToolNamesSQL is the session-wide read as it stood before
+// #157: the same seek, plus the ORDER BY whose only effect was a temp B-tree
+// over every row the seek found. Kept here so the cost of that sort stays a
+// measured number rather than a story about indexes.
+const orderedSessionToolNamesSQL = sessionToolNamesSQL + `
+	ORDER BY turn_id, turn_ordinal`
+
+// BenchmarkSessionToolNameReadSort measures what get_session_summary was
+// paying for an ordering it does not use (#157). Both forms read the same
+// rows; only one sorts them.
+func BenchmarkSessionToolNameReadSort(b *testing.B) {
+	for _, sc := range benchSessions {
+		database, err := Open(b.TempDir())
+		if err != nil {
+			b.Fatalf("open db: %v", err)
+		}
+		buildToolHeavySession(b, database, "bench-session", sc.turns, sc.calls)
+
+		b.Run("ordered/"+sc.name, func(b *testing.B) {
+			rows := 0
+			for i := 0; i < b.N; i++ {
+				rows = countNames(mustToolNames(b, database, orderedSessionToolNamesSQL))
+			}
+			b.ReportMetric(float64(rows), "rows/op")
+		})
+		b.Run("unordered/"+sc.name, func(b *testing.B) {
+			rows := 0
+			for i := 0; i < b.N; i++ {
+				byTurn, err := database.SessionToolNamesByTurn("bench-session")
+				if err != nil {
+					b.Fatal(err)
+				}
+				rows = countNames(byTurn)
+			}
+			b.ReportMetric(float64(rows), "rows/op")
+		})
+
+		_ = database.Close()
+	}
+}
+
+// mustToolNames runs a (turn_id, tool_name) query over the bench session and
+// groups it the way the readers do, so a benchmark measures the same work.
+func mustToolNames(tb testing.TB, database *DB, query string) map[string][]string {
+	tb.Helper()
+	rows, err := database.Query(query, "bench-session")
+	if err != nil {
+		tb.Fatal(err)
+	}
+	byTurn, err := scanToolNamesByTurn(rows)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return byTurn
+}
+
+// markTenPercentFailed flips is_error on roughly a tenth of a bench session's
+// calls, which is the archive's real rate: the worst session holds 196
+// failures across 1,871 calls.
+func markTenPercentFailed(tb testing.TB, database *DB, sessionID string) int {
+	tb.Helper()
+	if _, err := database.Exec(
+		`UPDATE tool_uses SET is_error = 1 WHERE session_id = ? AND id % 10 = 0`, sessionID); err != nil {
+		tb.Fatalf("mark failed calls: %v", err)
+	}
+	var failures int
+	if err := database.QueryRow(
+		`SELECT count(*) FROM tool_uses WHERE session_id = ? AND is_error = 1`, sessionID).Scan(&failures); err != nil {
+		tb.Fatalf("count failed calls: %v", err)
+	}
+	if failures == 0 {
+		tb.Fatal("no call was marked failed, so the failed-call benchmark would measure nothing")
+	}
+	return failures
+}
+
+// BenchmarkFailedToolCallReadForOnePage measures #157's first half: get_turns
+// labels each turn with what broke in it, and read the whole session's
+// failures to label one 50-turn page.
+func BenchmarkFailedToolCallReadForOnePage(b *testing.B) {
+	for _, sc := range benchSessions {
+		database, err := Open(b.TempDir())
+		if err != nil {
+			b.Fatalf("open db: %v", err)
+		}
+		ids := buildToolHeavySession(b, database, "bench-session", sc.turns, sc.calls)
+		markTenPercentFailed(b, database, "bench-session")
+		page := ids[:50]
+
+		b.Run("session_wide/"+sc.name, func(b *testing.B) {
+			rows := 0
+			for i := 0; i < b.N; i++ {
+				failures, err := database.GetFailedToolCalls("bench-session")
+				if err != nil {
+					b.Fatal(err)
+				}
+				rows = len(failures)
+			}
+			b.ReportMetric(float64(rows), "rows/op")
+		})
+		b.Run("page_bounded/"+sc.name, func(b *testing.B) {
+			rows := 0
+			for i := 0; i < b.N; i++ {
+				failures, err := database.GetFailedToolCallsForTurns("bench-session", page)
+				if err != nil {
+					b.Fatal(err)
+				}
+				rows = len(failures)
+			}
+			b.ReportMetric(float64(rows), "rows/op")
+		})
+
+		_ = database.Close()
 	}
 }

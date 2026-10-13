@@ -189,54 +189,6 @@ func TestGetTurns_ToolNameReadIsBoundedByThePage(t *testing.T) {
 	}
 }
 
-// TestToolNamesForTurns_ReadsOnlyTheTurnsAsked is the row count behind the
-// handler test. Every row the query returns appends exactly one name, so the
-// names in the result are the rows it read — a page of two turns with three
-// calls each must come back with six, not the session's eighteen.
-func TestToolNamesForTurns_ReadsOnlyTheTurnsAsked(t *testing.T) {
-	_, database := newTestServer(t)
-	p := seedProject(t, database, "/test/proj")
-	seedSession(t, database, "session-1", p.ID)
-	ids := seedAssistantTurnsWithToolCalls(t, database, "session-1", 6, 3)
-
-	page := ids[:2]
-	onPage := map[string]bool{page[0]: true, page[1]: true}
-
-	byTurn, err := toolNamesForTurns(database, "session-1", page)
-	if err != nil {
-		t.Fatalf("toolNamesForTurns: %v", err)
-	}
-
-	read := 0
-	for turnID, names := range byTurn {
-		if !onPage[turnID] {
-			t.Errorf("read %d tool calls for turn %s, which is not on the page", len(names), turnID)
-		}
-		read += len(names)
-	}
-	if want := len(page) * 3; read != want {
-		t.Errorf("read %d tool_uses rows to label a %d-turn page, want %d (#141)", read, len(page), want)
-	}
-}
-
-// TestToolNamesForTurns_NoTurnsReadsNothing pins the empty case. A page with
-// no assistant turns has nothing to label, and `turn_id IN ()` is not valid
-// SQL — so the query must not be built at all.
-func TestToolNamesForTurns_NoTurnsReadsNothing(t *testing.T) {
-	_, database := newTestServer(t)
-	p := seedProject(t, database, "/test/proj")
-	seedSession(t, database, "session-1", p.ID)
-	seedAssistantTurnsWithToolCalls(t, database, "session-1", 2, 2)
-
-	byTurn, err := toolNamesForTurns(database, "session-1", nil)
-	if err != nil {
-		t.Fatalf("toolNamesForTurns with no turns: %v", err)
-	}
-	if len(byTurn) != 0 {
-		t.Errorf("an empty page read %d turns' tool calls", len(byTurn))
-	}
-}
-
 // TestGetTurns_EveryPageLabelsItsOwnTurns walks a session in pages the way an
 // agent resuming from an ordinal does (#79) and checks every assistant turn
 // gets its stored names. A read bounded by the page is only correct if the
@@ -339,5 +291,79 @@ func TestGetTurns_RawJSONFallbackSurvivesThePageBound(t *testing.T) {
 	}
 	if got := tools["session-1-rawonly"]; len(got) != 1 || got[0] != "Grep" {
 		t.Errorf("raw-only turn labelled %v, want [Grep]: the raw_json fallback is gone", got)
+	}
+}
+
+// TestGetTurns_FailedToolCallReadIsBoundedByThePage covers #157's first half
+// at the handler. get_turns labels each turn with what broke in it, and read
+// the whole session's failures to do it — so the cost of labelling a page
+// followed the session, exactly as the tool-name read did before #141.
+//
+// Every off-page row here is unreadable, so the handler completing at all is
+// the proof the read stayed inside the page.
+func TestGetTurns_FailedToolCallReadIsBoundedByThePage(t *testing.T) {
+	s, database := newTestServer(t)
+	p := seedProject(t, database, "/test/proj")
+	seedSession(t, database, "session-1", p.ID)
+	ids := seedAssistantTurnsWithToolCalls(t, database, "session-1", 6, 3)
+
+	// The first call of every turn failed. An UPDATE rather than a re-insert:
+	// InsertToolUses numbers a turn's calls by their position in the batch and
+	// replaces whatever holds that position, so seeding the failing call
+	// separately would renumber the turn's other calls over themselves.
+	if _, err := database.Exec(
+		`UPDATE tool_uses SET is_error = 1 WHERE session_id = 'session-1' AND turn_ordinal = 0`); err != nil {
+		t.Fatalf("mark failing calls: %v", err)
+	}
+
+	// The first two assistant turns are the page; the other four turns' rows
+	// must not be read, failing or otherwise.
+	shadowToolUsesOutsideThePage(t, database, ids[:2])
+
+	result, err := s.getTurns(map[string]interface{}{
+		"session_id": "session-1",
+		"type":       "assistant",
+		"limit":      float64(2),
+	})
+	if err != nil {
+		t.Fatalf("get_turns read tool_uses rows belonging to turns outside the page it was rendering (#157): %v", err)
+	}
+
+	m := resultMap(t, result)
+	turns := mustField[[]map[string]interface{}](t, m, "turns")
+	if len(turns) != 2 {
+		t.Fatalf("got %d turns, want 2", len(turns))
+	}
+	for i, turn := range turns {
+		names, ok := turn["failed_tools"].([]string)
+		if !ok {
+			t.Fatalf("turn %d has failed_tools %#v, want the one call that failed", i, turn["failed_tools"])
+		}
+		if len(names) != 1 {
+			t.Errorf("turn %d names %d failed tools, want 1: bounding the read changed the labels", i, len(names))
+		}
+	}
+}
+
+// TestGetSessionSummary_CountsEveryFailureInTheSession is the other side of
+// bounding get_turns' read: the summary means the session, so it must keep
+// counting failures the page-bounded reader would never see.
+func TestGetSessionSummary_CountsEveryFailureInTheSession(t *testing.T) {
+	s, database := newTestServer(t)
+	p := seedProject(t, database, "/test/proj")
+	seedSession(t, database, "session-1", p.ID)
+	seedAssistantTurnsWithToolCalls(t, database, "session-1", 6, 3)
+	if _, err := database.Exec(
+		`UPDATE tool_uses SET is_error = 1 WHERE session_id = 'session-1' AND turn_ordinal = 0`); err != nil {
+		t.Fatalf("mark failing calls: %v", err)
+	}
+
+	result, err := s.getSessionSummary(map[string]interface{}{"session_id": "session-1"})
+	if err != nil {
+		t.Fatalf("getSessionSummary: %v", err)
+	}
+	m := resultMap(t, result)
+	if got := m["failed_tool_calls"]; got != 6 {
+		t.Errorf("failed_tool_calls = %v, want 6 — the summary is reading a page, not the session", got)
 	}
 }
