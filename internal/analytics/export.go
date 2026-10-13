@@ -14,7 +14,12 @@ import (
 	"github.com/xitongsys/parquet-go/writer"
 )
 
-// SessionRecord is a Parquet-compatible session record
+// SessionRecord is a Parquet-compatible session record. It is the only record
+// type this package declares, and sessions.parquet the only file Export
+// writes. Two sibling types once sat beside it describing files that were
+// never produced — TurnRecord (deleted in #77) and ToolRecord (#139) — so a
+// record type added here without a writer should be read as the same mistake
+// a third time.
 type SessionRecord struct {
 	ID              string `parquet:"name=id, type=BYTE_ARRAY, convertedtype=UTF8"`
 	ProjectID       int64  `parquet:"name=project_id, type=INT64"`
@@ -28,14 +33,17 @@ type SessionRecord struct {
 	CacheReadTokens int64  `parquet:"name=cache_read_tokens, type=INT64"`
 	TotalTokens     int64  `parquet:"name=total_tokens, type=INT64"`
 	Source          string `parquet:"name=source, type=BYTE_ARRAY, convertedtype=UTF8"`
-}
 
-// ToolRecord is a Parquet-compatible tool usage record
-type ToolRecord struct {
-	SessionID string `parquet:"name=session_id, type=BYTE_ARRAY, convertedtype=UTF8"`
-	ToolName  string `parquet:"name=tool_name, type=BYTE_ARRAY, convertedtype=UTF8"`
-	FilePath  string `parquet:"name=file_path, type=BYTE_ARRAY, convertedtype=UTF8"`
-	Timestamp int64  `parquet:"name=timestamp, type=INT64, convertedtype=TIMESTAMP_MILLIS"`
+	// ParentSessionID is the id of the transcript that dispatched this one,
+	// empty for a top-level session — the same "" means top-level that
+	// models.Session uses, rather than a nullable parquet column that every
+	// reader would have to COALESCE. Appended rather than placed next to ID
+	// so the existing column order is undisturbed.
+	//
+	// Without it the cache counts subagent sessions but cannot separate
+	// them (#74), and a parquet file copied away from the archive has no
+	// join back to SQLite to recover the split.
+	ParentSessionID string `parquet:"name=parent_session_id, type=BYTE_ARRAY, convertedtype=UTF8"`
 }
 
 // Exporter exports data to Parquet format
@@ -121,6 +129,7 @@ func (e *Exporter) exportSessions() error {
 			CacheReadTokens: s.CacheReadTokens,
 			TotalTokens:     s.InputTokens + s.OutputTokens + s.CacheReadTokens + s.CacheWriteTokens,
 			Source:          s.Source,
+			ParentSessionID: s.ParentSessionID,
 		}
 		if err := pw.Write(record); err != nil {
 			return fmt.Errorf("write record: %w", err)
