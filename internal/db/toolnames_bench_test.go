@@ -1,14 +1,13 @@
-// ABOUTME: Benchmarks the tool-name read behind get_turns, session-wide against page-bounded (#141).
-// ABOUTME: Exists so the claim in #141's fix is a measured number rather than an argument about indexes.
+// ABOUTME: Benchmarks the per-page reads behind get_turns, session-wide against page-bounded (#141, #157).
+// ABOUTME: Exists so the claims in those fixes are measured numbers rather than arguments about indexes.
 
-package mcp
+package db
 
 import (
 	"fmt"
 	"testing"
 	"time"
 
-	"github.com/2389-research/ccvault/internal/db"
 	"github.com/2389-research/ccvault/pkg/models"
 )
 
@@ -16,7 +15,7 @@ import (
 // calls tool_uses rows spread evenly over them, which is the shape that makes
 // the session-wide read expensive: many rows attached to many turns, of which
 // a page wants fifty.
-func buildToolHeavySession(tb testing.TB, database *db.DB, sessionID string, turns, calls int) []string {
+func buildToolHeavySession(tb testing.TB, database *DB, sessionID string, turns, calls int) []string {
 	tb.Helper()
 
 	p := &models.Project{Path: "/bench/proj", DisplayName: "bench"}
@@ -117,7 +116,7 @@ var benchSessions = []struct {
 
 func BenchmarkToolNameReadForOnePage(b *testing.B) {
 	for _, sc := range benchSessions {
-		database, err := db.Open(b.TempDir())
+		database, err := Open(b.TempDir())
 		if err != nil {
 			b.Fatalf("open db: %v", err)
 		}
@@ -127,7 +126,7 @@ func BenchmarkToolNameReadForOnePage(b *testing.B) {
 		b.Run("session_wide/"+sc.name, func(b *testing.B) {
 			rows := 0
 			for i := 0; i < b.N; i++ {
-				byTurn, err := toolNamesByTurn(database, "bench-session")
+				byTurn, err := database.SessionToolNamesByTurn("bench-session")
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -138,7 +137,7 @@ func BenchmarkToolNameReadForOnePage(b *testing.B) {
 		b.Run("page_bounded/"+sc.name, func(b *testing.B) {
 			rows := 0
 			for i := 0; i < b.N; i++ {
-				byTurn, err := toolNamesForTurns(database, "bench-session", page)
+				byTurn, err := database.ToolNamesForTurns("bench-session", page)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -167,7 +166,7 @@ func TestMeasureToolNameRead(t *testing.T) {
 	}
 	for _, sc := range benchSessions {
 		t.Run(sc.name, func(t *testing.T) {
-			database, err := db.Open(t.TempDir())
+			database, err := Open(t.TempDir())
 			if err != nil {
 				t.Fatalf("open db: %v", err)
 			}
@@ -177,14 +176,14 @@ func TestMeasureToolNameRead(t *testing.T) {
 			page := ids[:50]
 
 			start := time.Now()
-			wide, err := toolNamesByTurn(database, "bench-session")
+			wide, err := database.SessionToolNamesByTurn("bench-session")
 			if err != nil {
 				t.Fatal(err)
 			}
 			wideElapsed := time.Since(start)
 
 			start = time.Now()
-			scoped, err := toolNamesForTurns(database, "bench-session", page)
+			scoped, err := database.ToolNamesForTurns("bench-session", page)
 			if err != nil {
 				t.Fatal(err)
 			}

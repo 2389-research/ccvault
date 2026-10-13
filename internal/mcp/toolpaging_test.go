@@ -189,54 +189,6 @@ func TestGetTurns_ToolNameReadIsBoundedByThePage(t *testing.T) {
 	}
 }
 
-// TestToolNamesForTurns_ReadsOnlyTheTurnsAsked is the row count behind the
-// handler test. Every row the query returns appends exactly one name, so the
-// names in the result are the rows it read — a page of two turns with three
-// calls each must come back with six, not the session's eighteen.
-func TestToolNamesForTurns_ReadsOnlyTheTurnsAsked(t *testing.T) {
-	_, database := newTestServer(t)
-	p := seedProject(t, database, "/test/proj")
-	seedSession(t, database, "session-1", p.ID)
-	ids := seedAssistantTurnsWithToolCalls(t, database, "session-1", 6, 3)
-
-	page := ids[:2]
-	onPage := map[string]bool{page[0]: true, page[1]: true}
-
-	byTurn, err := toolNamesForTurns(database, "session-1", page)
-	if err != nil {
-		t.Fatalf("toolNamesForTurns: %v", err)
-	}
-
-	read := 0
-	for turnID, names := range byTurn {
-		if !onPage[turnID] {
-			t.Errorf("read %d tool calls for turn %s, which is not on the page", len(names), turnID)
-		}
-		read += len(names)
-	}
-	if want := len(page) * 3; read != want {
-		t.Errorf("read %d tool_uses rows to label a %d-turn page, want %d (#141)", read, len(page), want)
-	}
-}
-
-// TestToolNamesForTurns_NoTurnsReadsNothing pins the empty case. A page with
-// no assistant turns has nothing to label, and `turn_id IN ()` is not valid
-// SQL — so the query must not be built at all.
-func TestToolNamesForTurns_NoTurnsReadsNothing(t *testing.T) {
-	_, database := newTestServer(t)
-	p := seedProject(t, database, "/test/proj")
-	seedSession(t, database, "session-1", p.ID)
-	seedAssistantTurnsWithToolCalls(t, database, "session-1", 2, 2)
-
-	byTurn, err := toolNamesForTurns(database, "session-1", nil)
-	if err != nil {
-		t.Fatalf("toolNamesForTurns with no turns: %v", err)
-	}
-	if len(byTurn) != 0 {
-		t.Errorf("an empty page read %d turns' tool calls", len(byTurn))
-	}
-}
-
 // TestGetTurns_EveryPageLabelsItsOwnTurns walks a session in pages the way an
 // agent resuming from an ordinal does (#79) and checks every assistant turn
 // gets its stored names. A read bounded by the page is only correct if the
