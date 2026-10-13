@@ -79,6 +79,21 @@ jobs:
         with:
           fetch-depth: 0
 
+      # `cache: true` is the only module cache in this job. There used to be a
+      # hand-rolled `actions/cache` step after this one caching ~/go/pkg/mod
+      # as well -- the same directory setup-go already handles, restored twice
+      # and saved twice per job. Its key was
+      # `${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}`, which names no Go
+      # version, so both matrix jobs shared one entry and each overwrote a
+      # cache the other toolchain had populated. setup-go's own key carries
+      # the Go version alongside the go.sum hash, which is exactly the
+      # dimension the manual key was missing, so deleting the step fixes the
+      # collision rather than trading it for a different one.
+      #
+      # It cached nothing extra either: setup-go covers the build cache
+      # (~/.cache/go-build) as well as the module cache. If a future step
+      # needs something outside both, scope `actions/cache` to that path only
+      # and put the Go version in its key.
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
@@ -90,14 +105,6 @@ jobs:
           go version
           echo "GOTOOLCHAIN=$(go env GOTOOLCHAIN)"
           test "$(go env GOTOOLCHAIN)" = local
-
-      - name: Cache Go modules
-        uses: actions/cache@v4
-        with:
-          path: ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
 
       - name: Download dependencies
         run: go mod download
