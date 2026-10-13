@@ -99,6 +99,12 @@ type rpcError struct {
 // failure the caller cannot correct.
 const internalErrorCode = -32603
 
+// invalidParamsCode is JSON-RPC 2.0's reserved code for params the server
+// cannot act on. MCP reuses it for an initialize whose protocolVersion
+// names no revision the server can speak, distinguished from any other
+// bad-params case by the message rather than the code.
+const invalidParamsCode = -32602
+
 // MCP types
 type serverInfo struct {
 	Name    string `json:"name"`
@@ -122,6 +128,14 @@ type initializeResult struct {
 	ProtocolVersion string       `json:"protocolVersion"`
 	Capabilities    capabilities `json:"capabilities"`
 	ServerInfo      serverInfo   `json:"serverInfo"`
+}
+
+// initializeParams is the half of the client's initialize params we act on.
+// Capabilities and clientInfo are read past: this server offers the same
+// tools to every client and adapts to none of them, so recording what they
+// said it could do would be collecting a fact nothing consults.
+type initializeParams struct {
+	ProtocolVersion string `json:"protocolVersion"`
 }
 
 type tool struct {
@@ -300,9 +314,92 @@ func (s *Server) handleRequest(req *jsonRPCRequest) {
 	}
 }
 
+// supportedProtocolVersions are the MCP revisions this server speaks,
+// newest first, which makes [0] the latest and the whole slice the
+// `supported` list a rejected client is handed.
+//
+// All three are claimed because this server's entire surface is tools and
+// prompts over stdio, and those are defined identically across them. What
+// each later revision adds -- completions, audio content and tool
+// annotations in 2025-03-26; elicitation, structured tool output and
+// resource links in 2025-06-18 -- is optional, and none of it appears in
+// the capabilities we advertise. The one change that cuts the other way is
+// JSON-RPC batching, which 2024-11-05 permits a client to send and
+// 2025-06-18 removes: this server reads one JSON object per line and has
+// never handled a batch, so 2025-06-18 describes it more accurately than
+// 2024-11-05 does.
+//
+// Adding a revision here is a claim about wire behaviour. Check what it
+// changed before extending the list, rather than assuming newest is safe.
+var supportedProtocolVersions = []string{"2025-06-18", "2025-03-26", "2024-11-05"}
+
+// negotiateProtocolVersion applies the MCP lifecycle spec's two rules to
+// the version a client proposed, and returns ok=false when neither applies.
+//
+//   - A version we support is answered with itself. The spec makes this a
+//     MUST, and it is the half that matters most: a client that strictly
+//     checks the negotiated version against what it offered sees agreement
+//     rather than an unexplained substitution.
+//   - Any other MCP revision is answered with our latest, which the spec
+//     makes a MUST (respond with another version you support) and a SHOULD
+//     (make it the latest). This covers revisions newer than ours and the
+//     dated revisions that predate the oldest we speak; the client decides
+//     whether it can live with the answer and disconnects if it cannot.
+//   - A proposal that is not a dated MCP revision at all -- "1.0.0", the
+//     spec's own example -- names nothing to downgrade to, so there is no
+//     version both sides support and the caller sends the spec's error.
+//     Answering a date here would assert an agreement that does not exist.
+//
+// An absent proposal is treated as no proposal rather than as a failure.
+// The spec requires clients to send one, so there is nothing to negotiate
+// against, and our latest is at least a version we really do support.
+func negotiateProtocolVersion(requested string) (agreed string, ok bool) {
+	latest := supportedProtocolVersions[0]
+	if requested == "" {
+		return latest, true
+	}
+	for _, v := range supportedProtocolVersions {
+		if v == requested {
+			return requested, true
+		}
+	}
+	if _, err := time.Parse(protocolVersionLayout, requested); err != nil {
+		return "", false
+	}
+	return latest, true
+}
+
+// protocolVersionLayout is the YYYY-MM-DD shape MCP revisions are named
+// with. Parsing rather than pattern-matching so "2025-13-40" is rejected
+// as the non-revision it is.
+const protocolVersionLayout = "2006-01-02"
+
 func (s *Server) handleInitialize(req *jsonRPCRequest) {
+	var params initializeParams
+	if len(req.Params) > 0 {
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			s.log("Initialize params unreadable: %v", err)
+			s.sendError(req.ID, invalidParamsCode, "Invalid params", err.Error())
+			return
+		}
+	}
+
+	// Negotiate rather than assert. The handler used to answer the literal
+	// "2024-11-05" without ever reading what the client offered (#127), so
+	// a client speaking another revision was told it had agreement it had
+	// not been given.
+	agreed, ok := negotiateProtocolVersion(params.ProtocolVersion)
+	if !ok {
+		s.log("Unsupported protocol version requested: %s", params.ProtocolVersion)
+		s.sendError(req.ID, invalidParamsCode, "Unsupported protocol version", map[string]interface{}{
+			"supported": supportedProtocolVersions,
+			"requested": params.ProtocolVersion,
+		})
+		return
+	}
+
 	result := initializeResult{
-		ProtocolVersion: "2024-11-05",
+		ProtocolVersion: agreed,
 		Capabilities: capabilities{
 			Tools:   &toolsCapability{},
 			Prompts: &promptsCapability{},
