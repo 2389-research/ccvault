@@ -164,18 +164,15 @@ func TestGetTurns_CountsOnlyTheReturnedPage(t *testing.T) {
 	}
 }
 
-// TestGetTurns_ForeignRawShapeReadsAsNoTools pins a limitation this fix
-// does not close, so it is visible in code rather than only in a report.
-//
-// The enrichment reads message.content[], which is claude-code's and
-// nanoclaw's raw shape. The codex, hex and jeff adapters store raw
-// entries with no top-level `message` key at all, and Go's json.Unmarshal
-// ignores unknown keys — so the parse *succeeds* and reports
-// has_thinking: false with no tools, confidently and wrongly. That is a
-// false negative the response cannot detect, and it is a different defect
-// from the unreadable-raw_json one above: there is no error to notice.
-// Closing it needs per-adapter extraction, not a warning.
-func TestGetTurns_ForeignRawShapeReadsAsNoTools(t *testing.T) {
+// TestGetTurns_ForeignRawShapeIsNotReportedAsUnreadable is the boundary
+// between this file's defect and #100's. A raw entry with no top-level
+// `message` key parses fine — Go's json.Unmarshal ignores unknown keys —
+// so there is no error to report and nothing to warn about. What used to
+// be wrong was the answer that followed: tools silently empty and
+// has_thinking confidently false. Those are asserted in
+// foreignshape_test.go; what matters here is that such a turn is not
+// dressed up as a read failure, which would be a different lie.
+func TestGetTurns_ForeignRawShapeIsNotReportedAsUnreadable(t *testing.T) {
 	s, database := newTestServer(t)
 	seedAssistantTurns(t, database, "session-foreign", []string{
 		`{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}`,
@@ -189,13 +186,14 @@ func TestGetTurns_ForeignRawShapeReadsAsNoTools(t *testing.T) {
 	turns := mustField[[]map[string]interface{}](t, m, "turns")
 
 	if _, marked := turns[0]["raw_unavailable"]; marked {
-		t.Error("turn is marked raw_unavailable; a foreign raw shape parses fine, which is the problem")
-	}
-	if mustField[bool](t, turns[0], "has_thinking") {
-		t.Error("has_thinking = true, want the (wrong but current) false")
+		t.Error("turn is marked raw_unavailable; a foreign raw shape parses fine")
 	}
 	if v, present := m["unreadable_turns"]; present {
-		t.Errorf("unreadable_turns = %#v; a foreign shape is not detected as unreadable", v)
+		t.Errorf("unreadable_turns = %#v; a foreign shape is not a read failure", v)
+	}
+	if v, present := turns[0]["has_thinking"]; present {
+		t.Errorf("has_thinking = %#v; this shape carries no thinking blocks, so false "+
+			"would be a claim rather than a reading (#100)", v)
 	}
 }
 
