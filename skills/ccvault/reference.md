@@ -193,10 +193,18 @@ session.
 
 Why this matters for reading the archive:
 
-- Subagent transcripts **outnumber top-level ones** (roughly 2.6:1 on a real
-  machine), and they hold about **29% more tokens on top of their parents** —
-  none of it double-counted, because a parent transcript contains no sidechain
-  lines at all. That is where most of the actual tool work lives.
+- Subagent transcripts are **most of what a fresh sync captures and a small
+  slice of what the archive holds** — two different populations, both measured
+  on the author's machine on 2026-10-13. On disk, 237 of the 296 `*.jsonl`
+  files in `~/.claude/projects` are `agent-*` sidechains, 4:1 over top-level;
+  that is the forward-looking capture rate. In the archive, 362 of 47,409
+  sessions (0.8%) and 46,656 of 1,049,544 turns (4.4%) are subagents, because
+  subagent ingestion is recent and Claude Code prunes its own transcripts, so
+  older sidechains are gone permanently. Don't read the disk ratio as a claim
+  about history. Where a parent and its children are both present, the
+  children roughly **double** the parent's tokens (11.5M against 11.2M across
+  81 such parents), none of it double-counted — a parent transcript contains
+  no sidechain lines at all. That is where much of the actual tool work lives.
 - **Listings hide them by default** — `list_sessions`, `ccvault list-sessions`,
   and the TUI session list all show top-level sessions only. Every row reports
   `subagent_count`, so a filtered listing still tells you what it filtered.

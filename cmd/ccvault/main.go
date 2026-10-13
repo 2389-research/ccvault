@@ -1313,10 +1313,13 @@ var listProjectsCmd = &cobra.Command{
 }
 
 // subagentScopeFromFlags maps the list-sessions flags onto a listing scope.
-// The default hides subagent sessions — on a real machine they outnumber
-// top-level sessions roughly 2.6:1 — while every row still reports how many
-// it stands for. --subagents-of beats --include-subagents because asking for
-// one parent's children is the more specific request.
+// The default hides subagent sessions: on disk they outnumber top-level
+// transcripts about 4:1 (237 agent-* files of 296 in ~/.claude/projects on
+// 2026-10-13), which is what a fresh sync captures. The share already in the
+// archive is far smaller — db.SubagentsHidden's comment has both numbers and
+// why they differ. Every row still reports how many subagents it stands for.
+// --subagents-of beats --include-subagents because asking for one parent's
+// children is the more specific request.
 func subagentScopeFromFlags(includeSubagents bool, subagentsOf string) (db.SubagentScope, string) {
 	switch {
 	case subagentsOf != "":
