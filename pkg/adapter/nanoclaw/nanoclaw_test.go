@@ -142,6 +142,25 @@ func TestNanoclawAdapter_Parse_ParentSession(t *testing.T) {
 	if len(parsed.Turns) != 4 {
 		t.Fatalf("len(Turns) = %d, want 4", len(parsed.Turns))
 	}
+
+	// All four token counters reach the adapter turn. nanoclaw reads the same
+	// wire format as Claude Code, so the cache pair was zero here for the
+	// same reason it was zero there (#155).
+	assistant := parsed.Turns[1]
+	for _, tc := range []struct {
+		field string
+		got   int64
+		want  int64
+	}{
+		{"InputTokens", assistant.InputTokens, 5},
+		{"OutputTokens", assistant.OutputTokens, 2},
+		{"CacheReadTokens", assistant.CacheReadTokens, 1500},
+		{"CacheWriteTokens", assistant.CacheWriteTokens, 300},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("Turns[1].%s = %d, want %d", tc.field, tc.got, tc.want)
+		}
+	}
 }
 
 func TestNanoclawAdapter_Parse_ScheduledTaskReclassified(t *testing.T) {
@@ -232,6 +251,16 @@ func TestNanoclawAdapter_Parse_SubagentSession(t *testing.T) {
 	}
 	if _, ok := parsed.Metadata["has_scheduled_tasks"]; ok {
 		t.Error("has_scheduled_tasks should not be set on subagent sessions")
+	}
+
+	// Subagent transcripts carry usage too, and a subagent's spend is the
+	// whole point of #74/#150 — so the cache pair has to survive this branch
+	// of Parse as well, not only the parent one.
+	if parsed.Turns[1].CacheReadTokens != 900 {
+		t.Errorf("subagent Turns[1].CacheReadTokens = %d, want 900", parsed.Turns[1].CacheReadTokens)
+	}
+	if parsed.Turns[1].CacheWriteTokens != 100 {
+		t.Errorf("subagent Turns[1].CacheWriteTokens = %d, want 100", parsed.Turns[1].CacheWriteTokens)
 	}
 }
 
@@ -328,8 +357,11 @@ func parentSessionLines(sessionID string) []string {
 	return []string{
 		// 1. plain user turn
 		`{"uuid":"t1","sessionId":"` + sessionID + `","type":"user","timestamp":"2026-05-26T14:30:00Z","message":{"role":"user","content":"hello"},"cwd":"/workspace/group"}`,
-		// 2. assistant reply
-		`{"uuid":"t2","sessionId":"` + sessionID + `","parentUuid":"t1","type":"assistant","timestamp":"2026-05-26T14:30:05Z","message":{"id":"msg-1","model":"claude-sonnet-4-6","role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":5,"output_tokens":2}}}`,
+		// 2. assistant reply. nanoclaw writes Claude Code's wire format, so
+		// its usage object carries all four counters — the fixture used to
+		// carry only input/output, which is why nothing here noticed the
+		// cache pair was dropped (#155).
+		`{"uuid":"t2","sessionId":"` + sessionID + `","parentUuid":"t1","type":"assistant","timestamp":"2026-05-26T14:30:05Z","message":{"id":"msg-1","model":"claude-sonnet-4-6","role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":5,"output_tokens":2,"cache_read_input_tokens":1500,"cache_creation_input_tokens":300}}}`,
 		// 3. scheduled-task injection — should be reclassified to system
 		`{"uuid":"t3","sessionId":"` + sessionID + `","parentUuid":"t2","type":"user","timestamp":"2026-05-26T14:35:00Z","message":{"role":"user","content":"[SCHEDULED TASK - daily-check] run health probe"},"cwd":"/workspace/group"}`,
 		// 4. tool_result error turn — pins has_error metadata + Turns[3].HasError
@@ -348,7 +380,7 @@ func minimalSubagentLines(parentUUID, _ string) []string {
 	// is the invariant the adapter has to work around for ID uniqueness.
 	return []string{
 		`{"uuid":"s1","sessionId":"` + parentUUID + `","isSidechain":true,"type":"user","timestamp":"2026-05-26T14:36:22Z","message":{"role":"user","content":"[SCHEDULED TASK - shouldnt-reclassify] research foo"},"cwd":"/workspace/group"}`,
-		`{"uuid":"s2","sessionId":"` + parentUUID + `","parentUuid":"s1","isSidechain":true,"type":"assistant","timestamp":"2026-05-26T14:36:25Z","message":{"id":"msg-s1","model":"claude-sonnet-4-6","role":"assistant","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":3,"output_tokens":1}}}`,
+		`{"uuid":"s2","sessionId":"` + parentUUID + `","parentUuid":"s1","isSidechain":true,"type":"assistant","timestamp":"2026-05-26T14:36:25Z","message":{"id":"msg-s1","model":"claude-sonnet-4-6","role":"assistant","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":3,"output_tokens":1,"cache_read_input_tokens":900,"cache_creation_input_tokens":100}}}`,
 	}
 }
 

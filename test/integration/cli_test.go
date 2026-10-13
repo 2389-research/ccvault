@@ -153,6 +153,11 @@ func (f *cliFixture) WriteConfig(t *testing.T, path, claudeHome string) {
 }
 
 // AddSession writes a two-turn Claude Code session under claudeHome.
+//
+// The assistant turn's usage object carries all four counters, as every real
+// one does. It carried only input/output for a long time, which is the trap
+// #107 described and #155 fell into: a test asserting on the cache columns
+// would have read zero from the fixture and passed against the bug.
 func (f *cliFixture) AddSession(t *testing.T, claudeHome, encodedProject, sessionID, text string) {
 	t.Helper()
 
@@ -161,7 +166,7 @@ func (f *cliFixture) AddSession(t *testing.T, claudeHome, encodedProject, sessio
 		t.Fatalf("mkdir %s: %v", dir, err)
 	}
 	jsonl := fmt.Sprintf(`{"uuid":"%[1]s-t1","parentUuid":null,"type":"user","message":{"role":"user","content":%[2]q},"timestamp":"2026-01-01T00:00:01Z","sessionId":%[1]q,"cwd":"/Users/test/fixture","version":"1.0"}
-{"uuid":"%[1]s-t2","parentUuid":"%[1]s-t1","type":"assistant","message":{"id":"%[1]s-m1","model":"claude-sonnet-4-20250514","role":"assistant","content":[{"type":"text","text":"acknowledged"}],"usage":{"input_tokens":11,"output_tokens":7}},"timestamp":"2026-01-01T00:00:02Z","sessionId":%[1]q}
+{"uuid":"%[1]s-t2","parentUuid":"%[1]s-t1","type":"assistant","message":{"id":"%[1]s-m1","model":"claude-sonnet-4-20250514","role":"assistant","content":[{"type":"text","text":"acknowledged"}],"usage":{"input_tokens":11,"output_tokens":7,"cache_read_input_tokens":4096,"cache_creation_input_tokens":512}},"timestamp":"2026-01-01T00:00:02Z","sessionId":%[1]q}
 `, sessionID, text)
 	path := filepath.Join(dir, sessionID+".jsonl")
 	if err := os.WriteFile(path, []byte(jsonl), 0o644); err != nil {

@@ -68,7 +68,10 @@ func TestClaudeCodeAdapter_Parse(t *testing.T) {
 
 	lines := []string{
 		`{"uuid":"turn-1","sessionId":"sess-1","type":"user","timestamp":"2025-01-01T00:00:00Z","message":{"role":"user","content":"hello"},"cwd":"/tmp/project"}`,
-		`{"uuid":"turn-2","sessionId":"sess-1","parentUuid":"turn-1","type":"assistant","timestamp":"2025-01-01T00:01:00Z","message":{"id":"msg-1","model":"claude-3","role":"assistant","content":[{"type":"text","text":"hi there"}],"usage":{"input_tokens":10,"output_tokens":5}}}`,
+		// The usage object carries all four counters, as every real assistant
+		// message does. It used to carry only input/output, which is why no
+		// test here noticed that the cache pair was never forwarded (#155).
+		`{"uuid":"turn-2","sessionId":"sess-1","parentUuid":"turn-1","type":"assistant","timestamp":"2025-01-01T00:01:00Z","message":{"id":"msg-1","model":"claude-3","role":"assistant","content":[{"type":"text","text":"hi there"}],"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":2048,"cache_creation_input_tokens":256}}}`,
 	}
 	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -104,6 +107,15 @@ func TestClaudeCodeAdapter_Parse(t *testing.T) {
 	}
 	if parsed.Turns[1].InputTokens != 10 {
 		t.Errorf("Turns[1].InputTokens = %d, want 10", parsed.Turns[1].InputTokens)
+	}
+	if parsed.Turns[1].OutputTokens != 5 {
+		t.Errorf("Turns[1].OutputTokens = %d, want 5", parsed.Turns[1].OutputTokens)
+	}
+	if parsed.Turns[1].CacheReadTokens != 2048 {
+		t.Errorf("Turns[1].CacheReadTokens = %d, want 2048", parsed.Turns[1].CacheReadTokens)
+	}
+	if parsed.Turns[1].CacheWriteTokens != 256 {
+		t.Errorf("Turns[1].CacheWriteTokens = %d, want 256", parsed.Turns[1].CacheWriteTokens)
 	}
 }
 

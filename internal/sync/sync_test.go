@@ -548,9 +548,11 @@ func TestSyncer_RepeatedSyncDoesNotInflateProjectCounts(t *testing.T) {
 	if sessionCount != 2 {
 		t.Errorf("projects.session_count = %d, want 2 (one row per real session, not per sync)", sessionCount)
 	}
-	// Each test session carries 10 input + 5 output tokens.
-	if totalTokens != 30 {
-		t.Errorf("projects.total_tokens = %d, want 30", totalTokens)
+	// Each test session carries 10 input + 5 output + 100 cache-read +
+	// 20 cache-write tokens, and total_tokens sums all four (#155).
+	const perSession = 10 + 5 + 100 + 20
+	if totalTokens != 2*perSession {
+		t.Errorf("projects.total_tokens = %d, want %d", totalTokens, 2*perSession)
 	}
 }
 

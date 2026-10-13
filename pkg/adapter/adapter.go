@@ -47,8 +47,25 @@ type ParsedTurn struct {
 	RawJSON      json.RawMessage
 	InputTokens  int64
 	OutputTokens int64
-	ToolUses     []ParsedToolUse
-	HasError     bool
+
+	// CacheReadTokens and CacheWriteTokens are prompt-cache counters, summed
+	// into sessions.cache_read_tokens / cache_write_tokens by the sync layer
+	// the same way the input/output pair is. See models.Turn for why they are
+	// not persisted per turn.
+	//
+	// The four counters must be disjoint, because the session row adds them
+	// up. Sources do not agree on that: Claude Code and nanoclaw report
+	// cache reads beside input_tokens, while codex's cached_input_tokens is
+	// contained in its input_tokens — so the codex adapter subtracts the
+	// cached part out before filling these, rather than reporting the source's
+	// number verbatim and double-counting it. A source that records no cache
+	// figures at all (hex, jeff — neither transcript format carries token
+	// usage of any kind) leaves both zero.
+	CacheReadTokens  int64
+	CacheWriteTokens int64
+
+	ToolUses []ParsedToolUse
+	HasError bool
 }
 
 // ParsedToolUse captures a single tool invocation within a turn, including the

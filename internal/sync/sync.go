@@ -28,9 +28,27 @@ type Stats struct {
 	TotalSkippedLines          int
 	SessionsWithTruncatedTurns int
 	TurnsWithTruncatedRawJSON  int
-	TurnsIndexed               int
-	ToolUsesIndexed            int
-	ProjectsFound              int
+
+	// SessionsWithUnparsableTimestamps and TurnsWithUnparsableTimestamp count
+	// turns whose transcript timestamp matched none of the reading adapter's
+	// layouts, so the turn carries a fallback time rather than a recorded one.
+	//
+	// The turn is still indexed; what used to be missing is any sign of the
+	// substitution (#146). A fallback timestamp sorts somewhere arbitrary in
+	// the archive, answers date predicates, and looks exactly like a value
+	// someone recorded — so a non-zero count here is the only way to tell
+	// that a producer's format moved and our layout list has not.
+	SessionsWithUnparsableTimestamps int
+	TurnsWithUnparsableTimestamp     int
+
+	// UnparsableTimestampSample is the first unreadable timestamp string this
+	// run saw, verbatim. The count says a layout is missing; the sample says
+	// which one to add.
+	UnparsableTimestampSample string
+
+	TurnsIndexed    int
+	ToolUsesIndexed int
+	ProjectsFound   int
 	// SessionsRewrittenUpstream counts sessions whose stored last turn was
 	// absent from the transcript this run re-parsed — the file was rewritten
 	// rather than appended to, so the session's history was replaced with a
@@ -299,8 +317,35 @@ func (s *Syncer) Run(ctx context.Context) (*Stats, error) {
 		s.progress("Truncated raw_json for %d turn(s) across %d session(s)",
 			stats.TurnsWithTruncatedRawJSON, stats.SessionsWithTruncatedTurns)
 	}
+	s.progressUnparsableTimestamps(stats)
 
 	return stats, nil
+}
+
+// progressUnparsableTimestamps reports the #146 count, naming the first
+// unreadable value so the reader knows which layout is missing rather than
+// only that one is.
+//
+// Reporting, not refusal: the turn is indexed either way. An adapter that
+// cannot read a timestamp has still read the conversation, and the archive has
+// repeatedly been better served by the user seeing a problem than by a guard
+// that drops data — the same call #144 made for non-canonical stored values.
+func (s *Syncer) progressUnparsableTimestamps(stats *Stats) {
+	if stats.TurnsWithUnparsableTimestamp == 0 {
+		return
+	}
+	if stats.UnparsableTimestampSample != "" {
+		s.progress("Could not read the timestamp on %d turn(s) across %d session(s); "+
+			"first unreadable value: %q",
+			stats.TurnsWithUnparsableTimestamp, stats.SessionsWithUnparsableTimestamps,
+			stats.UnparsableTimestampSample)
+		return
+	}
+	// No sample means the transcripts carried no timestamp at all, which is a
+	// different problem from a layout we cannot read, so say so.
+	s.progress("Could not read the timestamp on %d turn(s) across %d session(s); "+
+		"the transcripts recorded none",
+		stats.TurnsWithUnparsableTimestamp, stats.SessionsWithUnparsableTimestamps)
 }
 
 // reconcileProjects recomputes the project aggregate columns against the
@@ -459,6 +504,19 @@ func (s *Syncer) processSession(ctx context.Context, sf adapter.SessionFile, adp
 			}
 		}
 	}
+	if v, ok := parsed.Metadata[adapter.UnreadableTimestampsKey]; ok {
+		if n, ok := v.(int); ok && n > 0 {
+			stats.SessionsWithUnparsableTimestamps++
+			stats.TurnsWithUnparsableTimestamp += n
+			if sample, ok := parsed.Metadata[adapter.UnreadableTimestampSampleKey].(string); ok &&
+				stats.UnparsableTimestampSample == "" {
+				stats.UnparsableTimestampSample = sample
+			}
+			if s.verbose {
+				s.progress("session %s: could not read the timestamp on %d turn(s)", sessionLabel, n)
+			}
+		}
+	}
 
 	if parsed.ID == "" {
 		// Record mtime so we skip this empty file next time
@@ -534,9 +592,16 @@ func (s *Syncer) processSession(ctx context.Context, sf adapter.SessionFile, adp
 			OutputTokens: int(pt.OutputTokens),
 		}
 
-		// Accumulate session token totals
+		// Accumulate session token totals. The turns table has no cache
+		// columns, so the cache pair is summed straight into the session row
+		// without a per-turn stop — adapters are responsible for reporting
+		// them disjoint from input/output (see adapter.ParsedTurn). Omitting
+		// them here is what left sessions.cache_read_tokens at 0 for every
+		// row in the archive (#155).
 		session.InputTokens += pt.InputTokens
 		session.OutputTokens += pt.OutputTokens
+		session.CacheReadTokens += pt.CacheReadTokens
+		session.CacheWriteTokens += pt.CacheWriteTokens
 
 		// Convert tool uses
 		for _, ptu := range pt.ToolUses {

@@ -98,6 +98,26 @@ type Turn struct {
 	RawJSON      json.RawMessage `json:"raw_json,omitempty"` // Original JSONL entry
 	InputTokens  int             `json:"input_tokens,omitempty"`
 	OutputTokens int             `json:"output_tokens,omitempty"`
+
+	// CacheReadTokens and CacheWriteTokens are the turn's prompt-cache
+	// counters: tokens served from the cache, and tokens written into it.
+	// For Claude Code they are usage.cache_read_input_tokens and
+	// usage.cache_creation_input_tokens, which sit *beside* input_tokens
+	// rather than inside it — the four counters are disjoint and the session's
+	// total is their sum.
+	//
+	// They are not small. Across the 200,000 newest turns of the author's
+	// archive the cache pair totals ~14.3 billion tokens against ~56 million
+	// for input+output, and until #155 nothing assigned them, so
+	// sessions.cache_read_tokens was 0 for all 47,409 rows.
+	//
+	// Unlike InputTokens/OutputTokens these are not persisted per turn: the
+	// turns table has no columns for them, and adding some is a migration
+	// this change deliberately does not write. They exist to carry the
+	// transcript's numbers up to the session row, which does have the
+	// columns.
+	CacheReadTokens  int `json:"cache_read_tokens,omitempty"`
+	CacheWriteTokens int `json:"cache_write_tokens,omitempty"`
 }
 
 // ToolUse represents a tool invocation within a session

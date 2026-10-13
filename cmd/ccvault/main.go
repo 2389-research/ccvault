@@ -913,6 +913,16 @@ over the live DB (the path is printed at run), or merge it back in with
 			fmt.Printf("  Truncated raw_json: %d turn(s) across %d session(s)\n",
 				stats.TurnsWithTruncatedRawJSON, stats.SessionsWithTruncatedTurns)
 		}
+		if stats.TurnsWithUnparsableTimestamp > 0 {
+			// Named value included: the count says a layout is missing, the
+			// sample says which one to add (#146).
+			fmt.Printf("  Unreadable timestamps: %d turn(s) across %d session(s)",
+				stats.TurnsWithUnparsableTimestamp, stats.SessionsWithUnparsableTimestamps)
+			if stats.UnparsableTimestampSample != "" {
+				fmt.Printf(" — first unreadable value %q", stats.UnparsableTimestampSample)
+			}
+			fmt.Println()
+		}
 		if stats.SessionsRewrittenUpstream > 0 {
 			fmt.Printf("  Rewritten upstream: %d session(s) — the transcript was replaced, "+
 				"not appended to, so the archived turns were swapped rather than extended\n",
