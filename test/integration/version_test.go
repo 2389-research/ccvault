@@ -97,7 +97,8 @@ func TestVersion_ReleaseStampsReachTheOutput(t *testing.T) {
 // TestVersion_UnstampedBuildDoesNotInventAVersion covers the plain `go build`
 // every contributor and test harness uses. It used to report the hardcoded
 // "0.1.0", a version no build ever was, which made `version` worthless as a
-// diagnostic. Now it says "dev" and names the commit it came from.
+// diagnostic. Now it says "dev", and every provenance field it prints is
+// either a fact the binary actually carries or an admission that it does not.
 func TestVersion_UnstampedBuildDoesNotInventAVersion(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds the binary")
@@ -114,20 +115,67 @@ func TestVersion_UnstampedBuildDoesNotInventAVersion(t *testing.T) {
 		}
 	}
 
-	// Go stamps VCS data into any build made from a repository, so the
-	// commit must be a real revision rather than the unknown placeholder.
+	// The anti-invention guarantee: the commit this binary reports is
+	// exactly the revision the toolchain embedded in it, or the honest
+	// placeholder when it embedded none. Never something made up in
+	// between.
 	//
-	// This checks the shape and not a specific revision on purpose. Which
-	// revision Go stamps depends on which repository root its VCS probe
-	// settles on, and that is not always this checkout's HEAD: build inside
-	// a linked worktree nested under the main checkout -- how the agents
-	// working on this repo are set up -- and the probe walks up to the
-	// outer repository and stamps its HEAD instead. Pinning an exact
-	// revision would fail there while proving nothing extra.
-	commit := strings.TrimSuffix(fields["commit"], "+dirty")
-	if !isHexRevision(commit) {
-		t.Errorf("commit = %q, want a hex revision from the embedded VCS data", fields["commit"])
+	// The embedded value is read back out of the binary rather than taken
+	// from git, because whether Go stamps VCS data at all is a property of
+	// the build environment, not of ccvault. `-buildvcs=auto` stamps
+	// nothing when it cannot run its probe -- a linked git worktree, where
+	// every agent working on this repo builds, is one such case, and a
+	// source archive with no .git is another. Asserting that the stamping
+	// happened tests the environment; asserting that the report agrees
+	// with whatever was stamped tests ccvault, and holds in both.
+	wantCommit := embeddedCommit(t, ccvaultBinary(t))
+	if fields["commit"] != wantCommit {
+		t.Errorf("commit = %q, want %q (the revision embedded in the binary)", fields["commit"], wantCommit)
 	}
+
+	// An unstamped build cannot know when it was built. It may name the
+	// commit timestamp for orientation, but the "unknown" has to stay --
+	// a bare date here would read as a build time nobody recorded.
+	if !strings.HasPrefix(fields["built"], "unknown") {
+		t.Errorf("built = %q, want it to begin with %q: an unstamped build has no build date", fields["built"], "unknown")
+	}
+}
+
+// embeddedCommit reports the commit `ccvault version` must print for bin,
+// derived from the VCS settings the Go toolchain embedded in it: the full
+// revision, "+dirty" when the tree was modified, or "unknown" when the build
+// carries no VCS data at all.
+func embeddedCommit(t *testing.T, bin string) string {
+	t.Helper()
+
+	//nolint:gosec // G204: bin is a binary this test just built
+	out, err := exec.Command("go", "version", "-m", bin).CombinedOutput()
+	if err != nil {
+		t.Fatalf("go version -m %s: %v\n%s", bin, err, out)
+	}
+
+	settings := map[string]string{}
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 || fields[0] != "build" {
+			continue
+		}
+		if key, value, found := strings.Cut(fields[1], "="); found {
+			settings[key] = value
+		}
+	}
+
+	revision, ok := settings["vcs.revision"]
+	if !ok {
+		return "unknown"
+	}
+	if !isHexRevision(revision) {
+		t.Fatalf("embedded vcs.revision = %q, which is not a git object name", revision)
+	}
+	if settings["vcs.modified"] == "true" {
+		return revision + "+dirty"
+	}
+	return revision
 }
 
 // isHexRevision reports whether s is a full-length git object name.
