@@ -103,7 +103,7 @@ func TestProjectCRUD(t *testing.T) {
 	}
 
 	// List projects
-	projects, err := db.GetProjects("activity", 10)
+	projects, err := db.GetProjects("activity", 10, 0)
 	if err != nil {
 		t.Fatalf("get projects: %v", err)
 	}
@@ -258,7 +258,7 @@ func TestSessionCRUD(t *testing.T) {
 	}
 
 	// List sessions
-	sessions, err := db.GetSessions(p.ID, 10)
+	sessions, err := db.GetSessions(p.ID, 10, 0)
 	if err != nil {
 		t.Fatalf("get sessions: %v", err)
 	}
@@ -534,7 +534,7 @@ func TestProjectSourceField(t *testing.T) {
 	}
 
 	// Verify source via GetProjects
-	projects, err := db.GetProjects("activity", 10)
+	projects, err := db.GetProjects("activity", 10, 0)
 	if err != nil {
 		t.Fatalf("get projects: %v", err)
 	}
@@ -615,7 +615,7 @@ func TestSessionSourceField(t *testing.T) {
 	}
 
 	// Verify via GetSessions
-	sessions, err := db.GetSessions(p.ID, 10)
+	sessions, err := db.GetSessions(p.ID, 10, 0)
 	if err != nil {
 		t.Fatalf("get sessions: %v", err)
 	}
@@ -1076,11 +1076,11 @@ func TestGetProjects_SortStableTiebreaker(t *testing.T) {
 	}
 
 	// Query twice; results must match exactly.
-	first, err := db.GetProjects("name", 10)
+	first, err := db.GetProjects("name", 10, 0)
 	if err != nil {
 		t.Fatalf("first GetProjects: %v", err)
 	}
-	second, err := db.GetProjects("name", 10)
+	second, err := db.GetProjects("name", 10, 0)
 	if err != nil {
 		t.Fatalf("second GetProjects: %v", err)
 	}
@@ -1100,10 +1100,10 @@ func TestGetProjects_SortStableTiebreaker(t *testing.T) {
 	}
 }
 
-// TestGetProjectsPage_WalksEveryRowWithoutGapsOrRepeats covers the offset
+// TestGetProjects_WalksEveryRowWithoutGapsOrRepeats covers the offset
 // pagination the MCP list_projects tool is built on: consecutive pages must
 // tile the full sorted result set exactly once.
-func TestGetProjectsPage_WalksEveryRowWithoutGapsOrRepeats(t *testing.T) {
+func TestGetProjects_WalksEveryRowWithoutGapsOrRepeats(t *testing.T) {
 	db, cleanup := setupTestDB(t)
 	defer cleanup()
 
@@ -1116,9 +1116,9 @@ func TestGetProjectsPage_WalksEveryRowWithoutGapsOrRepeats(t *testing.T) {
 
 	var walked []string
 	for offset := 0; ; offset += 2 {
-		page, err := db.GetProjectsPage("name", 2, offset)
+		page, err := db.GetProjects("name", 2, offset)
 		if err != nil {
-			t.Fatalf("GetProjectsPage offset %d: %v", offset, err)
+			t.Fatalf("GetProjects offset %d: %v", offset, err)
 		}
 		if len(page) == 0 {
 			break
@@ -1139,9 +1139,9 @@ func TestGetProjectsPage_WalksEveryRowWithoutGapsOrRepeats(t *testing.T) {
 	}
 
 	// An offset with no limit must still skip, not silently return everything.
-	rest, err := db.GetProjectsPage("name", 0, 3)
+	rest, err := db.GetProjects("name", 0, 3)
 	if err != nil {
-		t.Fatalf("GetProjectsPage unlimited: %v", err)
+		t.Fatalf("GetProjects unlimited: %v", err)
 	}
 	if len(rest) != 2 {
 		t.Fatalf("unlimited page from offset 3 = %d rows, want 2", len(rest))
@@ -1151,9 +1151,9 @@ func TestGetProjectsPage_WalksEveryRowWithoutGapsOrRepeats(t *testing.T) {
 	}
 }
 
-// TestGetSessionsPage_WalksEveryRowWithoutGapsOrRepeats is the sessions
+// TestGetSessions_WalksEveryRowWithoutGapsOrRepeats is the sessions
 // counterpart — MCP list_sessions pages through this.
-func TestGetSessionsPage_WalksEveryRowWithoutGapsOrRepeats(t *testing.T) {
+func TestGetSessions_WalksEveryRowWithoutGapsOrRepeats(t *testing.T) {
 	db, cleanup := setupTestDB(t)
 	defer cleanup()
 
@@ -1177,9 +1177,9 @@ func TestGetSessionsPage_WalksEveryRowWithoutGapsOrRepeats(t *testing.T) {
 
 	var walked []string
 	for offset := 0; ; offset += 2 {
-		page, err := db.GetSessionsPage(p.ID, 2, offset)
+		page, err := db.GetSessions(p.ID, 2, offset)
 		if err != nil {
-			t.Fatalf("GetSessionsPage offset %d: %v", offset, err)
+			t.Fatalf("GetSessions offset %d: %v", offset, err)
 		}
 		if len(page) == 0 {
 			break
@@ -1528,25 +1528,25 @@ func TestSessionReadPathsToleratesNullProjectID(t *testing.T) {
 		t.Errorf("GetSessionBySourceFile ProjectID = %d, want 0", byFile.ProjectID)
 	}
 
-	page, err := db.GetSessionsPage(0, 0, 0)
+	page, err := db.GetSessions(0, 0, 0)
 	if err != nil {
-		t.Fatalf("GetSessionsPage with a NULL project_id row present: %v", err)
+		t.Fatalf("GetSessions with a NULL project_id row present: %v", err)
 	}
 	if len(page) != 1 {
-		t.Fatalf("GetSessionsPage returned %d sessions, want 1", len(page))
+		t.Fatalf("GetSessions returned %d sessions, want 1", len(page))
 	}
 	if page[0].ProjectID != 0 {
-		t.Errorf("GetSessionsPage ProjectID = %d, want 0", page[0].ProjectID)
+		t.Errorf("GetSessions ProjectID = %d, want 0", page[0].ProjectID)
 	}
 	if page[0].ProjectPath != "" {
-		t.Errorf("GetSessionsPage ProjectPath = %q, want empty for a session with no project", page[0].ProjectPath)
+		t.Errorf("GetSessions ProjectPath = %q, want empty for a session with no project", page[0].ProjectPath)
 	}
 
 	// Filtering by a real project must not pick up the orphan. Guards the
 	// obvious wrong fix: coalescing NULL to a project id.
-	filtered, err := db.GetSessionsPage(other.ID, 0, 0)
+	filtered, err := db.GetSessions(other.ID, 0, 0)
 	if err != nil {
-		t.Fatalf("GetSessionsPage filtered: %v", err)
+		t.Fatalf("GetSessions filtered: %v", err)
 	}
 	if len(filtered) != 0 {
 		t.Errorf("project %d has %d sessions, want 0 — the orphan was mis-attributed", other.ID, len(filtered))

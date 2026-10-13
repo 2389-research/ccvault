@@ -341,7 +341,7 @@ func (m *SearchModel) View() string {
 			// Load all projects once so adapter DisplayNames surface in
 			// the result rows instead of falling through to basename.
 			// Best-effort — on lookup failure rows degrade to basename.
-			projectsList, projectsErr := m.db.GetProjects("activity", 0)
+			projectsList, projectsErr := m.db.GetProjects("activity", 0, 0)
 			_ = projectsErr
 			byPath := projectref.ProjectsByPath(projectsList)
 

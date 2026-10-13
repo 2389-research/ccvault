@@ -143,14 +143,9 @@ func (db *DB) GetProjectByPath(path string) (*models.Project, error) {
 	return p, nil
 }
 
-// GetProjects retrieves all projects from the start of the sorted set.
-func (db *DB) GetProjects(orderBy string, limit int) ([]models.Project, error) {
-	return db.GetProjectsPage(orderBy, limit, 0)
-}
-
-// GetProjectsPage retrieves one page of projects: up to limit rows
+// GetProjects retrieves one page of projects: up to limit rows
 // (0 means unlimited) starting at offset in the sorted set.
-func (db *DB) GetProjectsPage(orderBy string, limit, offset int) ([]models.Project, error) {
+func (db *DB) GetProjects(orderBy string, limit, offset int) ([]models.Project, error) {
 	// Every sort adds `path ASC` as a tiebreaker so results are stable
 	// across syncs even when the primary key (display_name, timestamp,
 	// count) collides — e.g. multiple projects sharing a basename don't

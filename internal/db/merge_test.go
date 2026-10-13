@@ -550,7 +550,7 @@ func TestMergeFrom_LeavesDestinationUsableAfterFailure(t *testing.T) {
 		t.Errorf("sessions after failed merge = %d, want 1", n)
 	}
 	// And the connection is still usable for ordinary work afterwards.
-	if _, err := dest.GetProjects("activity", 10); err != nil {
+	if _, err := dest.GetProjects("activity", 10, 0); err != nil {
 		t.Errorf("destination unusable after failed merge: %v", err)
 	}
 }

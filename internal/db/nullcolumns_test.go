@@ -104,14 +104,14 @@ func TestSessionReadPathsTolerateNullMetadata(t *testing.T) {
 		cacheReadTokens: byFile.CacheReadTokens, cacheWriteTokens: byFile.CacheWriteTokens,
 	})
 
-	page, err := db.GetSessionsPage(0, 0, 0)
+	page, err := db.GetSessions(0, 0, 0)
 	if err != nil {
-		t.Fatalf("GetSessionsPage with a NULL metadata row present: %v", err)
+		t.Fatalf("GetSessions with a NULL metadata row present: %v", err)
 	}
 	if len(page) != 1 {
-		t.Fatalf("GetSessionsPage returned %d sessions, want 1", len(page))
+		t.Fatalf("GetSessions returned %d sessions, want 1", len(page))
 	}
-	assertNullMetadataReadsAsZero(t, "GetSessionsPage", sessionMetadata{
+	assertNullMetadataReadsAsZero(t, "GetSessions", sessionMetadata{
 		model: page[0].Model, gitBranch: page[0].GitBranch, turnCount: page[0].TurnCount,
 		inputTokens: page[0].InputTokens, outputTokens: page[0].OutputTokens,
 		cacheReadTokens: page[0].CacheReadTokens, cacheWriteTokens: page[0].CacheWriteTokens,

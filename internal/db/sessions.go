@@ -169,7 +169,7 @@ func forgetSupersededSourceFile(w sessionWriter, previousFile, currentFile strin
 //   - `ProjectID > 0` is already the tree-wide test for "has a project"
 //     (cmd/ccvault, internal/tui, internal/mcp, internal/projectref all spell
 //     it that way), so zero-means-absent is the convention already in force.
-//   - GetSessionsPage already LEFT JOINs projects and COALESCEs the path, i.e.
+//   - GetSessions already LEFT JOINs projects and COALESCEs the path, i.e.
 //     this layer was written for sessions with no project from the start. Only
 //     the project_id scan disagreed with the schema.
 //   - A synthetic project row would be counted by GetProjectStats, listed by
@@ -349,19 +349,13 @@ const sessionListSelect = `
 		FROM sessions s
 		LEFT JOIN projects p ON s.project_id = p.id`
 
-// GetSessions retrieves sessions from the start of the sorted set,
-// optionally filtered to one project. Returns parents and subagents alike;
-// listing surfaces that want the hidden-by-default behaviour call
-// QuerySessions with SubagentsHidden.
-func (db *DB) GetSessions(projectID int64, limit int) ([]models.Session, error) {
-	return db.GetSessionsPage(projectID, limit, 0)
-}
-
-// GetSessionsPage retrieves one page of sessions: up to limit rows
-// (0 means unlimited) starting at offset in the sorted set. Unfiltered —
-// analytics and export read through here precisely because subagent sessions
-// must be counted.
-func (db *DB) GetSessionsPage(projectID int64, limit, offset int) ([]models.Session, error) {
+// GetSessions retrieves one page of sessions: up to limit rows (0 means
+// unlimited) starting at offset in the sorted set, optionally filtered to one
+// project. Unfiltered as to scope — it returns parents and subagents alike,
+// which is precisely why analytics and export read through here: subagent
+// sessions must be counted. Listing surfaces that want the hidden-by-default
+// behaviour call QuerySessions with SubagentsHidden.
+func (db *DB) GetSessions(projectID int64, limit, offset int) ([]models.Session, error) {
 	return db.QuerySessions(SessionQuery{
 		ProjectID: projectID,
 		Limit:     limit,

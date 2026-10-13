@@ -74,7 +74,7 @@ func (m *DashboardModel) loadStats() tea.Msg {
 		return ErrorMsg{Err: err}
 	}
 
-	projects, err := m.db.GetProjects("activity", 5)
+	projects, err := m.db.GetProjects("activity", 5, 0)
 	if err != nil {
 		return ErrorMsg{Err: err}
 	}

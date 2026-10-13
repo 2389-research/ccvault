@@ -282,7 +282,7 @@ func gatherOrientation(database *db.DB) orientation {
 	o.TokensByModel, err = database.GetTokensByModel()
 	warn("model stats", err)
 
-	projects, err := database.GetProjects("activity", 5)
+	projects, err := database.GetProjects("activity", 5, 0)
 	warn("recent projects", err)
 	o.RecentProjects = projects
 
@@ -940,7 +940,7 @@ resolved on this machine's own calendar instead.`,
 		// Surface enrichment failures on stderr rather than silently
 		// falling through to basename — agents watching this output need
 		// to know why adapter branding is missing.
-		allProjects, enrichErr := database.GetProjects("activity", 0)
+		allProjects, enrichErr := database.GetProjects("activity", 0, 0)
 		if enrichErr != nil {
 			fmt.Fprintf(os.Stderr, "warning: project enrichment lookup failed: %v — Project labels fell back to basename\n", enrichErr)
 		}
@@ -1270,7 +1270,7 @@ var listProjectsCmd = &cobra.Command{
 		}
 		defer func() { _ = database.Close() }()
 
-		projects, err := database.GetProjects(sortBy, limit)
+		projects, err := database.GetProjects(sortBy, limit, 0)
 		if err != nil {
 			return fmt.Errorf("get projects: %w", err)
 		}
@@ -1478,7 +1478,7 @@ var listSessionsCmd = &cobra.Command{
 				// Fall back to partial match. Class D — return every match
 				// via projectref.ResolveAll rather than silently picking one,
 				// and refuse when ambiguous so the user picks a longer filter.
-				projects, err := database.GetProjects("activity", 0)
+				projects, err := database.GetProjects("activity", 0, 0)
 				if err != nil {
 					return fmt.Errorf("get projects: %w", err)
 				}
@@ -1515,7 +1515,7 @@ var listSessionsCmd = &cobra.Command{
 			enc.SetIndent("", "  ")
 			// Class C — enrich with project_name so agents get the
 			// doctrine {name, path} shape on session objects.
-			allProjects, enrichErr := database.GetProjects("activity", 0)
+			allProjects, enrichErr := database.GetProjects("activity", 0, 0)
 			if enrichErr != nil {
 				fmt.Fprintf(os.Stderr, "warning: project enrichment lookup failed: %v\n", enrichErr)
 			}
@@ -1534,7 +1534,7 @@ var listSessionsCmd = &cobra.Command{
 		// surface in the PROJECT column.
 		var byPath map[string]*models.Project
 		if showProject {
-			allProjects, enrichErr := database.GetProjects("activity", 0)
+			allProjects, enrichErr := database.GetProjects("activity", 0, 0)
 			if enrichErr != nil {
 				fmt.Fprintf(os.Stderr, "warning: project enrichment lookup failed: %v — PROJECT column fell back to basename\n", enrichErr)
 			}

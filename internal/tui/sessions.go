@@ -214,7 +214,7 @@ func (m *SessionsModel) View() string {
 		// matches best-effort TUI rendering (no ok place to raise a
 		// modal here); the failure would separately surface via the
 		// dedicated data-load message paths anyway.
-		projectsList, projectsErr := m.db.GetProjects("activity", 0)
+		projectsList, projectsErr := m.db.GetProjects("activity", 0, 0)
 		_ = projectsErr // best-effort enrichment for column labels only
 		byPath := projectref.ProjectsByPath(projectsList)
 

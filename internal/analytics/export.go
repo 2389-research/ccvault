@@ -92,7 +92,7 @@ func (e *Exporter) exportSessions() error {
 	pw.CompressionType = parquet.CompressionCodec_SNAPPY
 
 	// Get all projects for path lookup
-	projects, err := e.db.GetProjects("", 0)
+	projects, err := e.db.GetProjects("", 0, 0)
 	if err != nil {
 		return fmt.Errorf("get projects: %w", err)
 	}
@@ -102,7 +102,7 @@ func (e *Exporter) exportSessions() error {
 	}
 
 	// Get all sessions
-	sessions, err := e.db.GetSessions(0, 0)
+	sessions, err := e.db.GetSessions(0, 0, 0)
 	if err != nil {
 		return fmt.Errorf("get sessions: %w", err)
 	}
