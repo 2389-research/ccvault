@@ -292,8 +292,8 @@ func TestAnalyzer_GetSessionsBySource(t *testing.T) {
 // COALESCE(source, 'claude-code') clause in the query is aspirational
 // defensive coding — DuckDB errors at bind-time when the column is
 // missing, so the fallback never fires. The real safety net is that
-// callers (TUI) call SessionsParquetHasSource first and rebuild the
-// cache when it returns false; this test guards the "the caller didn't
+// callers (TUI) call SessionsParquetMissingColumns first and rebuild the
+// cache when it names any column; this test guards the "the caller didn't
 // rebuild" behavior so a future regression that silently returns wrong
 // data would be caught.
 func TestAnalyzer_LegacyParquetErrorsCleanlyOnSourceQueries(t *testing.T) {
