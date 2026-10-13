@@ -42,7 +42,7 @@ func (m *ProjectsModel) Init() tea.Cmd {
 }
 
 func (m *ProjectsModel) loadProjects() tea.Msg {
-	projects, err := m.db.GetProjects("activity", 0)
+	projects, err := m.db.GetProjects("activity", 0, 0)
 	if err != nil {
 		return ErrorMsg{Err: err}
 	}

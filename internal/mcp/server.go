@@ -676,7 +676,7 @@ func (s *Server) searchConversations(args map[string]interface{}) (interface{}, 
 	// {name, path} doctrine shape uniformly across MCP surfaces. A failed
 	// lookup leaves every project_name on the basename fallback, so say so
 	// rather than passing the fallback off as the adapter-provided label.
-	allProjects, enrichErr := s.db.GetProjects("activity", 0)
+	allProjects, enrichErr := s.db.GetProjects("activity", 0, 0)
 	if enrichErr != nil {
 		warnings = append(warnings, fmt.Sprintf("project enrichment unavailable: %v (result project_name values fell back to basename)", enrichErr))
 	}
@@ -1331,7 +1331,7 @@ func (s *Server) listSessions(args map[string]interface{}) (interface{}, error) 
 	var projectID int64
 	if projectFilter, ok := args["project"].(string); ok && projectFilter != "" {
 		// Class D — return all matches, don't silently pick one.
-		projects, err := s.db.GetProjects("activity", 0)
+		projects, err := s.db.GetProjects("activity", 0, 0)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get projects: %w", err)
 		}
@@ -1399,7 +1399,7 @@ func (s *Server) listSessions(args map[string]interface{}) (interface{}, error) 
 	// lookup query fails, surface a warning rather than silently falling
 	// back to basename for every session — the agent needs to know why
 	// adapter branding is missing.
-	allProjects, enrichErr := s.db.GetProjects("activity", 0)
+	allProjects, enrichErr := s.db.GetProjects("activity", 0, 0)
 	projectsByID := projectref.ProjectsByID(allProjects)
 
 	response := map[string]interface{}{
@@ -1445,7 +1445,7 @@ func (s *Server) listProjects(args map[string]interface{}) (interface{}, error) 
 	}
 
 	// Fetch one extra row to detect whether more projects exist
-	projects, err := s.db.GetProjectsPage(sortBy, limit+1, offset)
+	projects, err := s.db.GetProjects(sortBy, limit+1, offset)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get projects: %w", err)
 	}
@@ -1663,7 +1663,7 @@ func (s *Server) promptAnalyzeProject(args map[string]interface{}) (promptGetRes
 	}
 
 	// Find project
-	projects, err := s.db.GetProjects("activity", 0)
+	projects, err := s.db.GetProjects("activity", 0, 0)
 	if err != nil {
 		return promptGetResult{}, err
 	}

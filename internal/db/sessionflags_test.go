@@ -53,12 +53,12 @@ func TestSessionReadPathsReturnStoredFlags(t *testing.T) {
 		}
 	}
 
-	page, err := db.GetSessionsPage(p.ID, 0, 0)
+	page, err := db.GetSessions(p.ID, 0, 0)
 	if err != nil {
-		t.Fatalf("GetSessionsPage: %v", err)
+		t.Fatalf("GetSessions: %v", err)
 	}
 	if len(page) != len(want) {
-		t.Fatalf("GetSessionsPage returned %d sessions, want %d", len(page), len(want))
+		t.Fatalf("GetSessions returned %d sessions, want %d", len(page), len(want))
 	}
 	listed := map[string]models.Session{}
 	for _, s := range page {
@@ -68,14 +68,14 @@ func TestSessionReadPathsReturnStoredFlags(t *testing.T) {
 	for _, w := range want {
 		got, ok := listed[w.id]
 		if !ok {
-			t.Errorf("GetSessionsPage: session %s missing", w.id)
+			t.Errorf("GetSessions: session %s missing", w.id)
 			continue
 		}
 		if got.HasError != w.hasError {
-			t.Errorf("GetSessionsPage %s: HasError = %v, want %v", w.id, got.HasError, w.hasError)
+			t.Errorf("GetSessions %s: HasError = %v, want %v", w.id, got.HasError, w.hasError)
 		}
 		if got.HasSubagent != w.hasSubagent {
-			t.Errorf("GetSessionsPage %s: HasSubagent = %v, want %v", w.id, got.HasSubagent, w.hasSubagent)
+			t.Errorf("GetSessions %s: HasSubagent = %v, want %v", w.id, got.HasSubagent, w.hasSubagent)
 		}
 
 		// `show-session --json` serialises GetSession's result straight out of
@@ -115,12 +115,12 @@ func TestSessionFlagsTolerateNull(t *testing.T) {
 		t.Fatalf("insert session with NULL flags: %v", err)
 	}
 
-	page, err := db.GetSessionsPage(0, 0, 0)
+	page, err := db.GetSessions(0, 0, 0)
 	if err != nil {
-		t.Fatalf("GetSessionsPage with NULL flags: %v", err)
+		t.Fatalf("GetSessions with NULL flags: %v", err)
 	}
 	if len(page) != 1 {
-		t.Fatalf("GetSessionsPage returned %d sessions, want 1", len(page))
+		t.Fatalf("GetSessions returned %d sessions, want 1", len(page))
 	}
 	if page[0].HasError || page[0].HasSubagent {
 		t.Errorf("NULL flags read as (%v, %v), want (false, false)", page[0].HasError, page[0].HasSubagent)

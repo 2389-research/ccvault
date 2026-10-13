@@ -282,7 +282,7 @@ func gatherOrientation(database *db.DB) orientation {
 	o.TokensByModel, err = database.GetTokensByModel()
 	warn("model stats", err)
 
-	projects, err := database.GetProjects("activity", 5)
+	projects, err := database.GetProjects("activity", 5, 0)
 	warn("recent projects", err)
 	o.RecentProjects = projects
 
@@ -940,7 +940,7 @@ resolved on this machine's own calendar instead.`,
 		// Surface enrichment failures on stderr rather than silently
 		// falling through to basename — agents watching this output need
 		// to know why adapter branding is missing.
-		allProjects, enrichErr := database.GetProjects("activity", 0)
+		allProjects, enrichErr := database.GetProjects("activity", 0, 0)
 		if enrichErr != nil {
 			fmt.Fprintf(os.Stderr, "warning: project enrichment lookup failed: %v — Project labels fell back to basename\n", enrichErr)
 		}
@@ -1270,7 +1270,7 @@ var listProjectsCmd = &cobra.Command{
 		}
 		defer func() { _ = database.Close() }()
 
-		projects, err := database.GetProjects(sortBy, limit)
+		projects, err := database.GetProjects(sortBy, limit, 0)
 		if err != nil {
 			return fmt.Errorf("get projects: %w", err)
 		}
@@ -1313,10 +1313,13 @@ var listProjectsCmd = &cobra.Command{
 }
 
 // subagentScopeFromFlags maps the list-sessions flags onto a listing scope.
-// The default hides subagent sessions — on a real machine they outnumber
-// top-level sessions roughly 2.6:1 — while every row still reports how many
-// it stands for. --subagents-of beats --include-subagents because asking for
-// one parent's children is the more specific request.
+// The default hides subagent sessions: on disk they outnumber top-level
+// transcripts about 4:1 (237 agent-* files of 296 in ~/.claude/projects on
+// 2026-10-13), which is what a fresh sync captures. The share already in the
+// archive is far smaller — db.SubagentsHidden's comment has both numbers and
+// why they differ. Every row still reports how many subagents it stands for.
+// --subagents-of beats --include-subagents because asking for one parent's
+// children is the more specific request.
 func subagentScopeFromFlags(includeSubagents bool, subagentsOf string) (db.SubagentScope, string) {
 	switch {
 	case subagentsOf != "":
@@ -1478,7 +1481,7 @@ var listSessionsCmd = &cobra.Command{
 				// Fall back to partial match. Class D — return every match
 				// via projectref.ResolveAll rather than silently picking one,
 				// and refuse when ambiguous so the user picks a longer filter.
-				projects, err := database.GetProjects("activity", 0)
+				projects, err := database.GetProjects("activity", 0, 0)
 				if err != nil {
 					return fmt.Errorf("get projects: %w", err)
 				}
@@ -1515,7 +1518,7 @@ var listSessionsCmd = &cobra.Command{
 			enc.SetIndent("", "  ")
 			// Class C — enrich with project_name so agents get the
 			// doctrine {name, path} shape on session objects.
-			allProjects, enrichErr := database.GetProjects("activity", 0)
+			allProjects, enrichErr := database.GetProjects("activity", 0, 0)
 			if enrichErr != nil {
 				fmt.Fprintf(os.Stderr, "warning: project enrichment lookup failed: %v\n", enrichErr)
 			}
@@ -1534,7 +1537,7 @@ var listSessionsCmd = &cobra.Command{
 		// surface in the PROJECT column.
 		var byPath map[string]*models.Project
 		if showProject {
-			allProjects, enrichErr := database.GetProjects("activity", 0)
+			allProjects, enrichErr := database.GetProjects("activity", 0, 0)
 			if enrichErr != nil {
 				fmt.Fprintf(os.Stderr, "warning: project enrichment lookup failed: %v — PROJECT column fell back to basename\n", enrichErr)
 			}

@@ -101,7 +101,7 @@ func TestSearch_FindsSessionWithNoProject(t *testing.T) {
 		t.Fatalf("the projectless session is absent from search results (got %d rows: %v)",
 			len(results), keysOf(bySession))
 	}
-	// The same fallback the session read path uses: GetSessionsPage already
+	// The same fallback the session read path uses: GetSessions already
 	// COALESCEs the joined path to empty, so a consumer reading both surfaces
 	// sees one answer for "no project" rather than two.
 	if orphan.ProjectPath != "" {

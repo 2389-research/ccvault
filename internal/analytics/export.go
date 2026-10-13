@@ -30,16 +30,6 @@ type SessionRecord struct {
 	Source          string `parquet:"name=source, type=BYTE_ARRAY, convertedtype=UTF8"`
 }
 
-// TurnRecord is a Parquet-compatible turn record
-type TurnRecord struct {
-	ID           string `parquet:"name=id, type=BYTE_ARRAY, convertedtype=UTF8"`
-	SessionID    string `parquet:"name=session_id, type=BYTE_ARRAY, convertedtype=UTF8"`
-	Type         string `parquet:"name=type, type=BYTE_ARRAY, convertedtype=UTF8"`
-	Timestamp    int64  `parquet:"name=timestamp, type=INT64, convertedtype=TIMESTAMP_MILLIS"`
-	InputTokens  int32  `parquet:"name=input_tokens, type=INT32"`
-	OutputTokens int32  `parquet:"name=output_tokens, type=INT32"`
-}
-
 // ToolRecord is a Parquet-compatible tool usage record
 type ToolRecord struct {
 	SessionID string `parquet:"name=session_id, type=BYTE_ARRAY, convertedtype=UTF8"`
@@ -102,7 +92,7 @@ func (e *Exporter) exportSessions() error {
 	pw.CompressionType = parquet.CompressionCodec_SNAPPY
 
 	// Get all projects for path lookup
-	projects, err := e.db.GetProjects("", 0)
+	projects, err := e.db.GetProjects("", 0, 0)
 	if err != nil {
 		return fmt.Errorf("get projects: %w", err)
 	}
@@ -112,7 +102,7 @@ func (e *Exporter) exportSessions() error {
 	}
 
 	// Get all sessions
-	sessions, err := e.db.GetSessions(0, 0)
+	sessions, err := e.db.GetSessions(0, 0, 0)
 	if err != nil {
 		return fmt.Errorf("get sessions: %w", err)
 	}

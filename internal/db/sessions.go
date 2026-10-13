@@ -169,7 +169,7 @@ func forgetSupersededSourceFile(w sessionWriter, previousFile, currentFile strin
 //   - `ProjectID > 0` is already the tree-wide test for "has a project"
 //     (cmd/ccvault, internal/tui, internal/mcp, internal/projectref all spell
 //     it that way), so zero-means-absent is the convention already in force.
-//   - GetSessionsPage already LEFT JOINs projects and COALESCEs the path, i.e.
+//   - GetSessions already LEFT JOINs projects and COALESCEs the path, i.e.
 //     this layer was written for sessions with no project from the start. Only
 //     the project_id scan disagreed with the schema.
 //   - A synthetic project row would be counted by GetProjectStats, listed by
@@ -282,9 +282,21 @@ type SubagentScope int
 
 const (
 	// SubagentsHidden is the default for every listing surface: top-level
-	// sessions only. On a real machine subagent transcripts outnumber
-	// top-level ones roughly 2.6:1, so listing them flat turns ~72% of a
-	// session list into agent-* rows.
+	// sessions only. What justifies the default is a measurement of the
+	// transcripts on disk, not of the archive: of the 296 *.jsonl files in
+	// ~/.claude/projects on 2026-10-13, 237 were agent-* sidechains against
+	// 59 top-level ones — 4:1, so a flat listing of a freshly synced machine
+	// is ~80% agent-* rows.
+	//
+	// The archive's own share is much smaller, and both numbers are real.
+	// Subagent ingestion only landed in #31, and Claude Code prunes its own
+	// transcripts, so a sidechain is in the archive only if its file survived
+	// until a sync ran after that. Same date, same machine: 362 subagent
+	// sessions of 47,409 (0.8%) and 46,656 subagent turns of 1,049,544
+	// (4.4%). The disk figure is the forward-looking capture rate; the
+	// archive figure is the historical holding. Quoting one as the other is
+	// the mistake this comment used to invite — "subagents are most of the
+	// data" is false of the archive for any period before 2026-08.
 	//
 	// It also returns any subagent whose parent is NOT in this archive.
 	// Without that, a sidechain ingested without its parent (a pruned
@@ -349,19 +361,13 @@ const sessionListSelect = `
 		FROM sessions s
 		LEFT JOIN projects p ON s.project_id = p.id`
 
-// GetSessions retrieves sessions from the start of the sorted set,
-// optionally filtered to one project. Returns parents and subagents alike;
-// listing surfaces that want the hidden-by-default behaviour call
-// QuerySessions with SubagentsHidden.
-func (db *DB) GetSessions(projectID int64, limit int) ([]models.Session, error) {
-	return db.GetSessionsPage(projectID, limit, 0)
-}
-
-// GetSessionsPage retrieves one page of sessions: up to limit rows
-// (0 means unlimited) starting at offset in the sorted set. Unfiltered —
-// analytics and export read through here precisely because subagent sessions
-// must be counted.
-func (db *DB) GetSessionsPage(projectID int64, limit, offset int) ([]models.Session, error) {
+// GetSessions retrieves one page of sessions: up to limit rows (0 means
+// unlimited) starting at offset in the sorted set, optionally filtered to one
+// project. Unfiltered as to scope — it returns parents and subagents alike,
+// which is precisely why analytics and export read through here: subagent
+// sessions must be counted. Listing surfaces that want the hidden-by-default
+// behaviour call QuerySessions with SubagentsHidden.
+func (db *DB) GetSessions(projectID int64, limit, offset int) ([]models.Session, error) {
 	return db.QuerySessions(SessionQuery{
 		ProjectID: projectID,
 		Limit:     limit,

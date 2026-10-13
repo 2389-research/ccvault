@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/2389-research/ccvault/pkg/models"
 )
@@ -411,97 +410,6 @@ func (db *DB) SearchTurns(query string, limit int) ([]models.Turn, error) {
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scan search result: %w", err)
-		}
-		if parentID.Valid {
-			t.ParentID = parentID.String
-		}
-		if content.Valid {
-			t.Content = content.String
-		}
-		turns = append(turns, t)
-	}
-
-	return turns, rows.Err()
-}
-
-// SearchTurnsWithFilters performs filtered search
-func (db *DB) SearchTurnsWithFilters(textQuery string, projectID int64, model string, toolName string, limit int) ([]models.Turn, error) {
-	if limit <= 0 {
-		limit = 20
-	}
-
-	var conditions []string
-	var args []interface{}
-
-	// Build query based on filters
-	baseQuery := `
-		SELECT DISTINCT t.id, t.session_id, t.parent_id, t.type, t.timestamp, t.ordinal, t.content, t.input_tokens, t.output_tokens
-		FROM turns t
-		JOIN sessions s ON t.session_id = s.id`
-
-	// Join tool_uses if filtering by tool
-	if toolName != "" {
-		baseQuery += ` JOIN tool_uses tu ON t.session_id = tu.session_id`
-		conditions = append(conditions, "tu.tool_name = ?")
-		args = append(args, toolName)
-	}
-
-	// Full-text search
-	if textQuery != "" {
-		baseQuery += ` JOIN turns_fts fts ON t.rowid = fts.rowid`
-		conditions = append(conditions, "turns_fts MATCH ?")
-		args = append(args, contentScoped(textQuery))
-	}
-
-	// Project filter
-	if projectID > 0 {
-		conditions = append(conditions, "s.project_id = ?")
-		args = append(args, projectID)
-	}
-
-	// Model filter
-	if model != "" {
-		conditions = append(conditions, "s.model LIKE ?")
-		args = append(args, "%"+model+"%")
-	}
-
-	// Combine conditions
-	if len(conditions) > 0 {
-		baseQuery += " WHERE " + strings.Join(conditions, " AND ")
-	}
-
-	// Results span sessions, so ordinal is not an ordering key here — a
-	// position only means something inside one session. `t.id` is a
-	// tiebreaker, not a preference: turns that share a timestamp would
-	// otherwise swap places between calls, and a caller paginating the
-	// result would skip and repeat rows.
-	baseQuery += " ORDER BY t.timestamp DESC, t.id ASC LIMIT ?"
-	args = append(args, limit)
-
-	rows, err := db.Query(baseQuery, args...)
-	if err != nil {
-		return nil, fmt.Errorf("search turns with filters: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
-	var turns []models.Turn
-	for rows.Next() {
-		var t models.Turn
-		var parentID sql.NullString
-		var content sql.NullString
-		err := rows.Scan(
-			&t.ID,
-			&t.SessionID,
-			&parentID,
-			&t.Type,
-			&t.Timestamp,
-			&t.Ordinal,
-			&content,
-			&t.InputTokens,
-			&t.OutputTokens,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("scan filtered result: %w", err)
 		}
 		if parentID.Valid {
 			t.ParentID = parentID.String

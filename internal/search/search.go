@@ -264,7 +264,7 @@ func (s *Searcher) buildQuery(q *Query, limit int, periods []string) (string, []
 	// which is the point: the rows this makes visible are ones MergeFrom has
 	// yet to write, and search should not be the one surface that loses them.
 	//
-	// COALESCE on p.path for the same reason GetSessionsPage has one: the
+	// COALESCE on p.path for the same reason GetSessions has one: the
 	// column is NULL for these rows and project_path is scanned into a plain
 	// string, so the join fix without it would turn #65 into #64. Same for
 	// s.model, which is nullable in the schema with no default.
