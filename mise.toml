@@ -2,14 +2,32 @@
 # run means a clean CI run; "latest" on either side guarantees they drift
 # apart. Bumping a version here means bumping it in the workflows too:
 #
-#   golangci-lint  ->  .github/workflows/ci.yml       (Lint job)
-#   goreleaser     ->  .github/workflows/ci.yml       (Release config job)
-#                      .github/workflows/release.yml  (Release (macOS) job)
+#   go             ->  go.mod                          (the `go` directive)
+#                      .github/workflows/ci.yml        (Test job matrix floor)
+#   golangci-lint  ->  .github/workflows/ci.yml        (Lint job)
+#   goreleaser     ->  .github/workflows/ci.yml        (Release config job)
+#                      .github/workflows/release.yml   (Release (macOS) job)
 #
-# golangci-lint's pin also moves with go.mod's Go version: it type-checks with
-# the go/types built into the binary, which rejects any file requiring a newer
-# Go than that. A linter older than the toolchain does not report findings, it
-# panics. Raising `go` in go.mod means checking this version still runs.
+# `go` is pinned to exactly go.mod's directive, not to the newest Go release.
+# Developing on the floor is the point: it is the version CI's floor job
+# compiles with, so a feature newer than the floor fails on the machine that
+# introduced it rather than in CI. Until this pin existed, a contributor's
+# ambient toolchain drifted freely -- local 1.26.3 against a declared 1.25.5 --
+# which is how #119 happened.
+#
+# `go`, `golangci-lint` and go.mod's `go` directive are one coupled set, and
+# the coupling has a direction. golangci-lint type-checks with the go/types
+# built into its own binary, and that copy refuses any module targeting a newer
+# Go than it was built with: 2.11.4 is built with go1.26.1, so a go.mod
+# directive of 1.27 stops it dead. Older linters panicked outright rather than
+# saying so, which is how #119 presented.
+#
+# So the order to move them in is: pick a golangci-lint whose build Go is at
+# least the Go you want, then raise go.mod's directive, then raise `go` here
+# and the matrix floor in ci.yml to match. Check with `golangci-lint version`
+# -- it prints the Go it was built with -- and re-run `golangci-lint run ./...`
+# before pushing.
 [tools]
+go = "1.25.5"
 golangci-lint = "2.11.4"
 goreleaser = "2.18.2"

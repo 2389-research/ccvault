@@ -66,6 +66,12 @@ jobs:
         # only version this project claims to build on. `stable` runs beside
         # it as forward warning: it catches a new Go release breaking the
         # build before a contributor on current Go hits it.
+        #
+        # This number is one of three that must agree -- go.mod's directive,
+        # mise.toml's `go` pin, and this floor -- and it is not free to move on
+        # its own: go.mod's directive is capped by the Go version the pinned
+        # golangci-lint was built with. mise.toml documents the order to move
+        # the set in; #98 is where raising the floor gets argued.
         go-version: ['1.25.5', 'stable']
     steps:
       - name: Check out code
@@ -101,12 +107,18 @@ jobs:
 
       # Coverage comes from the floor job: one upload, from the version the
       # project supports rather than whatever `stable` happens to be.
+      #
+      # Selected by excluding `stable` rather than by naming the floor, so
+      # raising go.mod's Go version cannot silently switch coverage off here by
+      # leaving a stale literal behind. A third pinned entry in the matrix
+      # would give two uploads, which is loud; a stale literal gives none,
+      # which is not.
       - name: Run tests with coverage
-        if: matrix.go-version == '1.25.5'
+        if: matrix.go-version != 'stable'
         run: make test-coverage
 
       - name: Upload coverage to Codecov
-        if: matrix.go-version == '1.25.5'
+        if: matrix.go-version != 'stable'
         uses: codecov/codecov-action@v4
         with:
           file: ./coverage.out
@@ -149,6 +161,17 @@ jobs:
           # runner's Go happened to match it, while contributors on current Go
           # could not lint at all. It also reported gosec G602 on bounds it
           # could not prove, which cost a round-trip on #118.
+          #
+          # v2.11.4 is built with go1.26.1 (`golangci-lint version` prints the
+          # Go it was built with), so it is also the ceiling on go.mod's `go`
+          # directive. Measured, at `go 1.27.0`, this step fails with:
+          #
+          #   can't load config: the Go language version (go1.26) used to
+          #   build golangci-lint is lower than the targeted Go version
+          #   (1.27.0)
+          #
+          # Clearer than the old panic, still a hard stop. Raising the floor
+          # past 1.26 means raising this pin first.
           version: v2.11.4
           args: --timeout=10m
           verify: false
