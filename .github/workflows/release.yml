@@ -27,7 +27,28 @@ env:
 jobs:
   release-darwin:
     name: Release (macOS)
-    runs-on: macos-latest
+    # Pinned image, not `macos-latest`, for the same reason release-linux is:
+    # goreleaser builds this job's artifacts with CGO_ENABLED=1, so the runner
+    # image's clang and SDKs decide which macOS versions the binaries we
+    # publish will run on, and a floating label lets an image major change
+    # that with no commit from this repo -- on a tag, where it is most
+    # expensive to discover.
+    #
+    # #133 held this back from the earlier pinning pass for a good reason: the
+    # label could not be verified without cutting a tag, and a wrong label
+    # breaks the release outright where floating currently works. That is now
+    # answered rather than guessed at. ci.yml's `Build (macOS)` job runs on
+    # this same label on every pull request and performs the same cgo build
+    # for both darwin arches, so the label is exercised continuously, and the
+    # first PR carrying this pin is itself the proof.
+    #
+    # `macos-26` is the arm64 macOS 26 image, which is what `macos-latest`
+    # already resolved to for the v0.3.0 release, so this freezes the current
+    # image rather than changing it. `macos-26-arm64` is that image's *name*
+    # in actions/runner-images, not a usable label -- the arm64 labels are
+    # `macos-latest`, `macos-26` and `macos-26-xlarge`. Keep this in step with
+    # ci.yml's macOS job, and move both on a PR.
+    runs-on: macos-26
     steps:
       - name: Checkout code
         uses: actions/checkout@v7

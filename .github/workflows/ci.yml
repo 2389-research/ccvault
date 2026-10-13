@@ -309,3 +309,63 @@ jobs:
           name: ccvault-linux-amd64
           path: ccvault
           retention-days: 7
+
+  build-darwin:
+    name: Build (macOS)
+    # This job exists to make `release-darwin` verifiable. That job builds the
+    # released macOS binaries with CGO_ENABLED=1 and runs only on a tag, so
+    # until now the runner image it compiles against was first observed after
+    # the tag was pushed -- which is why #133 argued its `macos-latest` could
+    # not safely be pinned: choosing a label meant guessing one for a job
+    # nobody could exercise.
+    #
+    # Pinned to the same label `release-darwin` now uses, and triggered by
+    # `pull_request` like the rest of this file, so the label and the cgo
+    # toolchain behind it are proven on a PR instead of on a tag. If GitHub
+    # retires `macos-26`, this job fails here first.
+    #
+    # `macos-26` is the arm64 macOS 26 image, which is what `macos-latest`
+    # already resolved to for the v0.3.0 release -- so, like the ubuntu-24.04
+    # pins, this freezes the current image rather than changing it. Note that
+    # `macos-26-arm64` is the image *name* in actions/runner-images and not a
+    # usable label; the arm64 labels are `macos-latest`, `macos-26` and
+    # `macos-26-xlarge`. Pinning to the image name would have failed outright.
+    runs-on: macos-26
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Report the runner image
+        run: |
+          sw_vers
+          uname -m
+          cc --version
+
+      # Mirrors .goreleaser.yml's `ccvault` build: CGO_ENABLED=1, the
+      # sqlite_omit_load_extension tag, and both darwin arches. amd64 on an
+      # arm64 runner is a cgo cross-compile that leans on the SDKs the runner
+      # image ships, so it is the half most exposed to an image change and the
+      # half worth compiling here. Packaging is left to goreleaser; this job
+      # is about whether the code compiles on this image, which is what a
+      # runner-image major puts at risk.
+      - name: Build both darwin arches the release builds
+        env:
+          CGO_ENABLED: '1'
+        run: |
+          for arch in arm64 amd64; do
+            echo "::group::darwin/$arch"
+            GOARCH="$arch" go build -tags sqlite_omit_load_extension \
+              -o "ccvault-darwin-$arch" ./cmd/ccvault
+            echo "::endgroup::"
+          done
+          file ccvault-darwin-arm64 ccvault-darwin-amd64
+
+      # Only the native build can be executed on this runner.
+      - name: Verify the native binary runs
+        run: ./ccvault-darwin-arm64 --help
