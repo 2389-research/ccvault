@@ -209,7 +209,7 @@ Measured: 2,000 stranded documents in a 235,101-turn archive read as zero
 orphans while FTS5 called the index malformed.
 
 ```bash
-ccvault stats --strict   # FTS5's own integrity-check on every search index
+ccvault stats --strict   # FTS5's own integrity-check, plus the timestamp-layout count
 ```
 
 That is the only thing that returns a verdict. It is opt-in because it
@@ -217,6 +217,15 @@ re-tokenizes the archive — about 60% of the cost of a full rebuild, so a coupl
 of seconds on a million turns — and it exits non-zero if any index fails, so a
 script or an agent cannot read a pass off a failing run. Repair with
 `ccvault sync --full`.
+
+`--strict` also counts how many values in the archive's `DATETIME` columns are
+outside the layout ccvault writes (RFC3339, UTC, nine fraction digits). That
+layout is load-bearing: `ORDER BY`, `MIN()`/`MAX()` and the date filter all
+compare the stored text, and the generated `search_period` column slices the
+calendar date out of it by character position, so a value in a different shape
+sorts and indexes wherever its bytes land. Such a value is still readable, and
+an import could legitimately carry one, so this is reported rather than
+refused — it does not change the exit code.
 
 ### Running an older ccvault against a newer archive
 
