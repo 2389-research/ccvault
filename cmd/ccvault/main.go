@@ -384,11 +384,13 @@ func printIntegritySection(f db.FTSIntegrity, strictRan bool) {
 	if f.Missing() > 0 {
 		fmt.Printf("  Unindexed:     %d turns that search cannot reach\n", f.Missing())
 	}
-	// --full, not --rebuild. Both repair the index, but --rebuild wipes the
-	// archive first and destroys every session whose source file is gone,
-	// which is a steep price for a search index that a non-destructive
-	// re-parse rebuilds on its way past. See Syncer.repairSearchIndex.
-	fmt.Println("  Repair the index with 'ccvault sync --full'.")
+	// repair-index, not sync --full. #135: the index is an FTS5
+	// external-content table, so it is a pure function of the turns table and
+	// rebuilding it reads nothing off disk — 22 seconds on a 1,049,544-turn
+	// archive, against a re-parse of ~47,000 transcripts for the same result.
+	// Pointing a user at the most expensive available option makes them put
+	// the repair off, and an unrepaired index is what blocks a migration.
+	fmt.Println("  Repair the index with 'ccvault repair-index'.")
 	fmt.Println()
 }
 
@@ -433,7 +435,7 @@ func printStrictSection(r db.FTSStrictReport) {
 		fmt.Printf("  %-16s MALFORMED: %v\n", res.Table, res.Err)
 	}
 	if !r.OK() {
-		fmt.Println("  Repair the index with 'ccvault sync --full'.")
+		fmt.Println("  Repair the index with 'ccvault repair-index'.")
 	}
 	fmt.Println()
 }
@@ -1277,7 +1279,7 @@ Requirements and caveats:
     it refuses rather than compacting a database someone else is writing to.
   - Whole-file rewrite. On a multi-gigabyte archive, expect tens of seconds.
   - A sound search index. A copy whose index fails FTS5's own check is
-    discarded rather than swapped in; repair with 'ccvault sync --full'.
+    discarded rather than swapped in; repair with 'ccvault repair-index'.
 
 Run 'ccvault stats' to see how much there is to reclaim before committing.
 Use --json for machine-readable output.`,
@@ -1871,6 +1873,123 @@ var buildCacheCmd = &cobra.Command{
 	},
 }
 
+var repairIndexCmd = &cobra.Command{
+	Use:   "repair-index",
+	Short: "Rebuild the search indexes from the archive's own rows",
+	Long: `Rebuild every full-text search index from the tables it is derived from,
+then report FTS5's own verdict on the result.
+
+This is the repair for a malformed index, and it is the whole repair. The
+indexes are FTS5 external-content tables, so each one is a pure function of
+the table it indexes — rebuilding reads nothing outside the database and
+changes nothing but the index. 'ccvault sync --full' also rebuilds them, but
+it re-reads every transcript on disk to do it: tens of thousands of files, to
+repair a structure derived entirely from rows already here.
+
+Measured on a 1,049,544-turn archive whose index held 136,279 stranded
+documents: 22 seconds, and the strict check clean afterwards.
+
+It runs no migrations, deliberately. An index malformed badly enough aborts
+migration 012, which ends in FTS5's integrity-check — and because every other
+command migrates the archive as it opens it, the damage otherwise stands in
+front of its own repair.
+
+Exits non-zero if an index is still malformed after the rebuild. That means
+the damage is not in the index, and the content tables themselves need
+re-reading with 'ccvault sync --full'.
+
+Run 'ccvault stats --strict' for the verdict without the rebuild.`,
+	Args:         cobra.NoArgs,
+	SilenceUsage: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		asJSON, _ := cmd.Flags().GetBool("json")
+
+		cfg, err := loadConfig(cmd)
+		if err != nil {
+			return fmt.Errorf("load config: %w", err)
+		}
+		return runRepairIndex(cfg.DataDir, asJSON)
+	},
+}
+
+// runRepairIndex rebuilds every search index in the archive at dataDir and
+// reports FTS5's verdict on the result.
+//
+// Verdict after repair, not instead of it. `sqlite3` exits 0 when an FTS
+// integrity-check fails — the error goes to stderr while the status stays
+// clean — which is how a repair can look like it worked. A rebuild that left
+// the index malformed has to be a failed command, because at that point the
+// damage is in the content table and the user needs to know the cheap repair
+// was not enough.
+func runRepairIndex(dataDir string, asJSON bool) error {
+	database, err := db.OpenForRepair(dataDir)
+	if err != nil {
+		return nameTheBinary(err)
+	}
+	defer func() { _ = database.Close() }()
+
+	results, err := database.RebuildFTSIndexes()
+	if err != nil {
+		return fmt.Errorf("rebuild the search indexes: %w", err)
+	}
+
+	report, err := database.CheckFTSStrict()
+	if err != nil {
+		return fmt.Errorf("run the strict search-index check: %w", err)
+	}
+
+	if asJSON {
+		rebuilt := make([]map[string]interface{}, 0, len(results))
+		for _, r := range results {
+			rebuilt = append(rebuilt, map[string]interface{}{
+				"table":       r.Table,
+				"seconds":     r.Took.Seconds(),
+				"duration_ms": r.Took.Milliseconds(),
+			})
+		}
+		out, marshalErr := json.MarshalIndent(map[string]interface{}{
+			"archive":      database.Path(),
+			"rebuilt":      rebuilt,
+			"strict_check": strictJSON(report),
+		}, "", "  ")
+		if marshalErr != nil {
+			return fmt.Errorf("marshal repair report: %w", marshalErr)
+		}
+		fmt.Println(string(out))
+		return repairVerdict(report)
+	}
+
+	fmt.Printf("Rebuilt the search indexes in %s\n", database.Path())
+	for _, r := range results {
+		fmt.Printf("  %-16s rebuilt in %s\n", r.Table, r.Took.Round(time.Millisecond))
+	}
+	fmt.Println()
+	fmt.Println("Search index (strict):")
+	for _, res := range report.Results() {
+		if res.Err == nil {
+			fmt.Printf("  %-16s ok\n", res.Table)
+			continue
+		}
+		fmt.Printf("  %-16s MALFORMED: %v\n", res.Table, res.Err)
+	}
+	fmt.Println()
+
+	return repairVerdict(report)
+}
+
+// repairVerdict turns an index that survived its own rebuild into a non-zero
+// exit, and names the escalation rather than repeating the advice the user
+// just took.
+func repairVerdict(report db.FTSStrictReport) error {
+	if report.OK() {
+		return nil
+	}
+	return fmt.Errorf(
+		"%s still fails FTS5's strict integrity-check after a full rebuild, "+
+			"so the damage is not in the index: re-read the transcripts with 'ccvault sync --full'",
+		strings.Join(report.Malformed(), ", "))
+}
+
 var importCmd = &cobra.Command{
 	Use:     "import <database-path>",
 	Aliases: []string{"merge"},
@@ -1964,6 +2083,7 @@ func init() {
 	rootCmd.AddCommand(exportCmd)
 	rootCmd.AddCommand(mcpCmd)
 	rootCmd.AddCommand(buildCacheCmd)
+	rootCmd.AddCommand(repairIndexCmd)
 	rootCmd.AddCommand(importCmd)
 
 	// Orient flags
@@ -1986,6 +2106,9 @@ func init() {
 	syncCmd.Flags().Bool("no-backup", false, "Skip the pre-wipe SQLite backup when running --rebuild (dangerous)")
 	syncCmd.Flags().BoolP("verbose", "v", false, "Show verbose output")
 	syncCmd.Flags().String("source", "", "Sync only the configured source with this name (matches sources[].name from config)")
+
+	// Repair-index flags
+	repairIndexCmd.Flags().Bool("json", false, "Output the rebuild timings and the strict verdict as JSON")
 
 	// Import flags
 	importCmd.Flags().Bool("json", false, "Output merge counts as JSON")

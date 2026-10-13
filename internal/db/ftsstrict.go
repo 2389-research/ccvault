@@ -14,10 +14,26 @@ import (
 )
 
 // ftsRepairAdvice names the one repair for a malformed index, in the spelling
-// the user has to type. `sync --full` re-parses every transcript and rebuilds
-// the index on the way past; `sync --rebuild` would also fix it and wipes the
-// archive first, which is a steep price for a search index.
-const ftsRepairAdvice = "repair the index with 'ccvault sync --full'"
+// the user has to type.
+//
+// It used to say `ccvault sync --full`, which re-parses every transcript and
+// rebuilds the index on the way past — on the author's archive that is ~47,000
+// files read from disk to repair a structure derived entirely from rows
+// already in the database. #135: the repair that actually fixed the live
+// archive was FTS5's own 'rebuild', measured at 22 seconds against 1,049,544
+// turns. Pointing a user at the most expensive available option makes them put
+// the repair off, and an unrepaired index is the state that blocks a
+// migration.
+const ftsRepairAdvice = "repair the index with 'ccvault repair-index'"
+
+// errNoFTSIndexes is what both the strict check and the rebuild say when the
+// archive holds no full-text index at all. Neither may report success in that
+// state: a check that inspected nothing passes on every file ever handed to
+// it, and a repair that rebuilt nothing leaves the user believing a broken
+// index was fixed.
+var errNoFTSIndexes = errors.New(
+	"no fts5 indexes found, so there was nothing to check: this is not a ccvault archive, " +
+		"or its search indexes have been dropped")
 
 // FTSTableResult is one index's verdict.
 type FTSTableResult struct {
@@ -135,9 +151,7 @@ func strictFTSCheck(ctx context.Context, q sqlRunner) (FTSStrictReport, error) {
 		return FTSStrictReport{}, err
 	}
 	if len(tables) == 0 {
-		return FTSStrictReport{}, errors.New(
-			"no fts5 indexes found, so there was nothing to check: this is not a ccvault archive, " +
-				"or its search indexes have been dropped")
+		return FTSStrictReport{}, errNoFTSIndexes
 	}
 
 	report := FTSStrictReport{results: make([]FTSTableResult, 0, len(tables))}

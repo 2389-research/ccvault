@@ -183,7 +183,7 @@ func TestCheckFTSStrict_NamesTheRepair(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run strict check: %v", err)
 	}
-	if !strings.Contains(report.Err().Error(), "sync --full") {
+	if !strings.Contains(report.Err().Error(), "repair-index") {
 		t.Errorf("failure does not name the repair: %v", report.Err())
 	}
 }

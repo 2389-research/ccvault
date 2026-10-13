@@ -105,6 +105,7 @@ type archiveAccess int
 const (
 	accessReadWrite archiveAccess = iota
 	accessRead
+	accessRepair
 )
 
 // Open opens or creates the ccvault database for reading and writing.
@@ -132,6 +133,40 @@ func OpenForRead(dataDir string) (*DB, error) {
 	return open(dataDir, accessRead)
 }
 
+// OpenForRepair opens an existing archive to rebuild its search indexes, and
+// runs no migrations on the way in.
+//
+// Skipping migrations is the whole point, and it is #135's bootstrapping case.
+// Migration 012 ends in FTS5's own integrity-check, so an index malformed
+// badly enough aborts it — and because every other open path runs migrations
+// first, the damage blocks the one command that could repair it. That is what
+// happened to the live archive on 2026-10-13: there was no in-tool path at
+// all, and the fix had to be typed into raw sqlite3.
+//
+// What makes it safe to repair an archive this binary has not migrated: an
+// FTS5 external-content index is a pure function of the content table as that
+// table stands right now. 'rebuild' re-tokenizes whatever columns the index
+// was declared over, in the database's own current schema, and writes nothing
+// outside the index. It does not need to know which migration the archive is
+// on, because it reads the archive's answer rather than this binary's.
+//
+// Two refusals still apply, and they are the ones that matter. An archive
+// written by a newer ccvault is refused exactly as Open refuses it: a rebuild
+// is a write, and #105's rule does not get an exception for being a small
+// write. An archive that is not there is refused rather than created, so a
+// mistyped --data-dir cannot be answered with a clean verdict over an empty
+// file this command just made.
+func OpenForRepair(dataDir string) (*DB, error) {
+	dbPath := filepath.Join(dataDir, dbFileName)
+	if _, err := os.Stat(dbPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("no archive at %s, so there are no search indexes to repair", dbPath)
+		}
+		return nil, fmt.Errorf("stat archive: %w", err)
+	}
+	return open(dataDir, accessRepair)
+}
+
 func open(dataDir string, access archiveAccess) (*DB, error) {
 	// Ensure data directory exists
 	if err := os.MkdirAll(dataDir, 0o750); err != nil {
@@ -149,7 +184,7 @@ func open(dataDir string, access archiveAccess) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	if tooNew != nil && access == accessReadWrite {
+	if tooNew != nil && access != accessRead {
 		return nil, tooNew
 	}
 
@@ -184,6 +219,13 @@ func open(dataDir string, access archiveAccess) (*DB, error) {
 		// are skipped, which costs nothing — a binary that has never heard of
 		// the archive's migrations has none to apply.
 		db.schemaWarning = tooNew.Warning()
+		return db, nil
+	}
+
+	if access == accessRepair {
+		// Deliberately before init(). The repair exists for the archive whose
+		// damage is what stops a migration from applying; running migrations
+		// on the way in would put the blockage back in front of the fix.
 		return db, nil
 	}
 

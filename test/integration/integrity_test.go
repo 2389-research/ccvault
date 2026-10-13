@@ -159,7 +159,7 @@ func TestCLI_StatsStrictIsOptInAndSeesAMalformedIndex(t *testing.T) {
 	if !strings.Contains(said, "turns_fts") {
 		t.Errorf("stats --strict does not name the index that failed:\n%s", said)
 	}
-	if !strings.Contains(said, "sync --full") {
+	if !strings.Contains(said, "repair-index") {
 		t.Errorf("stats --strict does not name the repair:\n%s", said)
 	}
 
@@ -201,12 +201,14 @@ func TestCLI_VacuumRefusesToSwapAMalformedCopy(t *testing.T) {
 	if !strings.Contains(said, "turns_fts") {
 		t.Errorf("vacuum does not name the index that failed:\n%s", said)
 	}
-	if !strings.Contains(said, "sync --full") {
+	if !strings.Contains(said, "repair-index") {
 		t.Errorf("vacuum does not name the repair:\n%s", said)
 	}
 
-	// The repair it names has to actually unblock it.
-	f.Run(t, "sync", "--full")
+	// The repair it names has to actually unblock it. #135: that used to be a
+	// re-parse of every transcript; it is now the rebuild the index is
+	// derivable from.
+	f.Run(t, "repair-index")
 	if r := f.TryRun(t, "vacuum"); r.Err != nil {
 		t.Errorf("vacuum still refused after the repair it told the user to run: %v\n%s%s",
 			r.Err, r.Stdout, r.Stderr)

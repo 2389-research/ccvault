@@ -461,18 +461,18 @@ func TestPrintIntegritySection(t *testing.T) {
 			name:      "a healthy index reports its size and nothing else",
 			integrity: db.FTSIntegrity{Turns: 4200, Indexed: 4200},
 			wantLines: []string{"Search index:", "4200 of 4200 turns"},
-			omitLines: []string{"Orphaned", "Unindexed", "sync --full"},
+			omitLines: []string{"Orphaned", "Unindexed", "repair-index"},
 		},
 		{
 			name:      "ghost entries are named and the repair is spelled out",
 			integrity: db.FTSIntegrity{Turns: 4200, Indexed: 4203, Orphaned: 3},
-			wantLines: []string{"Orphaned:", "3 entries", "ccvault sync --full"},
+			wantLines: []string{"Orphaned:", "3 entries", "ccvault repair-index"},
 			omitLines: []string{"Unindexed"},
 		},
 		{
 			name:      "turns the index never got are named too",
 			integrity: db.FTSIntegrity{Turns: 4200, Indexed: 4190},
-			wantLines: []string{"Unindexed:", "10 turns", "ccvault sync --full"},
+			wantLines: []string{"Unindexed:", "10 turns", "ccvault repair-index"},
 			omitLines: []string{"Orphaned"},
 		},
 		{
