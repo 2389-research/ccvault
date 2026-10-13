@@ -1063,8 +1063,9 @@ func topCountsByName(counts map[string]int) []map[string]interface{} {
 // failedToolsByTurn groups a session's failed calls by the turn that issued
 // them, so a response can label each turn with what broke in it.
 //
-// Reads the stored is_error column through db.GetFailedToolCalls rather than
-// re-deriving the flag from raw_json, and that is the whole point of the
+// Reads the stored is_error column through the db package's failed-call
+// readers rather than re-deriving the flag from raw_json, and that is the
+// whole point of the
 // column. readTurnEnrichment above fails on 216,978 of the author's turns
 // (#101) and reports nothing on any source whose raw shape has no top-level
 // message key (#100); a failure flag recovered by the backfill or written by
@@ -1336,29 +1337,34 @@ func (s *Server) getTurns(args map[string]interface{}) (interface{}, error) {
 		turns = turns[:limit]
 	}
 
-	// Which calls failed, read once for the session rather than per turn.
-	// One indexed query against idx_tool_uses_is_error costs less than fifty
-	// lookups, and a page shows at most fifty turns.
-	failures, err := s.db.GetFailedToolCalls(sessionID)
+	// The two tool_uses reads this page needs, both scoped to the turns it is
+	// about to render and no others. Scoped rather than session-wide because
+	// the session is the wrong unit for a page: either read used to cost what
+	// the whole session's rows cost, however few turns it was labelling (#141
+	// for the names, #157 for the failures).
+	//
+	// Failures are asked about every turn on the page and tool names only
+	// about the assistant ones. tools labels assistant turns alone, so asking
+	// about a user turn would be asking a question whose answer is never
+	// rendered — while failed_tools is set on whatever turn owns the failing
+	// call, and narrowing that to assistant turns would turn a stored row
+	// hanging off some other turn type into a label that silently vanished.
+	pageTurnIDs := make([]string, 0, len(turns))
+	assistantTurnIDs := make([]string, 0, len(turns))
+	for _, t := range turns {
+		pageTurnIDs = append(pageTurnIDs, t.ID)
+		if t.Type == "assistant" {
+			assistantTurnIDs = append(assistantTurnIDs, t.ID)
+		}
+	}
+
+	failures, err := s.db.GetFailedToolCallsForTurns(sessionID, pageTurnIDs)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get failed tool calls: %w", err)
 	}
 	failedTools := failedToolsByTurn(failures)
 
-	// What each turn called, read for the turns this page is about to render
-	// and no others. Only assistant turns are labelled, so only those are
-	// asked about — and a page of nothing but user turns asks nothing.
-	//
-	// Scoped rather than session-wide because the session is the wrong unit
-	// for a page: the read used to cost what the whole session's tool calls
-	// cost, however few rows it was labelling (#141).
-	pageTurnIDs := make([]string, 0, len(turns))
-	for _, t := range turns {
-		if t.Type == "assistant" {
-			pageTurnIDs = append(pageTurnIDs, t.ID)
-		}
-	}
-	storedTools, err := s.db.ToolNamesForTurns(sessionID, pageTurnIDs)
+	storedTools, err := s.db.ToolNamesForTurns(sessionID, assistantTurnIDs)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get tool calls: %w", err)
 	}

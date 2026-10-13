@@ -250,3 +250,63 @@ func mustToolNames(tb testing.TB, database *DB, query string) map[string][]strin
 	}
 	return byTurn
 }
+
+// markTenPercentFailed flips is_error on roughly a tenth of a bench session's
+// calls, which is the archive's real rate: the worst session holds 196
+// failures across 1,871 calls.
+func markTenPercentFailed(tb testing.TB, database *DB, sessionID string) int {
+	tb.Helper()
+	if _, err := database.Exec(
+		`UPDATE tool_uses SET is_error = 1 WHERE session_id = ? AND id % 10 = 0`, sessionID); err != nil {
+		tb.Fatalf("mark failed calls: %v", err)
+	}
+	var failures int
+	if err := database.QueryRow(
+		`SELECT count(*) FROM tool_uses WHERE session_id = ? AND is_error = 1`, sessionID).Scan(&failures); err != nil {
+		tb.Fatalf("count failed calls: %v", err)
+	}
+	if failures == 0 {
+		tb.Fatal("no call was marked failed, so the failed-call benchmark would measure nothing")
+	}
+	return failures
+}
+
+// BenchmarkFailedToolCallReadForOnePage measures #157's first half: get_turns
+// labels each turn with what broke in it, and read the whole session's
+// failures to label one 50-turn page.
+func BenchmarkFailedToolCallReadForOnePage(b *testing.B) {
+	for _, sc := range benchSessions {
+		database, err := Open(b.TempDir())
+		if err != nil {
+			b.Fatalf("open db: %v", err)
+		}
+		ids := buildToolHeavySession(b, database, "bench-session", sc.turns, sc.calls)
+		markTenPercentFailed(b, database, "bench-session")
+		page := ids[:50]
+
+		b.Run("session_wide/"+sc.name, func(b *testing.B) {
+			rows := 0
+			for i := 0; i < b.N; i++ {
+				failures, err := database.GetFailedToolCalls("bench-session")
+				if err != nil {
+					b.Fatal(err)
+				}
+				rows = len(failures)
+			}
+			b.ReportMetric(float64(rows), "rows/op")
+		})
+		b.Run("page_bounded/"+sc.name, func(b *testing.B) {
+			rows := 0
+			for i := 0; i < b.N; i++ {
+				failures, err := database.GetFailedToolCallsForTurns("bench-session", page)
+				if err != nil {
+					b.Fatal(err)
+				}
+				rows = len(failures)
+			}
+			b.ReportMetric(float64(rows), "rows/op")
+		})
+
+		_ = database.Close()
+	}
+}

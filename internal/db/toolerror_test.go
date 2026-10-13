@@ -652,3 +652,145 @@ func TestIsErrorAgreesWithSessionHasError(t *testing.T) {
 		t.Errorf("%d sessions hold a failed call but are not flagged has_error", mismatched)
 	}
 }
+
+// markEveryTurnsFirstCallFailed flips is_error on the first call of every turn
+// in a session. An UPDATE rather than a re-insert because InsertToolUses
+// numbers a turn's calls by their position in the batch and replaces whatever
+// holds that position — so seeding a turn's failing call separately would
+// renumber the turn's other calls on top of themselves. is_error is not one of
+// the columns tool_uses_au watches, so nothing in FTS has to be reasoned about
+// either.
+func markEveryTurnsFirstCallFailed(t *testing.T, database *DB, sessionID string) {
+	t.Helper()
+	res, err := database.Exec(
+		`UPDATE tool_uses SET is_error = 1 WHERE session_id = ? AND turn_ordinal = 0`, sessionID)
+	if err != nil {
+		t.Fatalf("mark failing calls: %v", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		t.Fatalf("rows affected: %v", err)
+	}
+	if n == 0 {
+		t.Fatal("no call was marked failed, so nothing below would be testing the failed-call reader")
+	}
+}
+
+// TestGetFailedToolCallsForTurns_ReadsOnlyTheTurnsAsked covers #157's first
+// half. get_turns calls the failed-call reader once per invocation to label a
+// page, and the session-wide form read every failure in the session however
+// few turns the page held — the same shape #141 fixed for the tool names, and
+// it needed this signature to exist before it could be fixed.
+//
+// Every row the query returns is one failure, so the failures in the result
+// are the rows it read: a page of two turns must come back with two, not the
+// session's six.
+func TestGetFailedToolCallsForTurns_ReadsOnlyTheTurnsAsked(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ids := seedToolCallTurns(t, database, "session-f", 6, 3)
+	markEveryTurnsFirstCallFailed(t, database, "session-f")
+
+	page := ids[:2]
+	onPage := map[string]bool{page[0]: true, page[1]: true}
+
+	got, err := database.GetFailedToolCallsForTurns("session-f", page)
+	if err != nil {
+		t.Fatalf("GetFailedToolCallsForTurns: %v", err)
+	}
+	for _, f := range got {
+		if !onPage[f.TurnID] {
+			t.Errorf("read a failure of turn %s, which is not on the page", f.TurnID)
+		}
+	}
+	if len(got) != len(page) {
+		t.Errorf("read %d failures to label a %d-turn page, want %d (#157)", len(got), len(page), len(page))
+	}
+
+	// The session-wide reader is still the right answer for a caller counting
+	// the whole session, and still sees all six.
+	all, err := database.GetFailedToolCalls("session-f")
+	if err != nil {
+		t.Fatalf("GetFailedToolCalls: %v", err)
+	}
+	if len(all) != len(ids) {
+		t.Errorf("the session-wide reader found %d failures, want %d", len(all), len(ids))
+	}
+}
+
+// TestGetFailedToolCallsForTurns_NoTurnsReadsNothing pins the empty case, for
+// the same reason the tool-name reader has one: `turn_id IN ()` is not valid
+// SQL, so a page with no turns must not build the query at all. Returns an
+// empty slice rather than an error, as the session-wide reader does for a
+// session that broke nothing — the callers branch on length.
+func TestGetFailedToolCallsForTurns_NoTurnsReadsNothing(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	seedToolCallTurns(t, database, "session-f", 3, 2)
+	markEveryTurnsFirstCallFailed(t, database, "session-f")
+
+	got, err := database.GetFailedToolCallsForTurns("session-f", nil)
+	if err != nil {
+		t.Fatalf("GetFailedToolCallsForTurns with no turns: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("an empty page read %d failures", len(got))
+	}
+}
+
+// TestGetFailedToolCallsForTurns_IssueOrder pins the order both readers
+// promise: by turn, then by the call's position in it.
+func TestGetFailedToolCallsForTurns_IssueOrder(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ids := seedToolCallTurns(t, database, "session-f", 1, 3)
+	if _, err := database.Exec(
+		`UPDATE tool_uses SET is_error = 1 WHERE session_id = 'session-f'`); err != nil {
+		t.Fatalf("mark every call failed: %v", err)
+	}
+
+	got, err := database.GetFailedToolCallsForTurns("session-f", ids)
+	if err != nil {
+		t.Fatalf("GetFailedToolCallsForTurns: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("got %d failures, want 3: %+v", len(got), got)
+	}
+	for i, f := range got {
+		if f.TurnOrdinal != i {
+			t.Errorf("failure %d has TurnOrdinal %d, want %d — the issue order is gone", i, f.TurnOrdinal, i)
+		}
+	}
+}
+
+// TestGetFailedToolCallsForTurns_PlanSeeksPerTurn pins what naming the turns
+// buys: the seek narrows from "this session's failures" to "this turn's
+// failures", once per turn on the page.
+//
+// The ORDER BY's last term still needs a temp B-tree, because
+// idx_tool_uses_is_error carries session_id and turn_id but not turn_ordinal.
+// That sort is left in place deliberately: it now spans one page's failures
+// rather than the session's, and the archive's worst session holds 196
+// failures in total. Sorting them in Go instead would move the same work, not
+// remove it. The seek is the half that scaled with the session.
+func TestGetFailedToolCallsForTurns_PlanSeeksPerTurn(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ids := seedToolCallTurns(t, database, "session-f", 6, 3)
+	markEveryTurnsFirstCallFailed(t, database, "session-f")
+	page := ids[:2]
+
+	plan := toolUsesQueryPlan(t, database, failedToolCallsForTurnsSQL(len(page)),
+		turnIDArgs("session-f", page)...)
+	if !strings.Contains(plan, "idx_tool_uses_is_error") {
+		t.Errorf("page-bounded failed-call read does not use the partial index:\n%s", plan)
+	}
+	if !strings.Contains(plan, "turn_id=?") {
+		t.Errorf("page-bounded failed-call read still seeks by session alone, so it reads every "+
+			"failure in the session (#157):\n%s", plan)
+	}
+}
