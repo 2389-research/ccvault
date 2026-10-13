@@ -33,6 +33,7 @@ type Server struct {
 	analyzerErr error
 	build       buildinfo.Report
 	debug       bool
+	in          io.Reader // stdin by default; overridable for tests
 	out         io.Writer // stdout by default; overridable for tests
 }
 
@@ -54,6 +55,7 @@ func NewServer(database *db.DB, cfg *config.Config, build buildinfo.Report) (*Se
 		analyzerErr: analyzerErr,
 		build:       build,
 		debug:       os.Getenv("CCVAULT_MCP_DEBUG") == "1",
+		in:          os.Stdin,
 		out:         os.Stdout,
 	}, nil
 }
@@ -191,10 +193,12 @@ type promptGetResult struct {
 	Messages    []promptMessage `json:"messages"`
 }
 
-// Run starts the MCP server on stdio
+// Run starts the MCP server, reading newline-delimited JSON-RPC from its
+// input stream and writing replies to its output stream. It returns when
+// the input reaches EOF, which is how a client shuts the server down.
 func (s *Server) Run() error {
 	s.log("Starting MCP server")
-	reader := bufio.NewReader(os.Stdin)
+	reader := bufio.NewReader(s.input())
 
 	for {
 		line, err := reader.ReadBytes('\n')
@@ -203,20 +207,43 @@ func (s *Server) Run() error {
 				s.log("EOF received, shutting down")
 				return nil
 			}
-			return fmt.Errorf("read stdin: %w", err)
+			return fmt.Errorf("read input: %w", err)
 		}
 
-		s.log("Received: %s", strings.TrimSpace(string(line)))
-
-		var req jsonRPCRequest
-		if err := json.Unmarshal(line, &req); err != nil {
-			s.log("Parse error: %v", err)
-			s.sendError(nil, -32700, "Parse error", err.Error())
-			continue
-		}
-
-		s.handleRequest(&req)
+		s.handleLine(line)
 	}
+}
+
+// input is the stream Run reads requests from.
+//
+// os.Stdin unless a caller supplied one, which is what makes the whole
+// read → dispatch → write path reachable from a test: the write side has
+// been injectable as s.out for some time, and the asymmetry (#128) was why
+// every protocol-level test had to build and spawn a binary to say anything
+// about it. Nil rather than a required constructor argument so the Servers
+// assembled field-by-field in tests keep working unchanged.
+func (s *Server) input() io.Reader {
+	if s.in == nil {
+		return os.Stdin
+	}
+	return s.in
+}
+
+// handleLine parses one newline-delimited frame and dispatches it. A frame
+// that is not JSON is answered with a parse error and the loop goes on to
+// the next one: a client that garbles a frame has to be able to recover by
+// sending another.
+func (s *Server) handleLine(line []byte) {
+	s.log("Received: %s", strings.TrimSpace(string(line)))
+
+	var req jsonRPCRequest
+	if err := json.Unmarshal(line, &req); err != nil {
+		s.log("Parse error: %v", err)
+		s.sendError(nil, -32700, "Parse error", err.Error())
+		return
+	}
+
+	s.handleRequest(&req)
 }
 
 func (s *Server) handleRequest(req *jsonRPCRequest) {
