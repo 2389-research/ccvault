@@ -202,6 +202,15 @@ func (s *Server) Run() error {
 
 	for {
 		line, err := reader.ReadBytes('\n')
+
+		// Dispatch before acting on the error. ReadBytes returns the bytes
+		// it managed to read alongside io.EOF, so a client that writes one
+		// request and closes the pipe without a trailing newline delivers
+		// its frame this way — and returning on the error first read that
+		// frame and threw it away, leaving the client waiting on a reply
+		// that would never come.
+		s.handleLine(line)
+
 		if err != nil {
 			if err == io.EOF {
 				s.log("EOF received, shutting down")
@@ -209,8 +218,6 @@ func (s *Server) Run() error {
 			}
 			return fmt.Errorf("read input: %w", err)
 		}
-
-		s.handleLine(line)
 	}
 }
 
@@ -233,7 +240,16 @@ func (s *Server) input() io.Reader {
 // that is not JSON is answered with a parse error and the loop goes on to
 // the next one: a client that garbles a frame has to be able to recover by
 // sending another.
+//
+// Whitespace-only input is not a frame and is ignored. A blank line carries
+// no message, so there is no request to answer and no id to answer it with;
+// a -32700 with a null id would report a failure where nothing failed. It
+// is also what the reader hands back at a clean EOF.
 func (s *Server) handleLine(line []byte) {
+	if len(strings.TrimSpace(string(line))) == 0 {
+		return
+	}
+
 	s.log("Received: %s", strings.TrimSpace(string(line)))
 
 	var req jsonRPCRequest

@@ -107,3 +107,36 @@ func TestRun_UnknownMethodWithAnIDGetsMethodNotFound(t *testing.T) {
 		t.Errorf("response = %#v, want a -32601 method-not-found", responses[0])
 	}
 }
+
+// TestRun_AnswersARequestThatArrivesWithoutATrailingNewline is the partial
+// read #128 names. bufio.Reader returns the bytes it managed to read
+// *alongside* io.EOF, so a client that writes one request and closes the
+// pipe without a trailing newline had its request read and then thrown
+// away. Silence leaves that client waiting on a reply that will never come.
+func TestRun_AnswersARequestThatArrivesWithoutATrailingNewline(t *testing.T) {
+	responses := runServerOver(t, &Server{},
+		`{"jsonrpc":"2.0","id":5,"method":"ping"}`)
+
+	if len(responses) != 1 {
+		t.Fatalf("got %d responses, want the ping reply: %#v", len(responses), responses)
+	}
+	if id, ok := responses[0].ID.(float64); !ok || id != 5 {
+		t.Errorf("response id = %#v, want 5", responses[0].ID)
+	}
+}
+
+// TestRun_IgnoresBlankLines pins that a stray newline is not a frame. A
+// blank line carries no message, so there is no request to answer and no
+// id to answer it with; replying -32700 with a null id to it tells a client
+// something went wrong when nothing did.
+func TestRun_IgnoresBlankLines(t *testing.T) {
+	responses := runServerOver(t, &Server{}, "\n   \n"+
+		`{"jsonrpc":"2.0","id":6,"method":"ping"}`+"\n\n")
+
+	if len(responses) != 1 {
+		t.Fatalf("got %d responses, want only the ping reply: %#v", len(responses), responses)
+	}
+	if id, ok := responses[0].ID.(float64); !ok || id != 6 {
+		t.Errorf("response id = %#v, want 6", responses[0].ID)
+	}
+}
