@@ -366,23 +366,37 @@ Three persistent flags are available on every command:
 `--data-dir` also **replaces** the config search path, so `~/.ccvault` is not
 read at all when it is given.
 
-The two flags are deliberately **independent**: `--data-dir` redirects the
-archive, not the source it is built from, because relocating the archive while
-still indexing the real transcripts is the common case. A run isolated from
-the user's real data needs both:
+**`--data-dir` alone is enough to isolate a run.** When it is given and nothing
+says where conversations come from, the source tree is inferred as
+`<data-dir>/claude` rather than falling through to the real `~/.claude`:
 
 ```bash
 mkdir -p /tmp/fixture/claude
-ccvault --data-dir /tmp/fixture --claude-home /tmp/fixture/claude sync
+ccvault --data-dir /tmp/fixture sync        # reads /tmp/fixture/claude
 ccvault --data-dir /tmp/fixture stats --json
 ```
 
+Naming a source turns the inference off, which is how you relocate the archive
+while still indexing the real transcripts:
+
+```bash
+ccvault --data-dir /mnt/big --claude-home ~/.claude sync
+```
+
+`claude_home` or a `[[sources]]` list in the config file does the same. A
+*durable* relocation — `CCVAULT_DATA_DIR`, or `data_dir` in the config file —
+infers nothing and keeps reading the real source; only the ad-hoc flag, the
+form a test or sandbox types, implies isolation.
+
+If the inferred tree does not exist, `sync` refuses and names it, rather than
+exiting 0 having indexed nothing.
+
 `--claude-home` also **replaces** any `[[sources]]` list the config file
 declares, collapsing it to the single claude-code tree named on the flag. A
-partial override would leave a configured source pointing at the real
-transcript directory, which is the hole the flag exists to close. A config
-file that declares both `claude_home` and `[[sources]]` is hand-authored and
-keeps its list — only the flag and `CCVAULT_CLAUDE_HOME` replace it.
+partial override would leave a configured source pointing at a tree you did
+not name, which is the hole the flag exists to close. A config file that
+declares both `claude_home` and `[[sources]]` is hand-authored and keeps its
+list — only the flag and `CCVAULT_CLAUDE_HOME` replace it.
 
 `--config` names a single file instead of searching for one, and a path that
 does not exist is an error rather than a silent fall-back to defaults. Given

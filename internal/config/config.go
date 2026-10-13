@@ -18,7 +18,21 @@ type SourceConfig struct {
 	Name string `mapstructure:"name"`
 	Type string `mapstructure:"type"`
 	Path string `mapstructure:"path"`
+
+	// Implied marks a source nobody asked for: --data-dir was given, the
+	// configuration said nothing about where to read conversations from, and
+	// the path was inferred from the archive directory. Never read from a
+	// config file — it is a fact about how this Config was resolved.
+	//
+	// Consumers use it to tell "the tree you named is missing" (the user's
+	// problem) from "I guessed at a tree and guessed wrong" (ours, and worth
+	// a different message). See internal/sync.
+	Implied bool `mapstructure:"-"`
 }
+
+// ImpliedClaudeHomeDir is the subdirectory of the archive that --data-dir
+// infers as its source tree when nothing says otherwise.
+const ImpliedClaudeHomeDir = "claude"
 
 // Config holds all ccvault configuration
 type Config struct {
@@ -61,10 +75,16 @@ const ClaudeHomeEnvVar = "CCVAULT_CLAUDE_HOME"
 // file says. ClaudeHome is where conversations are read from, and it wins
 // the same way.
 //
-// DataDir and ClaudeHome are independent on purpose: relocating the archive
-// while still indexing the real transcripts is the common case, so --data-dir
-// does not imply a scratch claude home. Isolating a run from the user's real
-// data takes both.
+// The two are not independent. DataDir is the ad-hoc, per-invocation way to
+// relocate the archive — the form a test, an agent or a sandbox types — and
+// passing it has always been understood to mean "stay away from my real
+// data". So a DataDir given with nothing said about where to read
+// conversations from infers its source tree from the archive instead of
+// falling through to the user's real ~/.claude. Naming a source explicitly
+// (ClaudeHome, CCVAULT_CLAUDE_HOME, claude_home or sources in the config
+// file) switches that off, which is how the archive gets relocated while the
+// real transcripts are still indexed. A durable relocation via
+// CCVAULT_DATA_DIR or the config file's data_dir infers nothing.
 type Options struct {
 	// ConfigFile is the one file to read. When set, no directory is
 	// searched and a missing file is an error rather than a fallback.
@@ -149,6 +169,14 @@ func LoadWith(opts Options) (*Config, error) {
 	if opts.DataDir != "" {
 		v.Set("data_dir", opts.DataDir)
 	}
+
+	// Decided before claude_home is overridden, because the question is
+	// whether ANYTHING answered "where do I read conversations from" —
+	// and after that Set the answer would always look like yes.
+	implied := impliedClaudeHome(v, opts)
+	if implied != "" {
+		v.Set("claude_home", implied)
+	}
 	if opts.ClaudeHome != "" {
 		v.Set("claude_home", opts.ClaudeHome)
 	}
@@ -160,11 +188,45 @@ func LoadWith(opts Options) (*Config, error) {
 
 	// Done after defaults so it overwrites a synthesized source as well as a
 	// declared one.
-	if opts.ClaudeHome != "" || os.Getenv(ClaudeHomeEnvVar) != "" {
+	switch {
+	case implied != "":
+		applyExplicitClaudeHome(cfg)
+		cfg.Sources[0].Implied = true
+	case opts.ClaudeHome != "" || os.Getenv(ClaudeHomeEnvVar) != "":
 		applyExplicitClaudeHome(cfg)
 	}
 
 	return cfg, nil
+}
+
+// impliedClaudeHome returns the source tree to infer from the archive
+// directory, or "" when the configuration already answers where conversations
+// come from.
+//
+// This is the safety default behind #68. --data-dir exists so a test or an
+// agent can drive ccvault against a scratch archive, and everyone who passes
+// it believes that means isolated — but claude_home used to fall through to
+// the real ~/.claude, so a `sync` read every transcript on the machine. An
+// opt-in flag alone would only protect the people who remember it, leaving
+// the trap armed for anyone who passes one flag and not the other.
+//
+// The inference is deliberately narrow. It needs the --data-dir FLAG, not
+// CCVAULT_DATA_DIR or a config file's data_dir: the flag is the ad-hoc form a
+// sandbox types, while the other two are durable relocations whose owners
+// mean to keep indexing the real source. And it needs the configuration to
+// have said nothing at all — neither claude_home nor a sources list, in the
+// file or the environment — because any of those IS the answer to the
+// question being inferred.
+func impliedClaudeHome(v *viper.Viper, opts Options) string {
+	switch {
+	case opts.DataDir == "":
+		return ""
+	case opts.ClaudeHome != "", os.Getenv(ClaudeHomeEnvVar) != "":
+		return ""
+	case v.InConfig("claude_home"), v.InConfig("sources"):
+		return ""
+	}
+	return filepath.Join(opts.DataDir, ImpliedClaudeHomeDir)
 }
 
 // applyExplicitClaudeHome collapses the source list to the single claude-code

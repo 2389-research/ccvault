@@ -245,8 +245,8 @@ func TestLoadWith_ClaudeHomePrecedence(t *testing.T) {
 		}
 	})
 
-	t.Run("default when nothing set", func(t *testing.T) {
-		cfg, err := LoadWith(Options{DataDir: t.TempDir()})
+	t.Run("default when nothing set and nothing relocated", func(t *testing.T) {
+		cfg, err := LoadWith(Options{})
 		if err != nil {
 			t.Fatalf("LoadWith: %v", err)
 		}
@@ -314,19 +314,171 @@ func TestLoadWith_ConfigFileClaudeHomeKeepsItsOwnSources(t *testing.T) {
 	}
 }
 
-// The decision recorded: --data-dir redirects the archive only. It does NOT
-// imply a scratch claude_home, because the common real use is relocating the
-// archive while still indexing the real transcripts. --claude-home is the
-// separate knob for the other half.
-func TestLoadWith_DataDirDoesNotImplyScratchClaudeHome(t *testing.T) {
+// The property that matters, stated as bluntly as possible: there is no way
+// to pass --data-dir and end up reading the real ~/.claude by accident. It
+// takes saying so.
+func TestLoadWith_DataDirNeverSilentlyReachesTheRealClaudeHome(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	real := filepath.Join(home, ".claude")
 
-	cfg, err := LoadWith(Options{DataDir: t.TempDir()})
+	for _, name := range []string{"no config file", "empty config file", "config file setting only data_dir"} {
+		t.Run(name, func(t *testing.T) {
+			fixture := t.TempDir()
+			switch name {
+			case "empty config file":
+				writeConfig(t, fixture, "")
+			case "config file setting only data_dir":
+				writeConfig(t, fixture, "data_dir = \"/elsewhere\"\n")
+			}
+
+			cfg, err := LoadWith(Options{DataDir: fixture})
+			if err != nil {
+				t.Fatalf("LoadWith: %v", err)
+			}
+			if cfg.ClaudeHome == real {
+				t.Errorf("claude_home resolved to the real %q", real)
+			}
+			for _, s := range cfg.Sources {
+				if s.Path == real {
+					t.Errorf("source %q points at the real %q", s.Name, real)
+				}
+			}
+		})
+	}
+}
+
+// --- --data-dir implies an isolated claude home (#68) ---
+
+// The safety default. --data-dir is the ad-hoc, per-invocation form of
+// relocating the archive — the one tests, agents and sandboxes type — and
+// every agent on this repo was told to pass it to stay away from real data.
+// So when it is given and the configuration says NOTHING about where to read
+// conversations from, the source tree is inferred from the archive rather
+// than left pointing at the user's real ~/.claude.
+func TestLoadWith_DataDirImpliesAnIsolatedClaudeHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	fixture := t.TempDir()
+
+	cfg, err := LoadWith(Options{DataDir: fixture})
 	if err != nil {
 		t.Fatalf("LoadWith: %v", err)
 	}
-	if cfg.ClaudeHome != filepath.Join(home, ".claude") {
-		t.Errorf("claude_home = %q, want the default; --data-dir must not move it", cfg.ClaudeHome)
+
+	want := filepath.Join(fixture, "claude")
+	if cfg.ClaudeHome != want {
+		t.Errorf("claude_home = %q, want the inferred %q", cfg.ClaudeHome, want)
 	}
+	if cfg.ClaudeHome == filepath.Join(home, ".claude") {
+		t.Error("--data-dir alone still resolved claude_home to the real ~/.claude")
+	}
+	if len(cfg.Sources) != 1 || cfg.Sources[0].Path != want {
+		t.Fatalf("sources should follow the inferred claude home, got %+v", cfg.Sources)
+	}
+	if !cfg.Sources[0].Implied {
+		t.Error("an inferred source must be marked Implied so sync can explain itself when the tree is absent")
+	}
+}
+
+// The escape hatch for the case that motivated keeping the two flags
+// independent: relocating the archive while still indexing the real source.
+// Saying so explicitly — on the flag, in the environment, or in the config
+// file — switches the implication off.
+func TestLoadWith_SayingWhereToReadDisablesTheImplication(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	t.Run("--claude-home", func(t *testing.T) {
+		cfg, err := LoadWith(Options{DataDir: t.TempDir(), ClaudeHome: "/named/on/the/flag"})
+		if err != nil {
+			t.Fatalf("LoadWith: %v", err)
+		}
+		if cfg.ClaudeHome != "/named/on/the/flag" {
+			t.Errorf("claude_home = %q, want the flag value", cfg.ClaudeHome)
+		}
+		if cfg.Sources[0].Implied {
+			t.Error("a claude home named on the flag is not implied")
+		}
+	})
+
+	t.Run("CCVAULT_CLAUDE_HOME", func(t *testing.T) {
+		t.Setenv("CCVAULT_CLAUDE_HOME", "/named/in/the/env")
+		cfg, err := LoadWith(Options{DataDir: t.TempDir()})
+		if err != nil {
+			t.Fatalf("LoadWith: %v", err)
+		}
+		if cfg.ClaudeHome != "/named/in/the/env" {
+			t.Errorf("claude_home = %q, want the env value", cfg.ClaudeHome)
+		}
+		if cfg.Sources[0].Implied {
+			t.Error("a claude home named in the environment is not implied")
+		}
+	})
+
+	t.Run("claude_home in the config file", func(t *testing.T) {
+		fixture := t.TempDir()
+		writeConfig(t, fixture, "claude_home = \"/named/in/the/file\"\n")
+		cfg, err := LoadWith(Options{DataDir: fixture})
+		if err != nil {
+			t.Fatalf("LoadWith: %v", err)
+		}
+		if cfg.ClaudeHome != "/named/in/the/file" {
+			t.Errorf("claude_home = %q, want the config-file value", cfg.ClaudeHome)
+		}
+		if cfg.Sources[0].Implied {
+			t.Error("a claude home named in the config file is not implied")
+		}
+	})
+
+	t.Run("a sources list in the config file", func(t *testing.T) {
+		fixture := t.TempDir()
+		writeConfig(t, fixture, "[[sources]]\nname = \"a\"\ntype = \"claude-code\"\npath = \"/declared/source\"\n")
+		cfg, err := LoadWith(Options{DataDir: fixture})
+		if err != nil {
+			t.Fatalf("LoadWith: %v", err)
+		}
+		if len(cfg.Sources) != 1 || cfg.Sources[0].Path != "/declared/source" {
+			t.Fatalf("a declared sources list answers the question and must survive, got %+v", cfg.Sources)
+		}
+		if cfg.Sources[0].Implied {
+			t.Error("a declared source is not implied")
+		}
+	})
+}
+
+// A durable relocation of the archive — config file or environment, not the
+// ad-hoc flag — keeps the historical behaviour of reading the real source.
+// That is the use the two independent flags were argued for, and it is
+// untouched.
+func TestLoadWith_DurableDataDirRelocationStillReadsTheRealSource(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	t.Run("bare Load", func(t *testing.T) {
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.ClaudeHome != filepath.Join(home, ".claude") {
+			t.Errorf("claude_home = %q, want the default", cfg.ClaudeHome)
+		}
+		if cfg.Sources[0].Implied {
+			t.Error("the default source is not implied; nothing was relocated")
+		}
+	})
+
+	t.Run("CCVAULT_DATA_DIR", func(t *testing.T) {
+		t.Setenv("CCVAULT_DATA_DIR", filepath.Join(home, "env-archive"))
+		cfg, err := LoadWith(Options{})
+		if err != nil {
+			t.Fatalf("LoadWith: %v", err)
+		}
+		if cfg.ClaudeHome != filepath.Join(home, ".claude") {
+			t.Errorf("claude_home = %q, want the default; the env form is a durable relocation", cfg.ClaudeHome)
+		}
+		if cfg.Sources[0].Implied {
+			t.Error("CCVAULT_DATA_DIR must not imply a source")
+		}
+	})
 }

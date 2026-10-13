@@ -63,21 +63,24 @@ make the whole CLI runnable against a throwaway archive:
   ccvault --data-dir /tmp/fixture sync
   ccvault --data-dir /tmp/fixture stats --json
 
---data-dir redirects the archive, not the source it reads, and the two are
-deliberately independent: relocating the archive while still indexing the
-real transcripts is the common case. --claude-home redirects the source,
-with the same precedence chain:
+Conversations are read from claude_home, resolved the same way:
 
   --claude-home <path>  this flag
   CCVAULT_CLAUDE_HOME   environment
   claude_home = "..."   the config file
   ~/.claude             built-in default
 
-An isolated run needs both. --claude-home also REPLACES any [[sources]]
-list the config file declares, so no source is left pointing at the real
-transcript tree:
+Passing --data-dir with NOTHING said about claude_home infers the source
+tree as <data-dir>/claude rather than falling through to ~/.claude, so one
+flag is enough to keep a run away from real conversation files. Name a
+source to turn that off — which is how you relocate the archive while
+still indexing the real transcripts:
 
-  ccvault --data-dir /tmp/fixture --claude-home /tmp/fixture/claude sync`,
+  ccvault --data-dir /tmp/fixture sync                      # reads /tmp/fixture/claude
+  ccvault --data-dir /mnt/big --claude-home ~/.claude sync  # reads the real tree
+
+--claude-home also REPLACES any [[sources]] list the config file declares,
+so no source is left pointing at a tree you did not name.`,
 }
 
 // loadConfig reads configuration honouring the root command's persistent
@@ -1963,11 +1966,10 @@ func init() {
 		"Data directory holding the archive. Overrides CCVAULT_DATA_DIR, the config file, and the ~/.ccvault default, and makes this directory the only place config.toml is looked for")
 	rootCmd.PersistentFlags().String("config", "",
 		"Config file to read (default: config.toml in the data directory, then ./config.toml). A path that does not exist is an error")
-	// Independent of --data-dir on purpose: the archive and the source it is
-	// built from are different things, and relocating one should not move the
-	// other. Isolating a run from the user's real data takes both.
+	// Naming a source is also how you turn OFF the inference --data-dir
+	// makes when nothing names one; see config.impliedClaudeHome.
 	rootCmd.PersistentFlags().String("claude-home", "",
-		"Claude Code directory to read conversations from. Overrides CCVAULT_CLAUDE_HOME, the config file, and the ~/.claude default, and replaces any [[sources]] list with this one tree")
+		"Claude Code directory to read conversations from. Overrides CCVAULT_CLAUDE_HOME, the config file, and the ~/.claude default, and replaces any [[sources]] list with this one tree. Without it, --data-dir infers <data-dir>/claude rather than reading ~/.claude")
 
 	// Add commands
 	rootCmd.AddCommand(versionCmd)

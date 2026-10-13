@@ -447,49 +447,85 @@ func TestCLI_MissingConfigFileIsAnError(t *testing.T) {
 
 // --- claude_home isolation (#68) ---
 
-// The isolation gap --claude-home closes, driven through the real binary.
+// The isolation #68 is about, driven through the real binary.
 //
-// With no config.toml anywhere, claude_home falls back to $HOME/.claude — so
-// a --data-dir-only run reads the user's real transcripts even though its
-// archive is a throwaway. The fixture plants a stand-in $HOME/.claude to show
-// that happening, then shows --claude-home redirecting the read.
-func TestCLI_ClaudeHomeRedirectsTheSourceTree(t *testing.T) {
+// A stand-in $HOME/.claude plays the user's real transcripts. With the
+// fixture's config.toml removed, nothing says where to read from — the exact
+// situation in which claude_home used to fall through to that directory and
+// a "throwaway" run indexed every real conversation on the machine.
+func TestCLI_DataDirAloneNeverReadsTheDefaultClaudeHome(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds the binary")
 	}
 	f := newCLIFixture(t)
 
-	// Remove the fixture's config so claude_home resolves to its default.
 	if err := os.Remove(filepath.Join(f.DataDir, "config.toml")); err != nil {
 		t.Fatalf("remove fixture config: %v", err)
 	}
 	standInRealHome := filepath.Join(f.Home, ".claude")
 	f.AddSession(t, standInRealHome, "-Users-test-real", "cccccccc-cccc-cccc-cccc-cccccccccccc", "would be the users real transcript")
 
-	t.Run("--data-dir alone still reads the default claude home", func(t *testing.T) {
+	t.Run("an absent inferred tree is a refusal naming the way out", func(t *testing.T) {
+		r := f.TryRun(t, "sync")
+		if r.Err == nil {
+			t.Fatalf("sync should refuse rather than read the default claude home:\n%s", r.Stdout)
+		}
+		for _, want := range []string{filepath.Join(f.DataDir, "claude"), "--claude-home"} {
+			if !strings.Contains(r.Stderr, want) {
+				t.Errorf("refusal should mention %q, got:\n%s", want, r.Stderr)
+			}
+		}
+	})
+
+	t.Run("the inferred tree is what gets scanned when it exists", func(t *testing.T) {
+		f.AddSession(t, filepath.Join(f.DataDir, "claude"), "-Users-test-inferred", "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "inferred tree transcript")
+
 		f.Run(t, "sync")
-		hit := f.Run(t, "search", "would be the users real transcript")
-		if !strings.Contains(hit.Stdout, "Found 1 results") {
-			t.Fatalf("precondition failed: expected the default claude home to be scanned:\n%s", hit.Stdout)
+
+		inferred := f.Run(t, "search", "inferred tree transcript")
+		if !strings.Contains(inferred.Stdout, "Found 1 results") {
+			t.Errorf("the inferred tree was not scanned:\n%s", inferred.Stdout)
 		}
-	})
-
-	t.Run("--claude-home scans only the named tree", func(t *testing.T) {
-		scratchDataDir := filepath.Join(f.Home, "isolated-archive")
-		scratchClaude := filepath.Join(f.Home, "isolated-claude")
-		f.AddSession(t, scratchClaude, "-Users-test-isolated", "ffffffff-ffff-ffff-ffff-ffffffffffff", "isolated fixture transcript")
-
-		f.RunIn(t, scratchDataDir, "--claude-home", scratchClaude, "sync")
-
-		isolated := f.RunIn(t, scratchDataDir, "--claude-home", scratchClaude, "search", "isolated fixture transcript")
-		if !strings.Contains(isolated.Stdout, "Found 1 results") {
-			t.Errorf("the named claude home was not scanned:\n%s", isolated.Stdout)
-		}
-		real := f.RunIn(t, scratchDataDir, "--claude-home", scratchClaude, "search", "would be the users real transcript")
+		real := f.Run(t, "search", "would be the users real transcript")
 		if !strings.Contains(real.Stdout, "No results found") {
-			t.Errorf("--claude-home did not keep the default claude home out of the archive:\n%s", real.Stdout)
+			t.Errorf("the default claude home reached the archive anyway:\n%s", real.Stdout)
 		}
 	})
+
+	t.Run("--claude-home ~/.claude is how you opt back in", func(t *testing.T) {
+		scratchDataDir := filepath.Join(f.Home, "relocated-archive")
+
+		f.RunIn(t, scratchDataDir, "--claude-home", standInRealHome, "sync")
+
+		hit := f.RunIn(t, scratchDataDir, "--claude-home", standInRealHome, "search", "would be the users real transcript")
+		if !strings.Contains(hit.Stdout, "Found 1 results") {
+			t.Errorf("naming the default tree explicitly should read it:\n%s", hit.Stdout)
+		}
+	})
+}
+
+// --claude-home redirects the read to a tree that is neither the default nor
+// the one inferred from --data-dir.
+func TestCLI_ClaudeHomeRedirectsTheSourceTree(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds the binary")
+	}
+	f := newCLIFixture(t)
+
+	scratchClaude := filepath.Join(f.Home, "isolated-claude")
+	f.AddSession(t, scratchClaude, "-Users-test-isolated", "ffffffff-ffff-ffff-ffff-ffffffffffff", "isolated fixture transcript")
+
+	f.Run(t, "--claude-home", scratchClaude, "sync")
+
+	isolated := f.Run(t, "--claude-home", scratchClaude, "search", "isolated fixture transcript")
+	if !strings.Contains(isolated.Stdout, "Found 1 results") {
+		t.Errorf("the named claude home was not scanned:\n%s", isolated.Stdout)
+	}
+	// The fixture's own config.toml names a different tree; the flag outranks it.
+	fixtureHit := f.Run(t, "--claude-home", scratchClaude, "search", "fixture session one")
+	if !strings.Contains(fixtureHit.Stdout, "No results found") {
+		t.Errorf("--claude-home lost to the config file's claude_home:\n%s", fixtureHit.Stdout)
+	}
 }
 
 // A [[sources]] list with explicit paths is the remaining way a config file
