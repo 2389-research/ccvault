@@ -534,9 +534,16 @@ func (s *Syncer) processSession(ctx context.Context, sf adapter.SessionFile, adp
 			OutputTokens: int(pt.OutputTokens),
 		}
 
-		// Accumulate session token totals
+		// Accumulate session token totals. The turns table has no cache
+		// columns, so the cache pair is summed straight into the session row
+		// without a per-turn stop — adapters are responsible for reporting
+		// them disjoint from input/output (see adapter.ParsedTurn). Omitting
+		// them here is what left sessions.cache_read_tokens at 0 for every
+		// row in the archive (#155).
 		session.InputTokens += pt.InputTokens
 		session.OutputTokens += pt.OutputTokens
+		session.CacheReadTokens += pt.CacheReadTokens
+		session.CacheWriteTokens += pt.CacheWriteTokens
 
 		// Convert tool uses
 		for _, ptu := range pt.ToolUses {

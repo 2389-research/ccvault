@@ -294,6 +294,13 @@ func parseTurnInternal(data []byte) (*models.Turn, *models.RawTurn, error) {
 			if msg.Usage != nil {
 				turn.InputTokens = msg.Usage.InputTokens
 				turn.OutputTokens = msg.Usage.OutputTokens
+				// The cache pair is read here for the same reason the other
+				// two are, and was missing for the whole life of the parser
+				// (#155). Claude Code's four usage counters are disjoint, so
+				// these are additions to the turn's cost, not a breakdown of
+				// input_tokens.
+				turn.CacheReadTokens = msg.Usage.CacheReadInputTokens
+				turn.CacheWriteTokens = msg.Usage.CacheCreationInputTokens
 			}
 		}
 	}
@@ -373,9 +380,12 @@ func updateSessionMetadata(session *models.Session, turn *models.Turn, raw *mode
 		session.EndedAt = turn.Timestamp
 	}
 
-	// Accumulate tokens
+	// Accumulate tokens. All four counters, because all four are disjoint
+	// parts of what the session cost — see models.Turn.CacheReadTokens.
 	session.InputTokens += int64(turn.InputTokens)
 	session.OutputTokens += int64(turn.OutputTokens)
+	session.CacheReadTokens += int64(turn.CacheReadTokens)
+	session.CacheWriteTokens += int64(turn.CacheWriteTokens)
 
 	// Extract model from assistant messages
 	if turn.Type == "assistant" && session.Model == "" && raw.Message != nil {

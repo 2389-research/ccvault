@@ -99,12 +99,20 @@ type turnContextPayload struct {
 }
 
 // eventMsgPayload holds the fields from an event_msg payload.
+//
+// CachedInputTokens is the share of InputTokens that was served from the
+// prompt cache rather than charged fresh — a subset, not a sibling: a real
+// reading is input 8870 / cached 7040 / output 332 / total 9202, and
+// 8870 + 332 = 9202. Claude Code's shape is the opposite, with the cache
+// counters sitting beside input_tokens. See the split in the token_count
+// branch of Parse for what that difference costs.
 type eventMsgPayload struct {
 	Type string `json:"type"`
 	Info struct {
 		TotalTokenUsage struct {
-			InputTokens  int64 `json:"input_tokens"`
-			OutputTokens int64 `json:"output_tokens"`
+			InputTokens       int64 `json:"input_tokens"`
+			CachedInputTokens int64 `json:"cached_input_tokens"`
+			OutputTokens      int64 `json:"output_tokens"`
 		} `json:"total_token_usage"`
 	} `json:"info"`
 }
@@ -210,6 +218,7 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 
 		// Track last total token counts to compute per-turn deltas
 		prevInputTokens  int64
+		prevCachedTokens int64
 		prevOutputTokens int64
 
 		// A call and the output answering it are separate lines joined by
@@ -371,13 +380,34 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 			if evt.Type == "token_count" {
 				// Compute delta from previous total
 				deltaInput := evt.Info.TotalTokenUsage.InputTokens - prevInputTokens
+				deltaCached := evt.Info.TotalTokenUsage.CachedInputTokens - prevCachedTokens
 				deltaOutput := evt.Info.TotalTokenUsage.OutputTokens - prevOutputTokens
 				prevInputTokens = evt.Info.TotalTokenUsage.InputTokens
+				prevCachedTokens = evt.Info.TotalTokenUsage.CachedInputTokens
 				prevOutputTokens = evt.Info.TotalTokenUsage.OutputTokens
+
+				// cached_input_tokens is part of input_tokens, so the cached
+				// share is moved rather than added: InputTokens becomes the
+				// fresh input and CacheReadTokens the part served from cache.
+				// Reporting the raw cached figure as well would inflate the
+				// session's total by the amount it reports, because the
+				// session row sums all four counters (#155).
+				//
+				// Codex reports no cache-creation figure, so CacheWriteTokens
+				// stays zero for this source — an absence, not a zero.
+				if deltaCached < 0 || deltaCached > deltaInput {
+					// A cumulative counter that went backwards, or a cached
+					// share larger than the input it is a share of. Neither
+					// should happen; if one does, leave the input delta whole
+					// rather than deriving a negative fresh-input count from
+					// it.
+					deltaCached = 0
+				}
 
 				// Attach to the last assistant turn
 				if lastAssistantIdx >= 0 && lastAssistantIdx < len(turns) {
-					turns[lastAssistantIdx].InputTokens += deltaInput
+					turns[lastAssistantIdx].InputTokens += deltaInput - deltaCached
+					turns[lastAssistantIdx].CacheReadTokens += deltaCached
 					turns[lastAssistantIdx].OutputTokens += deltaOutput
 				}
 			}

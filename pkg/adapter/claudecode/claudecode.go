@@ -86,14 +86,16 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 	parsedTurns := make([]adapter.ParsedTurn, len(turns))
 	for i, t := range turns {
 		pt := adapter.ParsedTurn{
-			ID:           t.ID,
-			ParentID:     t.ParentID,
-			Type:         t.Type,
-			Timestamp:    t.Timestamp,
-			Content:      t.Content,
-			RawJSON:      t.RawJSON,
-			InputTokens:  int64(t.InputTokens),
-			OutputTokens: int64(t.OutputTokens),
+			ID:               t.ID,
+			ParentID:         t.ParentID,
+			Type:             t.Type,
+			Timestamp:        t.Timestamp,
+			Content:          t.Content,
+			RawJSON:          t.RawJSON,
+			InputTokens:      int64(t.InputTokens),
+			OutputTokens:     int64(t.OutputTokens),
+			CacheReadTokens:  int64(t.CacheReadTokens),
+			CacheWriteTokens: int64(t.CacheWriteTokens),
 		}
 
 		if turnHasError(t.RawJSON) {
