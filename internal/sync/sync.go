@@ -225,6 +225,17 @@ func (s *Syncer) Run(ctx context.Context) (*Stats, error) {
 
 		files, err := adpt.Discover(src.Path)
 		if err != nil {
+			// A source the configuration never named was inferred from
+			// --data-dir, and an inference that is wrong has to say so.
+			// Skipping it would exit 0 having indexed nothing, which is how
+			// a caller who meant to read the real transcripts ends up with
+			// an empty archive and no explanation.
+			if src.Implied && errors.Is(err, fs.ErrNotExist) {
+				return nil, fmt.Errorf(
+					"no conversations to read: --data-dir inferred the source tree %s, which does not exist.\n"+
+						"Pass --claude-home <path> to name the tree to read, or --claude-home ~/.claude for the real one",
+					src.Path)
+			}
 			stats.Errors = append(stats.Errors, fmt.Errorf("source %q discover: %w", src.Name, err))
 			s.progress("Error scanning source %q: %v", src.Name, err)
 			continue

@@ -218,6 +218,18 @@ func (f *cliFixture) Run(t *testing.T, args ...string) cliResult {
 	return r
 }
 
+// RunIn is Run against a second archive directory, for tests that need two
+// archives in one fixture — a before and an after, where the before has
+// already been written. dataDir still lives under the fixture's temp root.
+func (f *cliFixture) RunIn(t *testing.T, dataDir string, args ...string) cliResult {
+	t.Helper()
+
+	saved := f.DataDir
+	f.DataDir = dataDir
+	defer func() { f.DataDir = saved }()
+	return f.Run(t, args...)
+}
+
 // TestCLI_EndToEndAgainstThrowawayDataDir drives the real binary through the
 // commands whose CLI paths had no coverage before --data-dir existed.
 func TestCLI_EndToEndAgainstThrowawayDataDir(t *testing.T) {
@@ -430,5 +442,136 @@ func TestCLI_MissingConfigFileIsAnError(t *testing.T) {
 	}
 	if !strings.Contains(r.Stderr, "absent.toml") {
 		t.Errorf("stderr should name the missing file, got:\n%s", r.Stderr)
+	}
+}
+
+// --- claude_home isolation (#68) ---
+
+// The isolation #68 is about, driven through the real binary.
+//
+// A stand-in $HOME/.claude plays the user's real transcripts. With the
+// fixture's config.toml removed, nothing says where to read from — the exact
+// situation in which claude_home used to fall through to that directory and
+// a "throwaway" run indexed every real conversation on the machine.
+func TestCLI_DataDirAloneNeverReadsTheDefaultClaudeHome(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds the binary")
+	}
+	f := newCLIFixture(t)
+
+	if err := os.Remove(filepath.Join(f.DataDir, "config.toml")); err != nil {
+		t.Fatalf("remove fixture config: %v", err)
+	}
+	standInRealHome := filepath.Join(f.Home, ".claude")
+	f.AddSession(t, standInRealHome, "-Users-test-real", "cccccccc-cccc-cccc-cccc-cccccccccccc", "would be the users real transcript")
+
+	t.Run("an absent inferred tree is a refusal naming the way out", func(t *testing.T) {
+		r := f.TryRun(t, "sync")
+		if r.Err == nil {
+			t.Fatalf("sync should refuse rather than read the default claude home:\n%s", r.Stdout)
+		}
+		for _, want := range []string{filepath.Join(f.DataDir, "claude"), "--claude-home"} {
+			if !strings.Contains(r.Stderr, want) {
+				t.Errorf("refusal should mention %q, got:\n%s", want, r.Stderr)
+			}
+		}
+	})
+
+	t.Run("the inferred tree is what gets scanned when it exists", func(t *testing.T) {
+		f.AddSession(t, filepath.Join(f.DataDir, "claude"), "-Users-test-inferred", "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "inferred tree transcript")
+
+		f.Run(t, "sync")
+
+		inferred := f.Run(t, "search", "inferred tree transcript")
+		if !strings.Contains(inferred.Stdout, "Found 1 results") {
+			t.Errorf("the inferred tree was not scanned:\n%s", inferred.Stdout)
+		}
+		real := f.Run(t, "search", "would be the users real transcript")
+		if !strings.Contains(real.Stdout, "No results found") {
+			t.Errorf("the default claude home reached the archive anyway:\n%s", real.Stdout)
+		}
+	})
+
+	t.Run("--claude-home ~/.claude is how you opt back in", func(t *testing.T) {
+		scratchDataDir := filepath.Join(f.Home, "relocated-archive")
+
+		f.RunIn(t, scratchDataDir, "--claude-home", standInRealHome, "sync")
+
+		hit := f.RunIn(t, scratchDataDir, "--claude-home", standInRealHome, "search", "would be the users real transcript")
+		if !strings.Contains(hit.Stdout, "Found 1 results") {
+			t.Errorf("naming the default tree explicitly should read it:\n%s", hit.Stdout)
+		}
+	})
+}
+
+// --claude-home redirects the read to a tree that is neither the default nor
+// the one inferred from --data-dir.
+func TestCLI_ClaudeHomeRedirectsTheSourceTree(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds the binary")
+	}
+	f := newCLIFixture(t)
+
+	scratchClaude := filepath.Join(f.Home, "isolated-claude")
+	f.AddSession(t, scratchClaude, "-Users-test-isolated", "ffffffff-ffff-ffff-ffff-ffffffffffff", "isolated fixture transcript")
+
+	f.Run(t, "--claude-home", scratchClaude, "sync")
+
+	isolated := f.Run(t, "--claude-home", scratchClaude, "search", "isolated fixture transcript")
+	if !strings.Contains(isolated.Stdout, "Found 1 results") {
+		t.Errorf("the named claude home was not scanned:\n%s", isolated.Stdout)
+	}
+	// The fixture's own config.toml names a different tree; the flag outranks it.
+	fixtureHit := f.Run(t, "--claude-home", scratchClaude, "search", "fixture session one")
+	if !strings.Contains(fixtureHit.Stdout, "No results found") {
+		t.Errorf("--claude-home lost to the config file's claude_home:\n%s", fixtureHit.Stdout)
+	}
+}
+
+// A [[sources]] list with explicit paths is the remaining way a config file
+// can defeat claude_home. --claude-home replaces the list rather than being
+// shadowed by it, which is what makes the isolation total rather than
+// best-effort.
+func TestCLI_ClaudeHomeReplacesConfiguredSources(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds the binary")
+	}
+	f := newCLIFixture(t)
+
+	decoy := filepath.Join(f.Home, "decoy-claude")
+	f.AddSession(t, decoy, "-Users-test-decoy", "dddddddd-dddd-dddd-dddd-dddddddddddd", "decoy session text")
+	body := fmt.Sprintf("[[sources]]\nname = \"claude-code\"\ntype = \"claude-code\"\npath = %q\n", decoy)
+	if err := os.WriteFile(filepath.Join(f.DataDir, "config.toml"), []byte(body), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	f.Run(t, "--claude-home", f.ClaudeHome, "sync")
+
+	decoyHit := f.Run(t, "--claude-home", f.ClaudeHome, "search", "decoy session text")
+	if !strings.Contains(decoyHit.Stdout, "No results found") {
+		t.Errorf("the [[sources]] decoy path was scanned despite --claude-home:\n%s", decoyHit.Stdout)
+	}
+	fixtureHit := f.Run(t, "--claude-home", f.ClaudeHome, "search", "fixture session one")
+	if !strings.Contains(fixtureHit.Stdout, "Found 1 results") {
+		t.Errorf("--claude-home's own tree was not scanned:\n%s", fixtureHit.Stdout)
+	}
+}
+
+// The flag outranks the environment variable, same as --data-dir does.
+func TestCLI_ClaudeHomeFlagBeatsEnv(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds the binary")
+	}
+	f := newCLIFixture(t)
+
+	envClaude := filepath.Join(f.Home, "from-env-claude")
+	f.AddSession(t, envClaude, "-Users-test-env", "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee", "env claude home session")
+	f.env = append(f.env, "CCVAULT_CLAUDE_HOME="+envClaude)
+
+	f.Run(t, "--claude-home", f.ClaudeHome, "sync")
+
+	envHit := f.Run(t, "--claude-home", f.ClaudeHome, "search", "env claude home session")
+	if !strings.Contains(envHit.Stdout, "No results found") {
+		t.Errorf("--claude-home lost to CCVAULT_CLAUDE_HOME:\n%s", envHit.Stdout)
 	}
 }

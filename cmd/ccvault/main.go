@@ -63,24 +63,42 @@ make the whole CLI runnable against a throwaway archive:
   ccvault --data-dir /tmp/fixture sync
   ccvault --data-dir /tmp/fixture stats --json
 
---data-dir redirects the archive, not the source it reads: claude_home
-still defaults to ~/.claude. Set claude_home (or sources) in the fixture's
-config.toml, or CCVAULT_CLAUDE_HOME, to redirect that as well.`,
+Conversations are read from claude_home, resolved the same way:
+
+  --claude-home <path>  this flag
+  CCVAULT_CLAUDE_HOME   environment
+  claude_home = "..."   the config file
+  ~/.claude             built-in default
+
+Passing --data-dir with NOTHING said about claude_home infers the source
+tree as <data-dir>/claude rather than falling through to ~/.claude, so one
+flag is enough to keep a run away from real conversation files. Name a
+source to turn that off — which is how you relocate the archive while
+still indexing the real transcripts:
+
+  ccvault --data-dir /tmp/fixture sync                      # reads /tmp/fixture/claude
+  ccvault --data-dir /mnt/big --claude-home ~/.claude sync  # reads the real tree
+
+--claude-home also REPLACES any [[sources]] list the config file declares,
+so no source is left pointing at a tree you did not name.`,
 }
 
 // loadConfig reads configuration honouring the root command's persistent
-// --config and --data-dir flags. Every subcommand goes through this rather
-// than config.Load() so that pointing ccvault at a throwaway archive works
-// uniformly — the recurring need that bare config.Load() could not meet.
+// --config, --data-dir and --claude-home flags. Every subcommand goes
+// through this rather than config.Load() so that pointing ccvault at a
+// throwaway archive and a throwaway source tree works uniformly — the
+// recurring need that bare config.Load() could not meet.
 func loadConfig(cmd *cobra.Command) (*config.Config, error) {
 	// Persistent flags from the root are merged into every subcommand's
 	// flag set, so these lookups resolve from any depth.
 	configFile, _ := cmd.Flags().GetString("config")
 	dataDir, _ := cmd.Flags().GetString("data-dir")
+	claudeHome, _ := cmd.Flags().GetString("claude-home")
 
 	cfg, err := config.LoadWith(config.Options{
 		ConfigFile: configFile,
 		DataDir:    dataDir,
+		ClaudeHome: claudeHome,
 	})
 	if err != nil {
 		// A bad config path or a malformed config file is a plain message,
@@ -1948,6 +1966,10 @@ func init() {
 		"Data directory holding the archive. Overrides CCVAULT_DATA_DIR, the config file, and the ~/.ccvault default, and makes this directory the only place config.toml is looked for")
 	rootCmd.PersistentFlags().String("config", "",
 		"Config file to read (default: config.toml in the data directory, then ./config.toml). A path that does not exist is an error")
+	// Naming a source is also how you turn OFF the inference --data-dir
+	// makes when nothing names one; see config.impliedClaudeHome.
+	rootCmd.PersistentFlags().String("claude-home", "",
+		"Claude Code directory to read conversations from. Overrides CCVAULT_CLAUDE_HOME, the config file, and the ~/.claude default, and replaces any [[sources]] list with this one tree. Without it, --data-dir infers <data-dir>/claude rather than reading ~/.claude")
 
 	// Add commands
 	rootCmd.AddCommand(versionCmd)
