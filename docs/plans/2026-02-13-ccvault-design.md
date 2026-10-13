@@ -81,10 +81,24 @@ Structure:
   ccvault.db            # SQLite database (metadata + FTS5)
   analytics/
     sessions.parquet    # Analytics cache for DuckDB
-    turns.parquet
-    tools.parquet
+    turns.parquet       # NOT BUILT — see note below
+    tools.parquet       # NOT BUILT — see note below
   sync_state.json       # Tracks last sync position
 ```
+
+> **Historical note (2026-10-13).** `turns.parquet` and `tools.parquet` were
+> never built. `Exporter.Export` writes `sessions.parquet` and nothing else.
+> The struct that described each file — `analytics.TurnRecord`,
+> `analytics.ToolRecord` — was declared and never written to, and both have
+> since been deleted (#77, #139). They are listed here because this document
+> is the record of what was planned, not of what shipped; nothing in the tree
+> produces or reads either file, and a reader looking for the code behind
+> them will not find it.
+>
+> A turn-level or tool-level export is not ruled out, but it is unbuilt design
+> work rather than a missing implementation, and #29 is its first problem: the
+> deleted records carried no ordinal, so a naive per-turn export would have
+> reproduced the ordering bug #29 describes.
 
 ### SQLite Schema
 
@@ -148,9 +162,10 @@ CREATE VIRTUAL TABLE turns_fts USING fts5(
 
 Built via `ccvault build-cache`, enables DuckDB queries:
 
-- `sessions.parquet`: Session-level aggregates
-- `turns.parquet`: Turn-level data for time series
-- `tools.parquet`: Tool usage patterns
+- `sessions.parquet`: Session-level aggregates — **the only file built.**
+- `turns.parquet`: Turn-level data for time series — **never built** (see the
+  historical note under Storage Architecture).
+- `tools.parquet`: Tool usage patterns — **never built** (same note).
 
 ## CLI Commands
 

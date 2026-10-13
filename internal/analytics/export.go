@@ -14,7 +14,12 @@ import (
 	"github.com/xitongsys/parquet-go/writer"
 )
 
-// SessionRecord is a Parquet-compatible session record
+// SessionRecord is a Parquet-compatible session record. It is the only record
+// type this package declares, and sessions.parquet the only file Export
+// writes. Two sibling types once sat beside it describing files that were
+// never produced — TurnRecord (deleted in #77) and ToolRecord (#139) — so a
+// record type added here without a writer should be read as the same mistake
+// a third time.
 type SessionRecord struct {
 	ID              string `parquet:"name=id, type=BYTE_ARRAY, convertedtype=UTF8"`
 	ProjectID       int64  `parquet:"name=project_id, type=INT64"`
@@ -28,14 +33,6 @@ type SessionRecord struct {
 	CacheReadTokens int64  `parquet:"name=cache_read_tokens, type=INT64"`
 	TotalTokens     int64  `parquet:"name=total_tokens, type=INT64"`
 	Source          string `parquet:"name=source, type=BYTE_ARRAY, convertedtype=UTF8"`
-}
-
-// ToolRecord is a Parquet-compatible tool usage record
-type ToolRecord struct {
-	SessionID string `parquet:"name=session_id, type=BYTE_ARRAY, convertedtype=UTF8"`
-	ToolName  string `parquet:"name=tool_name, type=BYTE_ARRAY, convertedtype=UTF8"`
-	FilePath  string `parquet:"name=file_path, type=BYTE_ARRAY, convertedtype=UTF8"`
-	Timestamp int64  `parquet:"name=timestamp, type=INT64, convertedtype=TIMESTAMP_MILLIS"`
 }
 
 // Exporter exports data to Parquet format
