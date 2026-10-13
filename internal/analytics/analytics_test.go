@@ -104,42 +104,11 @@ func TestExporter_ExportProducesParquet(t *testing.T) {
 	}
 }
 
-// --- SessionsParquetHasSource ---
-
-// TestAnalyzer_SessionsParquetHasSource_MissingFileReturnsFalse ensures a
-// nonexistent parquet is reported as "no source column" without erroring
-// so the TUI can distinguish "hasn't run yet" from "has legacy cache".
-func TestAnalyzer_SessionsParquetHasSource_MissingFileReturnsFalse(t *testing.T) {
-	cacheDir := t.TempDir()
-	analyzer, err := NewAnalyzer(cacheDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = analyzer.Close() }()
-
-	got, err := analyzer.SessionsParquetHasSource()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if got {
-		t.Error("expected false for missing file, got true")
-	}
-}
-
-// TestAnalyzer_SessionsParquetHasSource_FreshFileReturnsTrue verifies a
-// fresh export (which uses the current SessionRecord shape) reports the
-// source column as present.
-func TestAnalyzer_SessionsParquetHasSource_FreshFileReturnsTrue(t *testing.T) {
-	analyzer, _ := newAnalyticsFixture(t)
-
-	got, err := analyzer.SessionsParquetHasSource()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !got {
-		t.Error("expected true after fresh export, got false")
-	}
-}
+// --- Parquet cache schema ---
+//
+// The staleness check itself is covered in cacheschema_test.go; the shared
+// legacy-shape writer below lives here because the *BySource fallback tests
+// use it too.
 
 // legacySessionRecord mirrors the pre-PR-#6 SessionRecord shape — same
 // fields as the current SessionRecord minus the Source column. We write
@@ -185,32 +154,6 @@ func writeLegacyParquet(t *testing.T, path string, rows []legacySessionRecord) {
 	}
 	if err := fw.Close(); err != nil {
 		t.Fatalf("close parquet writer: %v", err)
-	}
-}
-
-// TestAnalyzer_SessionsParquetHasSource_LegacyFileReturnsFalse writes a
-// synthetic parquet with the pre-PR-#6 schema (no source column) and
-// verifies the schema-compat check reports it as legacy.
-func TestAnalyzer_SessionsParquetHasSource_LegacyFileReturnsFalse(t *testing.T) {
-	cacheDir := t.TempDir()
-	now := time.Now().UnixMilli()
-	writeLegacyParquet(t, filepath.Join(cacheDir, "sessions.parquet"), []legacySessionRecord{
-		{ID: "legacy-1", ProjectPath: "/tmp/legacy", StartedAt: now, EndedAt: now,
-			Model: "claude-2", TurnCount: 1, InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
-	})
-
-	analyzer, err := NewAnalyzer(cacheDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = analyzer.Close() }()
-
-	got, err := analyzer.SessionsParquetHasSource()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if got {
-		t.Error("expected false for legacy parquet without source column, got true")
 	}
 }
 

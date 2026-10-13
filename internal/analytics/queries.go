@@ -38,28 +38,59 @@ func (a *Analyzer) Close() error {
 	return a.db.Close()
 }
 
-// SessionsParquetHasSource returns true when the on-disk sessions.parquet has a
-// `source` column. Older parquet files written before multi-source support
-// don't, and source-aware queries against them would fail; callers should
-// rebuild the cache when this returns false. A missing file also returns false.
-func (a *Analyzer) SessionsParquetHasSource() (bool, error) {
+// SessionsParquetMissingColumns reports which of the columns the current
+// SessionRecord declares are absent from the on-disk sessions.parquet. An
+// empty result means the cache carries today's schema; anything else means
+// the caller should rebuild before querying, because a column DuckDB cannot
+// find is a Binder Error at best and a wrong answer in a query written
+// defensively around it.
+//
+// A missing file reports every expected column, so one call answers "should I
+// rebuild?" for both the never-built and the outdated cache.
+//
+// This replaced a check for the literal column name `source`, which could not
+// see `parent_session_id` when #147 added it (#149). The expectation is
+// derived from the struct, so the next column is covered without touching
+// this function.
+func (a *Analyzer) SessionsParquetMissingColumns() ([]string, error) {
+	expected := sessionRecordColumns()
+
 	sessionsPath := filepath.Join(a.cacheDir, "sessions.parquet")
 	if _, err := os.Stat(sessionsPath); err != nil {
 		if os.IsNotExist(err) {
-			return false, nil
+			return expected, nil
 		}
-		return false, fmt.Errorf("stat sessions parquet: %w", err)
+		return nil, fmt.Errorf("stat sessions parquet: %w", err)
 	}
 
-	query := fmt.Sprintf(
-		`SELECT COUNT(*) FROM parquet_schema('%s') WHERE name = 'source'`,
-		sessionsPath,
-	)
-	var count int
-	if err := a.db.QueryRow(query).Scan(&count); err != nil {
-		return false, fmt.Errorf("inspect parquet schema: %w", err)
+	// parquet_schema takes the path as a bound parameter, so the cache dir
+	// never reaches the SQL text — unlike the read_parquet calls below, which
+	// predate this and interpolate.
+	rows, err := a.db.Query(`SELECT name FROM parquet_schema(?)`, sessionsPath)
+	if err != nil {
+		return nil, fmt.Errorf("inspect parquet schema: %w", err)
 	}
-	return count > 0, nil
+	defer func() { _ = rows.Close() }()
+
+	present := make(map[string]struct{})
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("scan parquet schema: %w", err)
+		}
+		present[name] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read parquet schema: %w", err)
+	}
+
+	var missing []string
+	for _, column := range expected {
+		if _, ok := present[column]; !ok {
+			missing = append(missing, column)
+		}
+	}
+	return missing, nil
 }
 
 // TokensByDay returns token usage grouped by day

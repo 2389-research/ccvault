@@ -5,8 +5,6 @@ package tui
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -70,30 +68,23 @@ type analyticsLoadedMsg struct {
 }
 
 func (m *AnalyticsModel) loadAnalytics() tea.Msg {
-	// Auto-build cache if parquet file is missing or predates multi-source support
-	sessionsPath := filepath.Join(m.cacheDir, "sessions.parquet")
-	needsRebuild := false
-	if _, err := os.Stat(sessionsPath); os.IsNotExist(err) {
-		needsRebuild = true
-	}
-
 	analyzer, err := analytics.NewAnalyzer(m.cacheDir)
 	if err != nil {
 		return analyticsLoadedMsg{err: err}
 	}
 	defer func() { _ = analyzer.Close() }()
 
-	if !needsRebuild {
-		hasSource, err := analyzer.SessionsParquetHasSource()
-		if err != nil {
-			return analyticsLoadedMsg{err: fmt.Errorf("check analytics cache schema: %w", err)}
-		}
-		if !hasSource {
-			needsRebuild = true
-		}
+	// Auto-build the cache when it is missing or its schema predates the
+	// exporter. One call covers both: a missing file reports every column as
+	// absent. The check follows SessionRecord rather than naming a column, so
+	// a cache written before any later column addition is still detected
+	// (#149).
+	missing, err := analyzer.SessionsParquetMissingColumns()
+	if err != nil {
+		return analyticsLoadedMsg{err: fmt.Errorf("check analytics cache schema: %w", err)}
 	}
 
-	if needsRebuild {
+	if len(missing) > 0 {
 		exporter := analytics.NewExporter(m.db, m.cacheDir)
 		if err := exporter.Export(); err != nil {
 			return analyticsLoadedMsg{err: fmt.Errorf("build analytics cache: %w", err)}
