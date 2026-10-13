@@ -1,5 +1,18 @@
 module github.com/2389-research/ccvault
 
+// The supported floor, and a support decision rather than a technical one.
+// Measured, so the next person does not have to: nothing in this module's
+// source needs a language or stdlib feature newer than Go 1.24, and the
+// heaviest `go` directive in the dependency graph is 1.24.2 (the charmbracelet
+// packages). So this number is not load-bearing -- it is the version the
+// project chooses to promise, and #98 is where raising it gets argued.
+//
+// It is also a ceiling, and that half is technical: golangci-lint type-checks
+// with the go/types built into its own binary and refuses any module targeting
+// a newer Go than that, so this directive cannot move past the Go version the
+// pinned linter was built with. mise.toml's `go` pin matches this number
+// exactly, and the CI matrix tests it as the floor. Raise one and all of them
+// move -- see the order written at the top of mise.toml.
 go 1.25.5
 
 require (

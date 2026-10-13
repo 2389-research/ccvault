@@ -66,6 +66,12 @@ jobs:
         # only version this project claims to build on. `stable` runs beside
         # it as forward warning: it catches a new Go release breaking the
         # build before a contributor on current Go hits it.
+        #
+        # This number is one of three that must agree -- go.mod's directive,
+        # mise.toml's `go` pin, and this floor -- and it is not free to move on
+        # its own: go.mod's directive is capped by the Go version the pinned
+        # golangci-lint was built with. mise.toml documents the order to move
+        # the set in; #98 is where raising the floor gets argued.
         go-version: ['1.25.5', 'stable']
     steps:
       - name: Check out code
@@ -73,6 +79,21 @@ jobs:
         with:
           fetch-depth: 0
 
+      # `cache: true` is the only module cache in this job. There used to be a
+      # hand-rolled `actions/cache` step after this one caching ~/go/pkg/mod
+      # as well -- the same directory setup-go already handles, restored twice
+      # and saved twice per job. Its key was
+      # `${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}`, which names no Go
+      # version, so both matrix jobs shared one entry and each overwrote a
+      # cache the other toolchain had populated. setup-go's own key carries
+      # the Go version alongside the go.sum hash, which is exactly the
+      # dimension the manual key was missing, so deleting the step fixes the
+      # collision rather than trading it for a different one.
+      #
+      # It cached nothing extra either: setup-go covers the build cache
+      # (~/.cache/go-build) as well as the module cache. If a future step
+      # needs something outside both, scope `actions/cache` to that path only
+      # and put the Go version in its key.
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
@@ -85,14 +106,6 @@ jobs:
           echo "GOTOOLCHAIN=$(go env GOTOOLCHAIN)"
           test "$(go env GOTOOLCHAIN)" = local
 
-      - name: Cache Go modules
-        uses: actions/cache@v4
-        with:
-          path: ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
-
       - name: Download dependencies
         run: go mod download
 
@@ -101,15 +114,41 @@ jobs:
 
       # Coverage comes from the floor job: one upload, from the version the
       # project supports rather than whatever `stable` happens to be.
+      #
+      # Selected by excluding `stable` rather than by naming the floor, so
+      # raising go.mod's Go version cannot silently switch coverage off here by
+      # leaving a stale literal behind. A third pinned entry in the matrix
+      # would give two uploads, which is loud; a stale literal gives none,
+      # which is not.
       - name: Run tests with coverage
-        if: matrix.go-version == '1.25.5'
+        if: matrix.go-version != 'stable'
         run: make test-coverage
 
+      # v7 is the Node 24 major, and getting here from v4 crosses a rewrite,
+      # so this is not the drop-in the other action bumps were. v5 replaced the
+      # action's own uploader with a wrapper around the Codecov CLI, and
+      # renamed inputs in the process: `file` became `files`, and `file` is
+      # simply absent from v7's action.yml.
+      #
+      # That rename is the whole risk, because GitHub only *warns* about an
+      # input an action does not declare. Left as `file`, this step would keep
+      # passing, keep saying it uploaded, and never be told which file to
+      # upload -- the CLI would fall back to searching the tree, so the
+      # outcome would depend on what it happened to find rather than on what
+      # `make test-coverage` just wrote. A silent change of meaning is worse
+      # here than a failure would be.
+      #
+      # v6 is Node 24 by default; v7 only changes which account holds
+      # Codecov's GPG signing key. No token is set, and none is needed: this
+      # repo is public, and tokenless upload for public repositories is the
+      # path v5 made explicit. `fail_ci_if_error: false` is kept, so a Codecov
+      # outage or an upload rate-limit still cannot redden a PR that has
+      # nothing wrong with it.
       - name: Upload coverage to Codecov
-        if: matrix.go-version == '1.25.5'
-        uses: codecov/codecov-action@v4
+        if: matrix.go-version != 'stable'
+        uses: codecov/codecov-action@v7
         with:
-          file: ./coverage.out
+          files: ./coverage.out
           flags: unittests
           fail_ci_if_error: false
 
@@ -149,6 +188,17 @@ jobs:
           # runner's Go happened to match it, while contributors on current Go
           # could not lint at all. It also reported gosec G602 on bounds it
           # could not prove, which cost a round-trip on #118.
+          #
+          # v2.11.4 is built with go1.26.1 (`golangci-lint version` prints the
+          # Go it was built with), so it is also the ceiling on go.mod's `go`
+          # directive. Measured, at `go 1.27.0`, this step fails with:
+          #
+          #   can't load config: the Go language version (go1.26) used to
+          #   build golangci-lint is lower than the targeted Go version
+          #   (1.27.0)
+          #
+          # Clearer than the old panic, still a hard stop. Raising the floor
+          # past 1.26 means raising this pin first.
           version: v2.11.4
           args: --timeout=10m
           verify: false
@@ -246,9 +296,76 @@ jobs:
       - name: Verify binary
         run: ./ccvault --help
 
+      # v7 is the Node 24 major; v4 targeted Node 20. Checked against the three
+      # inputs this step sets, all of which survive unchanged: v5 was a
+      # preliminary Node 24 build that still defaulted to Node 20; v6 made Node
+      # 24 the default and raised the minimum Actions runner to 2.327.1, which
+      # only matters for self-hosted runners and this repo has none; v7 moved
+      # the action to ESM and added an optional `archive` input that defaults
+      # to true, i.e. the v4 behaviour of zipping the upload.
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ccvault-linux-amd64
           path: ccvault
           retention-days: 7
+
+  build-darwin:
+    name: Build (macOS)
+    # This job exists to make `release-darwin` verifiable. That job builds the
+    # released macOS binaries with CGO_ENABLED=1 and runs only on a tag, so
+    # until now the runner image it compiles against was first observed after
+    # the tag was pushed -- which is why #133 argued its `macos-latest` could
+    # not safely be pinned: choosing a label meant guessing one for a job
+    # nobody could exercise.
+    #
+    # Pinned to the same label `release-darwin` now uses, and triggered by
+    # `pull_request` like the rest of this file, so the label and the cgo
+    # toolchain behind it are proven on a PR instead of on a tag. If GitHub
+    # retires `macos-26`, this job fails here first.
+    #
+    # `macos-26` is the arm64 macOS 26 image, which is what `macos-latest`
+    # already resolved to for the v0.3.0 release -- so, like the ubuntu-24.04
+    # pins, this freezes the current image rather than changing it. Note that
+    # `macos-26-arm64` is the image *name* in actions/runner-images and not a
+    # usable label; the arm64 labels are `macos-latest`, `macos-26` and
+    # `macos-26-xlarge`. Pinning to the image name would have failed outright.
+    runs-on: macos-26
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Report the runner image
+        run: |
+          sw_vers
+          uname -m
+          cc --version
+
+      # Mirrors .goreleaser.yml's `ccvault` build: CGO_ENABLED=1, the
+      # sqlite_omit_load_extension tag, and both darwin arches. amd64 on an
+      # arm64 runner is a cgo cross-compile that leans on the SDKs the runner
+      # image ships, so it is the half most exposed to an image change and the
+      # half worth compiling here. Packaging is left to goreleaser; this job
+      # is about whether the code compiles on this image, which is what a
+      # runner-image major puts at risk.
+      - name: Build both darwin arches the release builds
+        env:
+          CGO_ENABLED: '1'
+        run: |
+          for arch in arm64 amd64; do
+            echo "::group::darwin/$arch"
+            GOARCH="$arch" go build -tags sqlite_omit_load_extension \
+              -o "ccvault-darwin-$arch" ./cmd/ccvault
+            echo "::endgroup::"
+          done
+          file ccvault-darwin-arm64 ccvault-darwin-amd64
+
+      # Only the native build can be executed on this runner.
+      - name: Verify the native binary runs
+        run: ./ccvault-darwin-arm64 --help
