@@ -260,11 +260,12 @@ func (s *Server) input() io.Reader {
 // a -32700 with a null id would report a failure where nothing failed. It
 // is also what the reader hands back at a clean EOF.
 func (s *Server) handleLine(line []byte) {
-	if len(strings.TrimSpace(string(line))) == 0 {
+	frame := strings.TrimSpace(string(line))
+	if frame == "" {
 		return
 	}
 
-	s.log("Received: %s", strings.TrimSpace(string(line)))
+	s.log("Received: %s", frame)
 
 	var req jsonRPCRequest
 	if err := json.Unmarshal(line, &req); err != nil {
