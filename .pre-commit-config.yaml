@@ -39,8 +39,10 @@ repos:
       # into a spurious hook failure.
       - id: golangci-lint
         args: ['--timeout=10m', '--fix', '--allow-parallel-runners']
-      - id: go-unit-tests
-        args: ['-race', '-count=1', './...']  # -count=1 disables test caching
+      # No go-unit-tests here on purpose. That hook's script takes no
+      # arguments, so the `args:` this repo gave it -- -race, -count=1,
+      # ./... -- were silently discarded and the gate was substantially
+      # weaker than the config read. See the go-test-race hook below.
 
   - repo: local
     hooks:
@@ -56,5 +58,30 @@ repos:
         entry: go vet
         language: system
         args: ['./...']
+        files: \.go$
+        pass_filenames: false
+
+      # Replaces dnephin/pre-commit-golang's go-unit-tests, which ignored the
+      # args this repo passed it. Its script is, verbatim:
+      #
+      #   FILES=$(go list ./... | grep -v /vendor/) || fail
+      #   go test -tags=unit -timeout 30s -short -v ${FILES} || fail
+      #
+      # So `-race` had never run at commit time, `-short` skipped the
+      # integration suite outright, and the 30s budget was tight enough that a
+      # slow package produced a goroutine dump reading like a deadlock -- a
+      # failure that teaches you to re-run rather than to look.
+      #
+      # The scope lives in `make test-precommit` so there is one definition of
+      # it rather than a shell line here and a different one in CI. That target
+      # states which packages it skips and why; `name:` below repeats it,
+      # because the hook's one line of output is where most people will read it.
+      #
+      # Last in the file deliberately: go-vet above fails in a second or two,
+      # so a trivially broken tree never pays for a test run.
+      - id: go-test-race
+        name: go test -race (all packages except internal/db, internal/mcp)
+        entry: make test-precommit
+        language: system
         files: \.go$
         pass_filenames: false

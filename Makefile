@@ -1,7 +1,17 @@
 # ABOUTME: Build and development targets for ccvault
 # ABOUTME: Provides build, test, and release automation
 
-.PHONY: build test test-race test-short test-coverage clean install lint release
+.PHONY: build test test-race test-short test-precommit test-coverage clean install lint release
+
+# Packages excluded from the commit-time gate, as an extended-regexp anchored
+# at a path segment. Measured on a warm build cache with -race: internal/mcp
+# 157s and internal/db 73s, against 30-40s for the twenty that remain, all of
+# them together -- `go test` runs packages in parallel, so those two alone set
+# the wall clock. Both are covered by `make test-race` in CI on every PR.
+#
+# Deliberately a skip list and not an allowlist: a package added tomorrow is
+# gated from its first commit instead of being quietly left out.
+PRECOMMIT_SKIP := /(internal/db|internal/mcp)$$
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 
@@ -38,8 +48,42 @@ test-race:
 test-short:
 	go test ./... -short
 
+# The pre-commit gate. Everything `make test-race` runs, minus the two
+# packages named in PRECOMMIT_SKIP above, and with no -short so the
+# integration suite actually executes.
+#
+# -count=1 defeats the test cache. It costs the full 30-40s on every Go commit
+# even when nothing relevant changed, and it is worth it twice over: a gate
+# that reports a cached pass is the kind of gate this target exists to
+# replace, and race detection is probabilistic, so a fresh run is a fresh roll
+# of the dice rather than a repeat of one that already came up clean.
+#
+# -timeout 5m is per test binary, and 30s -- the value this replaces -- was
+# not enough for this suite on two counts. Measured under -race, internal/tui
+# takes 25s and test/integration 22s, so the old cap was marginal even for
+# packages that were working. And test/integration shells out to `go build`
+# from inside the test (version_test.go, cli_test.go), so a cold build cache
+# is charged against the timeout rather than paid before it -- which is how
+# that cap produced a goroutine dump indistinguishable from a real deadlock.
+# Dropping -short makes that path run on every commit, so the headroom is now
+# load-bearing rather than precautionary. At 5m, a timeout here means a hang.
+test-precommit:
+	@pkgs=$$(go list ./... | grep -Ev '$(PRECOMMIT_SKIP)') || exit 1; \
+	go test -race -count=1 -timeout 5m $$pkgs
+
+# Profiles every package, because the result is uploaded to Codecov and
+# labelled as this project's coverage. It used to profile ./internal/db/...
+# and ./pkg/parser/... alone -- 2 packages of 22 -- which made the published
+# figure describe something other than what it was named, and meant a change
+# landing in a thinly-tested package moved it by exactly zero.
+#
+# No -coverpkg: per-package attribution is what "unit test coverage" is
+# normally taken to mean, and crediting each package with the lines its own
+# tests exercise is the measure that responds when a change lands somewhere
+# untested. -coverpkg=./... would let the integration suite inflate everything
+# it touches, which is the opposite of the point.
 test-coverage:
-	go test ./internal/db/... ./pkg/parser/... -coverprofile=coverage.out -covermode=atomic
+	go test ./... -coverprofile=coverage.out -covermode=atomic
 
 lint:
 	golangci-lint run

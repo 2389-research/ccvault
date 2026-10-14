@@ -120,6 +120,14 @@ jobs:
       # leaving a stale literal behind. A third pinned entry in the matrix
       # would give two uploads, which is loud; a stale literal gives none,
       # which is not.
+      #
+      # This profiles every package now rather than two of them, so it is a
+      # second full pass over the suite after `make test-race` above and the
+      # job is correspondingly longer. Worth it: the number this uploads is
+      # labelled as the project's, and a second run without -race is what
+      # makes that label true. Not folded into the -race run, because
+      # -covermode=atomic there would measure a differently-instrumented
+      # binary and slow the pass everyone reads for pass/fail.
       - name: Run tests with coverage
         if: matrix.go-version != 'stable'
         run: make test-coverage
@@ -139,17 +147,43 @@ jobs:
       # here than a failure would be.
       #
       # v6 is Node 24 by default; v7 only changes which account holds
-      # Codecov's GPG signing key. No token is set, and none is needed: this
-      # repo is public, and tokenless upload for public repositories is the
-      # path v5 made explicit. `fail_ci_if_error: false` is kept, so a Codecov
-      # outage or an upload rate-limit still cannot redden a PR that has
-      # nothing wrong with it.
+      # Codecov's GPG signing key.
+      #
+      # No token is set, and this comment used to claim none was needed
+      # because the repo is public. That is false, measured. The upload is
+      # rejected every run, and has been since before the flag below changed:
+      #
+      #   info  -- Found 1 coverage files to report
+      #   info  -- > /home/runner/work/ccvault/ccvault/coverage.out
+      #   info  -- Upload queued for processing complete
+      #   error -- Upload queued for processing failed:
+      #            {"message":"Token required because branch is protected"}
+      #
+      # `fail_ci_if_error: false` is why nobody noticed -- it is there so a
+      # Codecov outage cannot redden a PR that has nothing wrong with it, and
+      # it swallows this too, so the step goes green while publishing nothing.
+      # Note the ordering: "complete" is printed before the error, so reading
+      # only the happy line tells you the opposite of what happened.
+      #
+      # Fixing it needs a CODECOV_TOKEN repository secret, which is a
+      # credential decision and not this PR's to make. Left failing and
+      # documented rather than silently papered over; the point of #151 is
+      # that the profile is now honest, and the number is not published at
+      # all until that token exists.
+      #
+      # `flags: project`, not the `unittests` it said before. That label was
+      # inherited from a `make test-coverage` that profiled two packages of
+      # 22, so the figure under it described neither the project nor its unit
+      # tests. The target now profiles everything, integration suite included,
+      # and this is the only upload, so `project` is what the number is. The
+      # old flag's history is left where it is: it measured a different thing
+      # and merging the two series would hide the step.
       - name: Upload coverage to Codecov
         if: matrix.go-version != 'stable'
         uses: codecov/codecov-action@v7
         with:
           files: ./coverage.out
-          flags: unittests
+          flags: project
           fail_ci_if_error: false
 
   lint:
