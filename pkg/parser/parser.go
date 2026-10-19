@@ -433,13 +433,17 @@ func updateSessionMetadata(session *models.Session, turn *models.Turn, raw *mode
 		session.GitBranch = raw.GitBranch
 	}
 
-	// CWD is the ground truth for project path; lock to first non-empty
-	// value. Canonicalised on the way in, so an agent worktree resolves to
-	// the repository it was cut from rather than becoming a project of its
-	// own (#72). This is the single place a cwd becomes a project identity,
-	// which is why the rule lives here and not in the sync layer — that layer
-	// also runs codex, jeff, hex and nanoclaw, none of which have a
-	// .claude/worktrees convention to know about.
+	// CWD is the ground truth for a top-level session's project path; lock to
+	// first non-empty value. Canonicalised on the way in, so an agent worktree
+	// resolves to the repository it was cut from rather than becoming a
+	// project of its own (#72). This is the single place a cwd becomes a
+	// project identity, which is why the rule lives here and not in the sync
+	// layer — that layer also runs codex, jeff, hex and nanoclaw, none of
+	// which have a .claude/worktrees convention to know about.
+	//
+	// A subagent transcript's cwd does NOT decide its project: the adapter
+	// overrides this with SubagentProjectPath, which takes the project of the
+	// session that dispatched it (#156).
 	if raw.CWD != "" && session.ProjectPath == "" {
 		session.ProjectPath = CanonicalProjectPath(raw.CWD)
 	}

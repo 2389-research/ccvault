@@ -1,5 +1,5 @@
-// ABOUTME: End-to-end test that an agent worktree syncs into its parent repo's project row.
-// ABOUTME: Covers #72, where 35 of 163 real project rows were ephemeral agent worktrees.
+// ABOUTME: End-to-end tests that a subagent session syncs into its parent's project row, whatever its cwd.
+// ABOUTME: Covers #72 (worktree cwds) and #156 (any cwd), where 37 of 163 real project rows were one dispatch each.
 
 package sync
 
@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/2389-research/ccvault/internal/config"
@@ -105,16 +106,34 @@ func TestWorktreeSubagentsJoinTheirParentProject(t *testing.T) {
 	}
 }
 
-// The counterpart that stops this being a blanket "subagents inherit their
-// parent" rule: a subagent whose cwd is a genuinely different directory keeps
-// that directory as its project.
-func TestSubagentOutsideAWorktreeKeepsItsOwnProject(t *testing.T) {
+// A subagent whose cwd is a genuinely different directory follows its parent
+// too, and this is where that judgement is recorded. #72 asserted the
+// opposite — "a subagent dispatched into a genuinely different directory keeps
+// that directory" — because it was reasoning about one path convention and
+// only needed the worktree case; #156 is the rule that a dispatched agent is
+// part of the session that dispatched it, which decides this case as well.
+//
+// The argument for inheriting: a subagent is not an independent unit of work.
+// It has no prompt of its own, it cannot outlive the session that spawned it,
+// and its cwd records where it was put to work rather than what it was working
+// on. Giving it a project of its own is how 42 of the author's sessions ended
+// up in 37 project rows nobody asked for. Nothing is lost by inheriting:
+// sessions.parent_session_id still names the dispatcher, the subagent's
+// git_branch is still on its row, and every turn's raw_json still holds the
+// cwd it was written with.
+//
+// What it costs: a session that reads and writes another repository is filed
+// under the repo it was dispatched from. Searching that other repo's project
+// will not find it. That is the trade, taken deliberately — the alternative
+// mints a project row per dispatch, which is the bug.
+func TestSubagentOutsideAWorktreeFollowsItsParent(t *testing.T) {
 	database, cleanup := setupTestDB(t)
 	defer cleanup()
 
 	claudeHome := t.TempDir()
 	const (
 		encodedProject = "-Users-test-dispatcher"
+		dispatcherPath = "/Users/test/dispatcher"
 		parentUUID     = "8b8b8b8b-1111-2222-3333-444444444444"
 		elsewhere      = "/Users/test/some-other-repo"
 	)
@@ -134,21 +153,25 @@ func TestSubagentOutsideAWorktreeKeepsItsOwnProject(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetProjects(): %v", err)
 	}
-	if len(projects) != 2 {
-		paths := make([]string, 0, len(projects))
-		for _, p := range projects {
-			paths = append(paths, p.Path)
-		}
-		t.Fatalf("want 2 project rows, got %d: %v", len(projects), paths)
+	paths := make([]string, 0, len(projects))
+	for _, p := range projects {
+		paths = append(paths, p.Path)
+	}
+	if len(projects) != 1 || projects[0].Path != dispatcherPath {
+		t.Fatalf("want the one dispatching project %q, got %v", dispatcherPath, paths)
+	}
+	if projects[0].SessionCount != 2 {
+		t.Errorf("session count = %d, want 2 (the dispatcher plus its subagent)", projects[0].SessionCount)
 	}
 
-	found := false
-	for _, p := range projects {
-		if p.Path == elsewhere {
-			found = true
-		}
+	// The discarded cwd is still readable on the turns, which is what makes
+	// this a change of filing rather than a loss.
+	var rawJSON string
+	if err := database.QueryRow(
+		`SELECT raw_json FROM turns WHERE session_id LIKE '%agent-eeee5555ffff6666a' ORDER BY ordinal LIMIT 1`).Scan(&rawJSON); err != nil {
+		t.Fatalf("scan subagent raw_json: %v", err)
 	}
-	if !found {
-		t.Errorf("a subagent that ran outside a worktree lost its own project identity; rows: %+v", projects)
+	if !strings.Contains(rawJSON, elsewhere) {
+		t.Errorf("subagent raw_json no longer holds the cwd %q: %s", elsewhere, rawJSON)
 	}
 }

@@ -26,10 +26,14 @@ const claudeWorktreeSegment = "/.claude/worktrees/"
 // the repo ccvault itself, which left `--project ccvault` unable to resolve to
 // anything (#72).
 //
-// This is a rule about one path convention, not about subagents. A top-level
-// session started inside a worktree canonicalises the same way, and a subagent
-// dispatched into a genuinely different directory keeps that directory, since
-// its cwd carries no worktree segment. Nothing is lost that cannot be
+// This is a rule about one path convention, not about subagents, and since
+// #156 it is no longer the rule that decides a subagent's project — see
+// SubagentProjectPath, which inherits the parent session's project outright
+// and is what handles a worktree this function deliberately leaves alone (a
+// hand-made ".worktrees/<name>", which six of the author's subagents ran in).
+// What is left here is the case with no parent to inherit from: a top-level
+// session someone started inside a worktree himself, and the fallback when a
+// subagent's parent transcript cannot be read. Nothing is lost that cannot be
 // recovered: the worktree's branch is still on the session, and each turn's
 // raw_json still holds the cwd it was written with.
 func CanonicalProjectPath(path string) string {
