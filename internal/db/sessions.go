@@ -31,6 +31,10 @@ const upsertSessionSQL = `
 	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(id) DO UPDATE SET
 		ended_at = excluded.ended_at,
+		project_id = CASE
+			WHEN excluded.project_id > 0 THEN excluded.project_id
+			ELSE sessions.project_id
+		END,
 		parent_session_id = COALESCE(excluded.parent_session_id, sessions.parent_session_id),
 		last_entry_uuid = COALESCE(excluded.last_entry_uuid, sessions.last_entry_uuid),
 		model = COALESCE(excluded.model, sessions.model),
@@ -63,6 +67,18 @@ func (db *DB) UpsertSessionTx(tx *sql.Tx, s *models.Session) error {
 }
 
 // upsertSession writes the session row and then follows the file if it moved.
+//
+// project_id is in the ON CONFLICT update list because a session's project
+// does change — not because the conversation moved, but because ccvault
+// corrected how it reads one. Without it, a re-parse computed the right
+// project, wrote the row, and the row kept the project it already had: #156's
+// 42 misfiled subagent sessions stayed misfiled through a sync that re-read
+// every one of their transcripts, and the repair was silently inert.
+//
+// Guarded with the same CASE shape as source_file, against 0 rather than the
+// empty string: project_id is an integer foreign key and 0 is no project, so a
+// caller that upserts a session without one keeps the project the row already
+// names rather than being orphaned onto a project id that does not exist.
 //
 // source_file is in the ON CONFLICT update list because a session's file does
 // move — a project directory renamed, an archive relocated, an agent dir
