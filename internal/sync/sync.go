@@ -49,6 +49,10 @@ type Stats struct {
 	TurnsIndexed    int
 	ToolUsesIndexed int
 	ProjectsFound   int
+	// ProjectsPruned counts the project rows this run removed because no
+	// session was filed under them any more — what a corrected attribution
+	// rule plus a re-parse leaves behind (#156).
+	ProjectsPruned int64
 	// SessionsRewrittenUpstream counts sessions whose stored last turn was
 	// absent from the transcript this run re-parsed — the file was rewritten
 	// rather than appended to, so the session's history was replaced with a
@@ -357,9 +361,28 @@ func (s *Syncer) progressUnparsableTimestamps(stats *Stats) {
 // also when a run is cancelled part-way — a half-finished run inflates the
 // counters just as surely as a finished one.
 //
+// It also prunes the project rows no session is filed under any more, which is
+// the other half of the same problem: reconciling an abandoned row's counters
+// would only write zeroes into a name nothing stands behind. See
+// DeleteEmptyProjects for when a row ends up in that state.
+//
 // Deliberately not context-bound: this is the repair step, and skipping it
 // because the run was cancelled is what leaves the archive reading wrong.
 func (s *Syncer) reconcileProjects(stats *Stats, projectsTouched map[string]bool) {
+	// Before the reconcile, so a row that is about to be dropped is not
+	// recomputed first. Unconditional, unlike the reconcile below: a run that
+	// wrote nothing can still be the run after a migration that moved
+	// sessions off a project, and an empty row cannot become non-empty
+	// without a write that touches it.
+	if removed, err := s.db.DeleteEmptyProjects(); err != nil {
+		// Non-fatal: an extra project row costs a name in a list, not data.
+		stats.Errors = append(stats.Errors, fmt.Errorf("prune empty projects: %w", err))
+		s.progress("Warning: could not prune empty project rows: %v", err)
+	} else if removed > 0 {
+		stats.ProjectsPruned = removed
+		s.progress("Removed %d project row(s) no session is filed under", removed)
+	}
+
 	if len(projectsTouched) == 0 {
 		return
 	}

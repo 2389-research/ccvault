@@ -928,6 +928,10 @@ over the live DB (the path is printed at run), or merge it back in with
 				"not appended to, so the archived turns were swapped rather than extended\n",
 				stats.SessionsRewrittenUpstream)
 		}
+		if stats.ProjectsPruned > 0 {
+			fmt.Printf("  Projects pruned: %d — no session is filed under them any more\n",
+				stats.ProjectsPruned)
+		}
 		if stats.SearchIndexRebuilt {
 			fmt.Println("  Search index: rebuilt from the parsed turns")
 		}
