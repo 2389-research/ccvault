@@ -221,6 +221,19 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 		prevCachedTokens int64
 		prevOutputTokens int64
 
+		// Deltas that arrived before there was an assistant turn to carry
+		// them. Codex only materialises a turn for a response_item/message,
+		// so a model response made entirely of tool calls produces none — and
+		// a run that works through tools before it says anything is billed the
+		// whole time. These used to be dropped (#166): 20 of 148 real rollouts
+		// on the author's machine lost deltas that way, the worst of them
+		// 36.7M of 36.9M tokens. They are held until the first assistant turn
+		// appears and applied to it, which is lumpy per turn and exact per
+		// session — and the session row is where these counters are read.
+		pendingInputTokens  int64
+		pendingCachedTokens int64
+		pendingOutputTokens int64
+
 		// A call and the output answering it are separate lines joined by
 		// call_id, so both halves are collected as they come and matched after
 		// the file is read. Resolving inline would only work while outputs
@@ -284,11 +297,24 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 
 		switch line.Type {
 		case "session_meta":
-			var meta sessionMetaPayload
-			if err := json.Unmarshal(line.Payload, &meta); err == nil {
-				sessionID = meta.ID
-				projectPath = meta.CWD
-				gitBranch = meta.Git.Branch
+			// First session_meta wins. A rollout that was forked — resumed, or
+			// spawned as a subagent — opens with its own session_meta and then
+			// replays the ancestor's, which names the ancestor's id and cwd.
+			// Taking the last one gave the rollout the ancestor's identity: on
+			// the author's machine 12 distinct rollouts resolved to one
+			// ancestor id, so syncing them wrote 12 files into a single session
+			// row and the last file synced overwrote the rest. Eleven rollouts
+			// left no row at all — not undercounted, absent (#166).
+			//
+			// Discover already reads only the first session_meta and keys the
+			// file on that id, so this is also what makes Parse agree with it.
+			if sessionID == "" {
+				var meta sessionMetaPayload
+				if err := json.Unmarshal(line.Payload, &meta); err == nil {
+					sessionID = meta.ID
+					projectPath = meta.CWD
+					gitBranch = meta.Git.Branch
+				}
 			}
 
 		case "turn_context":
@@ -343,6 +369,15 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 
 				if msg.Role == "assistant" {
 					lastAssistantIdx = len(turns) - 1
+					// Spend billed before any turn existed to carry it lands
+					// on the first assistant turn to appear — the turn it paid
+					// for. Only the first one ever finds a pending balance.
+					if pendingInputTokens != 0 || pendingCachedTokens != 0 || pendingOutputTokens != 0 {
+						turns[lastAssistantIdx].InputTokens += pendingInputTokens
+						turns[lastAssistantIdx].CacheReadTokens += pendingCachedTokens
+						turns[lastAssistantIdx].OutputTokens += pendingOutputTokens
+						pendingInputTokens, pendingCachedTokens, pendingOutputTokens = 0, 0, 0
+					}
 				}
 
 			case "function_call", "custom_tool_call":
@@ -393,10 +428,19 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 			}
 
 			if evt.Type == "token_count" {
-				// Compute delta from previous total
-				deltaInput := evt.Info.TotalTokenUsage.InputTokens - prevInputTokens
-				deltaCached := evt.Info.TotalTokenUsage.CachedInputTokens - prevCachedTokens
-				deltaOutput := evt.Info.TotalTokenUsage.OutputTokens - prevOutputTokens
+				// Compute delta from previous total.
+				//
+				// total_token_usage is cumulative but it restarts inside a
+				// single rollout when the context is cleared — a real reading
+				// drops from 767,935 to 40,766 mid-file. A counter that went
+				// down has restarted, so the new reading is itself the delta;
+				// subtracting the old total from it produced a negative delta
+				// that was then added to the turn, and one synced session held
+				// input_tokens = -399,066. Each counter is tested on its own
+				// because they do not have to reset together.
+				deltaInput := delta(evt.Info.TotalTokenUsage.InputTokens, prevInputTokens)
+				deltaCached := delta(evt.Info.TotalTokenUsage.CachedInputTokens, prevCachedTokens)
+				deltaOutput := delta(evt.Info.TotalTokenUsage.OutputTokens, prevOutputTokens)
 				prevInputTokens = evt.Info.TotalTokenUsage.InputTokens
 				prevCachedTokens = evt.Info.TotalTokenUsage.CachedInputTokens
 				prevOutputTokens = evt.Info.TotalTokenUsage.OutputTokens
@@ -410,20 +454,25 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 				//
 				// Codex reports no cache-creation figure, so CacheWriteTokens
 				// stays zero for this source — an absence, not a zero.
-				if deltaCached < 0 || deltaCached > deltaInput {
-					// A cumulative counter that went backwards, or a cached
-					// share larger than the input it is a share of. Neither
-					// should happen; if one does, leave the input delta whole
-					// rather than deriving a negative fresh-input count from
-					// it.
+				if deltaCached > deltaInput {
+					// A cached share larger than the input it is a share of.
+					// Should not happen; if it does, leave the input delta
+					// whole rather than deriving a negative fresh-input count
+					// from it. (A negative delta can no longer reach here —
+					// see the reset handling above.)
 					deltaCached = 0
 				}
 
-				// Attach to the last assistant turn
+				// Attach to the last assistant turn, or hold the deltas until
+				// one exists. Dropping them was #166.
 				if lastAssistantIdx >= 0 && lastAssistantIdx < len(turns) {
 					turns[lastAssistantIdx].InputTokens += deltaInput - deltaCached
 					turns[lastAssistantIdx].CacheReadTokens += deltaCached
 					turns[lastAssistantIdx].OutputTokens += deltaOutput
+				} else {
+					pendingInputTokens += deltaInput - deltaCached
+					pendingCachedTokens += deltaCached
+					pendingOutputTokens += deltaOutput
 				}
 			}
 		}
@@ -431,6 +480,20 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 		if errors.Is(readErr, io.EOF) {
 			break
 		}
+	}
+
+	// A rollout that never produced an assistant turn still has nowhere exact
+	// to put its spend, so the last turn carries it: the statement "by the end
+	// of this session, this much had been spent" is the least wrong available,
+	// and it keeps the session total right, which is what #166 is about. None
+	// of the 148 real rollouts on the author's machine is this shape — every
+	// one with a token_count event has at least one assistant message — so
+	// this is the floor under the format changing, not a path the data takes.
+	if len(turns) > 0 && (pendingInputTokens != 0 || pendingCachedTokens != 0 || pendingOutputTokens != 0) {
+		last := len(turns) - 1
+		turns[last].InputTokens += pendingInputTokens
+		turns[last].CacheReadTokens += pendingCachedTokens
+		turns[last].OutputTokens += pendingOutputTokens
 	}
 
 	attachCodexOutputs(turns, callSites, outputs)
@@ -450,6 +513,19 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 		SourceName:  "codex",
 		Metadata:    metadata,
 	}, nil
+}
+
+// delta returns how much a cumulative counter advanced between two readings.
+//
+// A reading lower than the one before it means the counter restarted, which
+// codex does mid-rollout when the context is cleared. The new reading is then
+// the whole of the advance since the restart, so it is returned as-is rather
+// than differenced against a total that no longer applies.
+func delta(current, previous int64) int64 {
+	if current < previous {
+		return current
+	}
+	return current - previous
 }
 
 // codexCallSite records where a tool use landed so the output answering it can
