@@ -32,14 +32,23 @@ type ParseStats struct {
 
 	// TurnsWithUnparsableTimestamp is the number of turns whose transcript
 	// timestamp matched none of parseTimestamp's layouts (or was absent) and
-	// so carries a fallback time rather than a recorded one.
+	// so carries the zero time rather than a recorded one.
 	//
 	// The turn is kept — dropping a conversation over a clock is the wrong
-	// trade — but the substitution used to be completely silent, which is
-	// #146. A fallback timestamp is indistinguishable from a real value on
-	// inspection: it sorts somewhere arbitrary in the archive, it answers
-	// date predicates, and nothing about the row says it was invented. The
-	// count is what makes it answerable.
+	// trade, and refusing the line would make a producer changing its
+	// timestamp format cost the content of every session it wrote rather than
+	// their metadata: a session with no turns gets no id either, since that
+	// comes from turns[0]. But the substitution used to be completely silent,
+	// which is #146, so the count is what makes it answerable.
+	//
+	// The zero time is the fallback and time.Now() was not (#165). A
+	// present-day instant is indistinguishable from a recorded one on
+	// inspection, answers every date predicate, and since #142 made
+	// timestamps sort lexicographically as instants it sorts to the newest end
+	// of the archive — the part people look at. The zero value is impossible
+	// on its face, and it is what the codex and jeff adapters already produce
+	// for the same failure, so one archive does not carry two markers for it.
+	// Neither value belongs in the session's bounds; see updateSessionMetadata.
 	//
 	// Non-zero here means a producer's format moved and this list has not.
 	// It is not consolidated with the codex and jeff lists on purpose: each
@@ -302,11 +311,14 @@ func parseTurnInternal(data []byte) (*models.Turn, *models.RawTurn, bool, error)
 		return nil, &raw, true, nil
 	}
 
-	// Parse timestamp
+	// Parse timestamp. An unreadable one leaves ts at the zero value, which
+	// updateSessionMetadata then keeps out of the session's bounds — see the
+	// note on TurnsWithUnparsableTimestamp for why that is the fallback and
+	// time.Now() was not (#165).
 	ts, tsErr := parseTimestamp(raw.Timestamp)
 	timestampOK := tsErr == nil
 	if !timestampOK {
-		ts = time.Now() // Fallback
+		ts = time.Time{}
 	}
 
 	turn := &models.Turn{
@@ -407,11 +419,27 @@ func updateSessionMetadata(session *models.Session, turn *models.Turn, raw *mode
 	//
 	// IsZero is the "not set yet" sentinel for both, so the first turn seen
 	// establishes the pair regardless of where it sits in time.
-	if session.StartedAt.IsZero() || turn.Timestamp.Before(session.StartedAt) {
-		session.StartedAt = turn.Timestamp
-	}
-	if session.EndedAt.IsZero() || turn.Timestamp.After(session.EndedAt) {
-		session.EndedAt = turn.Timestamp
+	//
+	// Only turns whose time the transcript actually recorded take part. A turn
+	// with an unreadable timestamp carries the zero time (#165) and says
+	// nothing about when the session ran, so letting it into the extrema would
+	// put a value in these columns that no line of the transcript claims.
+	// db.MergeFrom chooses between duplicate copies of a session by comparing
+	// ended_at, which makes that a data-loss path rather than a display bug:
+	// the old time.Now() fallback dragged ended_at past every real transcript
+	// and won merges it should have lost. The zero value would drag started_at
+	// to year 1 for the same reason, because the sentinel cannot tell "not set
+	// yet" from "set to zero". Skipping is what holds both off.
+	//
+	// The same rule, for the same reason, is what the codex adapter's
+	// !ts.IsZero() guard already does.
+	if !turn.Timestamp.IsZero() {
+		if session.StartedAt.IsZero() || turn.Timestamp.Before(session.StartedAt) {
+			session.StartedAt = turn.Timestamp
+		}
+		if session.EndedAt.IsZero() || turn.Timestamp.After(session.EndedAt) {
+			session.EndedAt = turn.Timestamp
+		}
 	}
 
 	// Accumulate tokens. All four counters, because all four are disjoint
