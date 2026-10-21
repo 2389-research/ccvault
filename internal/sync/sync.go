@@ -9,10 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"os"
-	"path/filepath"
 	"time"
 
+	"github.com/2389-research/ccvault/internal/analytics"
 	"github.com/2389-research/ccvault/internal/config"
 	"github.com/2389-research/ccvault/internal/db"
 	"github.com/2389-research/ccvault/pkg/adapter"
@@ -183,15 +182,19 @@ func (s *Syncer) Run(ctx context.Context) (*Stats, error) {
 	// Both --full and --rebuild re-parse everything, so numbers in the
 	// DuckDB analytics cache can change either way; invalidate it so the
 	// TUI Analytics tab and MCP get_analytics don't serve pre-sync figures.
-	// The TUI auto-rebuilds when sessions.parquet is missing.
+	// The TUI auto-rebuilds when the cache is missing.
+	//
+	// What counts as "the cache" is analytics' to say, not ours: this used to
+	// os.Remove a hard-coded "sessions.parquet", which would have left a
+	// second output file behind to go silently stale (#168). The package that
+	// writes the files decides which ones to remove.
 	//
 	// This runs BEFORE the --rebuild wipe on purpose (#25): if removing the
 	// parquet fails (read-only cache dir, EROFS, quota) we abort with the
 	// archive still intact, rather than leaving SQLite empty behind a stale
 	// cache that nothing warns the user about.
-	if s.reparseAll() && s.cacheDir != "" {
-		parquetPath := filepath.Join(s.cacheDir, "sessions.parquet")
-		if err := os.Remove(parquetPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	if s.reparseAll() {
+		if err := analytics.InvalidateCache(s.cacheDir); err != nil {
 			return nil, fmt.Errorf("invalidate analytics cache: %w", err)
 		}
 	}

@@ -4,7 +4,9 @@
 package analytics
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -46,6 +48,18 @@ type SessionRecord struct {
 	// them (#74), and a parquet file copied away from the archive has no
 	// join back to SQLite to recover the split.
 	ParentSessionID string `parquet:"name=parent_session_id, type=BYTE_ARRAY, convertedtype=UTF8"`
+
+	// CacheWriteTokens completes the set TotalTokens already sums. Exporting
+	// the read counter and not the write one meant the cache could not
+	// reproduce its own total from its own columns, and could not tell cheap
+	// spend from expensive: a cache read costs roughly a tenth of a cache
+	// write, so read-vs-write is what a cache-efficiency number is made of
+	// (#167).
+	//
+	// Appended for the same reason ParentSessionID was, rather than placed
+	// beside CacheReadTokens where it reads better: existing column positions
+	// stay put.
+	CacheWriteTokens int64 `parquet:"name=cache_write_tokens, type=INT64"`
 }
 
 // sessionRecordColumns returns the parquet column names SessionRecord
@@ -80,6 +94,46 @@ func parquetColumnName(tag string) string {
 		}
 	}
 	return ""
+}
+
+// InvalidateCache removes every Parquet file in cacheDir, so that whatever
+// Export wrote is gone and the next read rebuilds. A missing directory, and an
+// empty cacheDir meaning "no analytics cache configured", are both success.
+//
+// It lives here, beside the writer, because the two have to agree on what the
+// cache *is*. The caller used to os.Remove a hard-coded "sessions.parquet":
+// correct only while that is the sole output, and silently wrong the moment a
+// second file is added — the stale file would be one nobody is looking at
+// (#168). That is #149 one level up, where a staleness check pinned to one
+// column name went blind when a column was added. The rule is "whatever the
+// exporter wrote", expressed once, in the package that does the writing.
+//
+// Deliberately narrower than emptying the directory: non-Parquet files are
+// left alone, and subdirectories are not descended into, because Export
+// creates neither.
+func InvalidateCache(cacheDir string) error {
+	if cacheDir == "" {
+		return nil
+	}
+
+	entries, err := os.ReadDir(cacheDir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("read analytics cache dir: %w", err)
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".parquet" {
+			continue
+		}
+		path := filepath.Join(cacheDir, entry.Name())
+		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("remove %s: %w", path, err)
+		}
+	}
+	return nil
 }
 
 // Exporter exports data to Parquet format
@@ -153,19 +207,20 @@ func (e *Exporter) exportSessions() error {
 
 	for _, s := range sessions {
 		record := SessionRecord{
-			ID:              s.ID,
-			ProjectID:       s.ProjectID,
-			ProjectPath:     projectPaths[s.ProjectID],
-			StartedAt:       s.StartedAt.UnixMilli(),
-			EndedAt:         s.EndedAt.UnixMilli(),
-			Model:           s.Model,
-			TurnCount:       int32(s.TurnCount),
-			InputTokens:     s.InputTokens,
-			OutputTokens:    s.OutputTokens,
-			CacheReadTokens: s.CacheReadTokens,
-			TotalTokens:     s.InputTokens + s.OutputTokens + s.CacheReadTokens + s.CacheWriteTokens,
-			Source:          s.Source,
-			ParentSessionID: s.ParentSessionID,
+			ID:               s.ID,
+			ProjectID:        s.ProjectID,
+			ProjectPath:      projectPaths[s.ProjectID],
+			StartedAt:        s.StartedAt.UnixMilli(),
+			EndedAt:          s.EndedAt.UnixMilli(),
+			Model:            s.Model,
+			TurnCount:        int32(s.TurnCount),
+			InputTokens:      s.InputTokens,
+			OutputTokens:     s.OutputTokens,
+			CacheReadTokens:  s.CacheReadTokens,
+			CacheWriteTokens: s.CacheWriteTokens,
+			TotalTokens:      s.InputTokens + s.OutputTokens + s.CacheReadTokens + s.CacheWriteTokens,
+			Source:           s.Source,
+			ParentSessionID:  s.ParentSessionID,
 		}
 		if err := pw.Write(record); err != nil {
 			return fmt.Errorf("write record: %w", err)
