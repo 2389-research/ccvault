@@ -615,22 +615,24 @@ func (s *Syncer) processSession(ctx context.Context, sf adapter.SessionFile, adp
 			OutputTokens: int(pt.OutputTokens),
 		}
 
-		// Accumulate session token totals. The turns table has no cache
-		// columns, so the cache pair is summed straight into the session row
-		// without a per-turn stop — adapters are responsible for reporting
-		// them disjoint from input/output (see adapter.ParsedTurn). Omitting
-		// them here is what left sessions.cache_read_tokens at 0 for every
-		// row in the archive (#155).
-		session.InputTokens += pt.InputTokens
-		session.OutputTokens += pt.OutputTokens
-		session.CacheReadTokens += pt.CacheReadTokens
-		session.CacheWriteTokens += pt.CacheWriteTokens
-
 		// Convert tool uses
 		for _, ptu := range pt.ToolUses {
 			toolUses = append(toolUses, adapter.ToolUseFromParsed(ptu, pt.ID, parsed.ID, pt.Timestamp))
 		}
 	}
+
+	// Session token totals. The turns table has no cache columns, so the cache
+	// pair is summed straight into the session row the way the input/output
+	// pair is — adapters are responsible for reporting all four disjoint (see
+	// adapter.ParsedTurn). Omitting the cache pair here is what left
+	// sessions.cache_read_tokens at 0 for every row in the archive (#155), and
+	// the sum lives in adapter.ParsedSession.TokenTotals so the backfill that
+	// repairs those rows cannot add them up any other way.
+	totals := parsed.TokenTotals()
+	session.InputTokens = totals.Input
+	session.OutputTokens = totals.Output
+	session.CacheReadTokens = totals.CacheRead
+	session.CacheWriteTokens = totals.CacheWrite
 
 	session.TurnCount = len(turns)
 	if len(turns) > 0 {
