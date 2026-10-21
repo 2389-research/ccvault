@@ -141,6 +141,7 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 	}
 
 	sessionID := session.ID
+	projectPath := session.ProjectPath
 	if adapter.IsSubagentPath(path) {
 		// A subagent transcript's in-band sessionId is its PARENT's uuid, so
 		// session.ID here is the parent's. Trusting it would make every
@@ -153,6 +154,15 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 		}
 		agentID := adapter.SubagentAgentID(path)
 		sessionID = adapter.SubagentSessionID(a.Name(), parentUUID, agentID)
+
+		// A subagent's project is its parent's project, never its own cwd —
+		// the cwd of an agent given worktree isolation is a directory named
+		// after the agent and deleted when it exits (#156). Falls back to the
+		// cwd-derived value, which #72's CanonicalProjectPath has already
+		// collapsed, when there is no parent transcript to read.
+		if parentProject := parser.SubagentProjectPath(path); parentProject != "" {
+			projectPath = parentProject
+		}
 
 		metadata["is_sidechain"] = true
 		if agentID != "" {
@@ -170,8 +180,8 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 
 	parsed := &adapter.ParsedSession{
 		ID:          sessionID,
-		ProjectPath: session.ProjectPath,
-		DisplayName: parser.GetDisplayName(session.ProjectPath),
+		ProjectPath: projectPath,
+		DisplayName: parser.GetDisplayName(projectPath),
 		Turns:       parsedTurns,
 		Model:       session.Model,
 		GitBranch:   session.GitBranch,

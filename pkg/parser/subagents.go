@@ -31,8 +31,9 @@ const (
 // The transcript's in-band sessionId field holds the PARENT's uuid, so it is
 // not usable as an identity — adapters mint a composite id instead (see
 // adapter.SubagentSessionID). ProjectPath is the lossy decode of the encoded
-// project directory, the same best-effort value ScanClaudeHome produces; the
-// cwd inside the transcript remains the authoritative source.
+// project directory, the same best-effort value ScanClaudeHome produces, and
+// it is only ever a label for a file that has not been parsed yet —
+// SubagentProjectPath decides the real one, from the parent session's cwd.
 //
 // A missing tree is not an error — a source with no sessions yet has no
 // subagents either.

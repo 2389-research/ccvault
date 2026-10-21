@@ -61,6 +61,18 @@ func decodedProjectDir(projectDir string) string {
 // contentless row and user-content assertions matched nothing.
 func writeTestSession(t *testing.T, dir, sessionID, projectDir string) string {
 	t.Helper()
+	return writeTestSessionWithCWD(t, dir, sessionID, projectDir, decodedProjectDir(projectDir))
+}
+
+// writeTestSessionWithCWD is writeTestSession with the transcript's cwd chosen
+// independently of the encoded directory it sits in.
+//
+// The two disagree in real data more often than the encoding suggests: the
+// encode is lossy, so a cwd holding a dot or a dash cannot be recovered from
+// the directory name at all. A fixture that can only express the agreeing case
+// cannot test what ccvault does with the cwd, which is the authoritative half.
+func writeTestSessionWithCWD(t *testing.T, dir, sessionID, projectDir, cwd string) string {
+	t.Helper()
 	// Create projects/<encoded-path>/ directory
 	projDir := filepath.Join(dir, "projects", projectDir)
 	if err := os.MkdirAll(projDir, 0755); err != nil {
@@ -68,7 +80,6 @@ func writeTestSession(t *testing.T, dir, sessionID, projectDir string) string {
 	}
 	path := filepath.Join(projDir, sessionID+".jsonl")
 
-	cwd := decodedProjectDir(projectDir)
 	now := time.Now().UTC().Truncate(time.Millisecond)
 
 	// Write a minimal JSONL file with a user message and an assistant response

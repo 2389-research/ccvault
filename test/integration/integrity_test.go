@@ -6,8 +6,12 @@ package integration
 import (
 	"database/sql"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/2389-research/ccvault/internal/db"
 
 	_ "modernc.org/sqlite"
 )
@@ -33,6 +37,29 @@ func stampFutureSchema(t *testing.T, dataDir string) int {
 		t.Fatalf("stamp schema version %d: %v", future, err)
 	}
 	return future
+}
+
+// knownSchemaVersion is the highest migration this source tree ships, which is
+// the number the built binary will report as its own maximum — both read the
+// same embedded migrations.
+//
+// A failure here is fatal rather than a reason to weaken the assertion below:
+// if the migrations cannot be enumerated, the test has no contract to check.
+func knownSchemaVersion(t *testing.T) int {
+	t.Helper()
+	known, err := db.MaxKnownSchemaVersion()
+	if err != nil {
+		t.Fatalf("read the highest shipped migration: %v", err)
+	}
+	return known
+}
+
+// namesNumber reports whether said contains n as a number in its own right,
+// rather than as the digits of a larger one. Schema versions are small, so a
+// plain substring match would let "151 turns" stand in for "15" and pass a
+// refusal that never named the version at all.
+func namesNumber(said string, n int) bool {
+	return regexp.MustCompile(`(?:^|[^0-9])` + strconv.Itoa(n) + `(?:[^0-9]|$)`).MatchString(said)
 }
 
 // strandTurnsFTSDoc forges the damage of #93 in the fixture's archive: a
@@ -88,8 +115,24 @@ func TestCLI_RefusesToWriteAnArchiveFromTheFuture(t *testing.T) {
 					t.Errorf("refusal does not mention %q:\n%s", want, said)
 				}
 			}
-			if !strings.Contains(said, "13") && !strings.Contains(said, "14") {
-				t.Errorf("refusal names no version numbers (archive is at %d):\n%s", future, said)
+			// Both numbers, derived rather than written down. The refusal is
+			// only actionable if it says which version the archive is at AND
+			// which one this binary tops out at — "upgrade" is advice the user
+			// cannot check without the pair.
+			//
+			// This assertion used to name the literals "13" and "14", which
+			// meant every migration that moved the binary's maximum broke a
+			// test about message content: 015 made it say "up to 15" and
+			// neither literal appeared. Reading the maximum off the embedded
+			// migrations is the same question the binary answers, so the pair
+			// moves with the schema and 016 needs no edit here.
+			for label, n := range map[string]int{
+				"the archive's version": future,
+				"its own maximum":       knownSchemaVersion(t),
+			} {
+				if !namesNumber(said, n) {
+					t.Errorf("refusal does not name %s (%d):\n%s", label, n, said)
+				}
 			}
 		})
 	}

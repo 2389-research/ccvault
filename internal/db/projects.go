@@ -269,6 +269,45 @@ func (db *DB) ReconcileProjectAggregates(paths []string) error {
 	return nil
 }
 
+// DeleteEmptyProjects removes every project row no session is filed under,
+// and returns how many it removed.
+//
+// A project row is created by the first session that names its path and is
+// never otherwise deleted, so an empty one means the sessions that justified
+// it have moved to another project. That happens when an attribution rule is
+// corrected and the affected transcripts are re-parsed: migration 015 forgets
+// the mtime of 42 misfiled subagent transcripts on the author's archive, and
+// the re-parse leaves the 37 agent-worktree project rows they came from
+// holding nothing (#156).
+//
+// An empty row is not harmless. It is a name in `list-projects`, a row in the
+// analytics export, and — the reason #156 was raised — a candidate that makes
+// `--project ccvault` ambiguous between the repo and the worktrees of agents
+// that once ran in it.
+//
+// Keyed on the absence of a referencing session rather than on session_count,
+// because that counter is maintained additively by UpsertProject and is the
+// very thing that cannot be trusted here. Safe to run on any sync: a project
+// whose sessions were all skipped this run still has its session rows, and the
+// sync write path creates a project and its first session in one transaction,
+// so there is no moment at which a live project looks empty.
+func (db *DB) DeleteEmptyProjects() (int64, error) {
+	res, err := db.Exec(`
+		DELETE FROM projects
+		WHERE NOT EXISTS (
+			SELECT 1 FROM sessions WHERE sessions.project_id = projects.id
+		)`)
+	if err != nil {
+		return 0, fmt.Errorf("delete empty projects: %w", err)
+	}
+	removed, err := res.RowsAffected()
+	if err != nil {
+		// The rows are gone either way; only the count is unavailable.
+		return 0, nil
+	}
+	return removed, nil
+}
+
 // GetFirstAndLastActivity returns the date range of all activity
 func (db *DB) GetFirstAndLastActivity() (first, last time.Time, err error) {
 	query := `SELECT MIN(first_seen_at), MAX(last_activity_at) FROM projects`
