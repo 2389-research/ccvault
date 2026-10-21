@@ -43,9 +43,18 @@ func waitFor(d time.Duration, cond func() bool) bool {
 }
 
 // writeSyntheticClaudeHome creates a Claude-Code-shaped source tree with
-// `count` single-turn sessions. Enough of them to overflow the TUI's
+// `count` two-turn sessions. Enough of them to overflow the TUI's
 // 100-slot progress channels is the point: that is when the sync goroutine
 // starts blocking on send.
+//
+// The field set is kept close to a real transcript line, because every field
+// the fixture omits is a field no test in this package can assert on. The
+// tests here only count goroutines, so none of it is load-bearing today —
+// but #107 is what happens otherwise: the user turn's type was "human",
+// which the claude-code adapter does not recognise, so it indexed a
+// contentless row with an empty role. That broke no existing assertion (they
+// were all row counts) and silently blocked every new one, costing an agent
+// a false failure before anyone worked out why.
 func writeSyntheticClaudeHome(t *testing.T, count int) string {
 	t.Helper()
 	home := t.TempDir()
@@ -59,25 +68,69 @@ func writeSyntheticClaudeHome(t *testing.T, count int) string {
 		// The scanner only accepts UUID-shaped filenames, so the session IDs
 		// have to look like real ones.
 		sessionID := fmt.Sprintf("a1b2c3d4-e5f6-7890-abcd-%012d", i)
-		turnID := sessionID + "-turn-1"
-		msg := map[string]any{
-			"uuid":      turnID,
-			"sessionId": sessionID,
-			"type":      "human",
+		userTurnID := sessionID + "-turn-1"
+		assistantTurnID := sessionID + "-turn-2"
+		userMsg := map[string]any{
+			"uuid":       userTurnID,
+			"parentUuid": nil,
+			"sessionId":  sessionID,
+			// "user" is the type real Claude Code transcripts carry; "human"
+			// parses to empty content (#107).
+			"type":      "user",
 			"timestamp": now.Format(time.RFC3339Nano),
 			"cwd":       "/Users/test/leaky",
+			"gitBranch": "main",
+			"version":   "1.0.0",
+			"userType":  "external",
 			"message": map[string]any{
 				"role":    "user",
 				"content": "hello",
 			},
 		}
-		line, err := json.Marshal(msg)
-		if err != nil {
-			t.Fatalf("marshal: %v", err)
+		assistantMsg := map[string]any{
+			"uuid":       assistantTurnID,
+			"parentUuid": userTurnID,
+			"sessionId":  sessionID,
+			"type":       "assistant",
+			"timestamp":  now.Add(time.Second).Format(time.RFC3339Nano),
+			"cwd":        "/Users/test/leaky",
+			"gitBranch":  "main",
+			"version":    "1.0.0",
+			"userType":   "external",
+			"message": map[string]any{
+				"id":    fmt.Sprintf("msg-%d", i),
+				"model": "claude-sonnet-4-20250514",
+				"role":  "assistant",
+				"content": []map[string]any{
+					{"type": "text", "text": "hi there"},
+				},
+				// Real assistant messages always carry the two cache
+				// counters, and they routinely dwarf input_tokens. Omitting
+				// them is how #155 stayed invisible — a token assertion
+				// against a fixture with no usage object reads zero and
+				// passes, which is also the value the bug produced.
+				"usage": map[string]any{
+					"input_tokens":                10,
+					"output_tokens":               5,
+					"cache_read_input_tokens":     100,
+					"cache_creation_input_tokens": 20,
+				},
+			},
 		}
 		path := filepath.Join(projDir, sessionID+".jsonl")
-		if err := os.WriteFile(path, append(line, '\n'), 0o600); err != nil {
-			t.Fatalf("write session: %v", err)
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+		if err != nil {
+			t.Fatalf("create session file: %v", err)
+		}
+		enc := json.NewEncoder(f)
+		for _, msg := range []map[string]any{userMsg, assistantMsg} {
+			if err := enc.Encode(msg); err != nil {
+				_ = f.Close()
+				t.Fatalf("encode turn: %v", err)
+			}
+		}
+		if err := f.Close(); err != nil {
+			t.Fatalf("close session file: %v", err)
 		}
 	}
 	return home
