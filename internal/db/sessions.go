@@ -293,6 +293,29 @@ func (db *DB) SessionLastEntryUUIDTx(tx *sql.Tx, sessionID string) (string, bool
 	return stored.String, stored.Valid, nil
 }
 
+// SessionProjectPathTx returns the path of the project a session is currently
+// filed under, and whether there was a row to read it from.
+//
+// Called before a re-parse rewrites the row, because a session that moves
+// project leaves the old one's counters naming a session it no longer holds,
+// and the old project's identity is only knowable from the row as it stands.
+// A session with no project yet reads back as ("", false): nothing to
+// reconcile, same as no row at all.
+func (db *DB) SessionProjectPathTx(tx *sql.Tx, sessionID string) (string, bool, error) {
+	var path sql.NullString
+	err := tx.QueryRow(`
+		SELECT p.path FROM sessions s
+		JOIN projects p ON p.id = s.project_id
+		WHERE s.id = ?`, sessionID).Scan(&path)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("read current project for session %s: %w", sessionID, err)
+	}
+	return path.String, path.Valid, nil
+}
+
 // SubagentScope selects which rows a session listing returns.
 type SubagentScope int
 

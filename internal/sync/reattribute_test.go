@@ -105,3 +105,90 @@ func TestReparseMovesASessionToItsCorrectedProject(t *testing.T) {
 		t.Errorf("session count = %d, want 2 (the dispatcher plus the subagent it reclaimed)", projects[0].SessionCount)
 	}
 }
+
+// TestReparseReconcilesTheProjectASessionLeft is the case the prune cannot
+// cover: the project a session departs still holds other sessions, so it
+// survives — carrying the departed session in its counters.
+//
+// reconcileProjects recomputes the projects a run wrote *into*. The project a
+// session moved *out of* was never written to, so nothing recomputed it, and
+// its session_count and total_tokens stayed inflated by a session it no longer
+// holds. Unreachable before a re-parse could move a session at all, which is
+// why it arrives with that change rather than before it.
+func TestReparseReconcilesTheProjectASessionLeft(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	claudeHome := t.TempDir()
+	const (
+		encodedProject = "-Users-test-dispatcher"
+		dispatcherPath = "/Users/test/dispatcher"
+		parentUUID     = "afafafaf-1111-2222-3333-444444444444"
+		agentID        = "agent-bbbb2222bbbb2222b"
+		// A worktree of some OTHER repo, which has a session of its own, so
+		// the subagent leaving it does not empty it.
+		otherRepo = "/Users/test/otherrepo"
+		worktree  = otherRepo + "/.worktrees/ws-isolated"
+	)
+	sources := []config.SourceConfig{
+		{Name: "claude-code", Type: "claude-code", Path: claudeHome},
+	}
+
+	// A top-level session of the author's own, run inside that worktree. It
+	// keeps the project row alive after the subagent leaves.
+	writeTestSessionWithCWD(t, claudeHome, "abababab-1111-2222-3333-444444444444",
+		"-Users-test-otherrepo-worktrees-ws-isolated", worktree)
+	writeSubagentTranscript(t, claudeHome, encodedProject, parentUUID, agentID, worktree)
+	if _, err := New(database, sources).Run(context.Background()); err != nil {
+		t.Fatalf("first Run(): %v", err)
+	}
+
+	before, err := database.GetProjectByPath(worktree)
+	if err != nil || before == nil {
+		t.Fatalf("GetProjectByPath(%q) = %v, %v", worktree, before, err)
+	}
+	if before.SessionCount != 2 {
+		t.Fatalf("setup: worktree project holds %d sessions, want 2 (a top-level one plus the misfiled subagent)", before.SessionCount)
+	}
+
+	// The repair: the parent appears, the mtime goes the way migration 015
+	// sends it, one sync.
+	writeTestSession(t, claudeHome, parentUUID, encodedProject)
+	subagentPath := claudeHome + "/projects/" + encodedProject + "/" + parentUUID + "/subagents/" + agentID + ".jsonl"
+	if _, err := database.Exec(
+		`DELETE FROM source_files WHERE path = ? AND source = 'claude-code'`, subagentPath); err != nil {
+		t.Fatalf("forget mtime: %v", err)
+	}
+	if _, err := New(database, sources).Run(context.Background()); err != nil {
+		t.Fatalf("second Run(): %v", err)
+	}
+
+	after, err := database.GetProjectByPath(worktree)
+	if err != nil || after == nil {
+		t.Fatalf("the worktree project should survive, it still has a session of its own: %v, %v", after, err)
+	}
+
+	var held int
+	if err := database.QueryRow(
+		`SELECT COUNT(*) FROM sessions WHERE project_id = ?`, after.ID).Scan(&held); err != nil {
+		t.Fatalf("count sessions: %v", err)
+	}
+	if held != 1 {
+		t.Fatalf("worktree project holds %d sessions after the repair, want 1", held)
+	}
+	if int(after.SessionCount) != held {
+		t.Errorf("session_count = %d but the project holds %d sessions — the project a session left was never reconciled",
+			after.SessionCount, held)
+	}
+
+	var heldTokens int64
+	if err := database.QueryRow(`
+		SELECT COALESCE(SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)
+			+ COALESCE(cache_read_tokens, 0) + COALESCE(cache_write_tokens, 0)), 0)
+		FROM sessions WHERE project_id = ?`, after.ID).Scan(&heldTokens); err != nil {
+		t.Fatalf("sum tokens: %v", err)
+	}
+	if after.TotalTokens != heldTokens {
+		t.Errorf("total_tokens = %d but the sessions it holds total %d", after.TotalTokens, heldTokens)
+	}
+}

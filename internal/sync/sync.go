@@ -642,8 +642,26 @@ func (s *Syncer) processSession(ctx context.Context, sf adapter.SessionFile, adp
 	// rolled-back session is not counted.
 	rewritten := false
 
+	// Set by the transaction below to the project this session is leaving, so
+	// reconcileProjects recomputes that one too. Collected after the commit
+	// for the same reason `rewritten` is.
+	departedProject := ""
+
 	// Store everything in a transaction
 	err = s.db.WithTxContext(ctx, func(tx *sql.Tx) error {
+		// The project the session is filed under right now, read before the
+		// upsert below overwrites it. A re-parse can move a session — that is
+		// what makes a corrected attribution rule take effect (#156) — and the
+		// project it moves OUT of is never written to, so nothing would
+		// recompute counters that still include the departing session. The
+		// prune does not cover it either: a project keeping any other session
+		// survives, inflated.
+		if previous, ok, err := s.db.SessionProjectPathTx(tx, session.ID); err != nil {
+			return err
+		} else if ok && previous != session.ProjectPath {
+			departedProject = previous
+		}
+
 		// Upsert project — use display name from adapter (source-specific logic)
 		displayName := parsed.DisplayName
 		if displayName == "" {
@@ -729,6 +747,11 @@ func (s *Syncer) processSession(ctx context.Context, sf adapter.SessionFile, adp
 	stats.SessionsIndexed++
 	stats.TurnsIndexed += len(turns)
 	stats.ToolUsesIndexed += len(toolUses)
+	// Marked only after the commit: a rolled-back session did not move, so
+	// reconciling the project it would have left would be work for nothing.
+	if departedProject != "" {
+		projectsTouched[departedProject] = true
+	}
 	if rewritten {
 		stats.SessionsRewrittenUpstream++
 		if s.verbose {
