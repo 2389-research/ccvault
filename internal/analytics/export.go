@@ -4,7 +4,9 @@
 package analytics
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -92,6 +94,46 @@ func parquetColumnName(tag string) string {
 		}
 	}
 	return ""
+}
+
+// InvalidateCache removes every Parquet file in cacheDir, so that whatever
+// Export wrote is gone and the next read rebuilds. A missing directory, and an
+// empty cacheDir meaning "no analytics cache configured", are both success.
+//
+// It lives here, beside the writer, because the two have to agree on what the
+// cache *is*. The caller used to os.Remove a hard-coded "sessions.parquet":
+// correct only while that is the sole output, and silently wrong the moment a
+// second file is added — the stale file would be one nobody is looking at
+// (#168). That is #149 one level up, where a staleness check pinned to one
+// column name went blind when a column was added. The rule is "whatever the
+// exporter wrote", expressed once, in the package that does the writing.
+//
+// Deliberately narrower than emptying the directory: non-Parquet files are
+// left alone, and subdirectories are not descended into, because Export
+// creates neither.
+func InvalidateCache(cacheDir string) error {
+	if cacheDir == "" {
+		return nil
+	}
+
+	entries, err := os.ReadDir(cacheDir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("read analytics cache dir: %w", err)
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".parquet" {
+			continue
+		}
+		path := filepath.Join(cacheDir, entry.Name())
+		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("remove %s: %w", path, err)
+		}
+	}
+	return nil
 }
 
 // Exporter exports data to Parquet format
