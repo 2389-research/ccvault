@@ -164,7 +164,11 @@ Built via `ccvault build-cache`, enables DuckDB queries:
 
 - `sessions.parquet`: Session-level aggregates — **the only file built.**
   Carries `source` and, since #74, `parent_session_id`, so a DuckDB query over
-  the cache alone can split subagent spend from top-level spend.
+  the cache alone can split subagent spend from top-level spend. Since #167 it
+  carries `cache_write_tokens` beside `cache_read_tokens`, so the same query
+  can split cheap cache reads from writes costing roughly ten times as much —
+  and can recompute `total_tokens` from its own components, which until then
+  came up short by exactly the write counter.
 - `turns.parquet`: Turn-level data for time series — **never built** (see the
   historical note under Storage Architecture).
 - `tools.parquet`: Tool usage patterns — **never built** (same note).
