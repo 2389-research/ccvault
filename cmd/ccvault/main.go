@@ -583,12 +583,15 @@ func printCacheTokenSection(c db.CacheTokenCoverage) {
 	// archive, where the repair recovered 23.1 billion cache tokens against
 	// 154 million counted ones.
 	fmt.Println("  Re-derive them from the stored transcript lines with 'ccvault repair-tokens'.")
-	// Said here because this line is otherwise a nag that never clears: 45 of
+	// Said here because this line is otherwise a nag that never clears. 45 of
 	// the author's sessions cannot be re-derived at all — 42 hold turns whose
 	// stored line was nulled as unreadable (#101) and 3 are missing turns the
-	// row still counts — so they keep being reported after every repair.
-	// 'repair-tokens' names each refusal; this says the residue is expected.
-	fmt.Println("  A session whose stored lines are gone or incomplete cannot be repaired and stays here.")
+	// row still counts — and every legacy codex session is permanently in that
+	// position too, because codex records its token counts on event lines that
+	// never became turns and so were never stored. 'repair-tokens' names each
+	// refusal and which source it came from; this says the residue is expected.
+	fmt.Println("  A session whose stored lines are gone, incomplete, or never held its")
+	fmt.Println("  token counts cannot be repaired, and stays here.")
 	fmt.Println()
 }
 
@@ -2172,8 +2175,11 @@ func runRepairTokens(ctx context.Context, database *db.DB, dryRun, asJSON bool) 
 			"repaired":               report.Repaired,
 			"no_cache_usage":         report.NoCacheUsage,
 			"unreadable":             report.Unreadable,
+			"stripped_payloads":      report.StrippedPayloads,
 			"mismatched":             report.Mismatched,
+			"mismatched_by_source":   report.MismatchedBySource,
 			"unsupported":            report.UnsupportedBySource,
+			"refused":                report.Refused,
 			"failed":                 report.Failed,
 			"cache_tokens_recovered": report.CacheTokensRecovered,
 			"coverage_before":        cacheCoverageJSON(before),
@@ -2183,7 +2189,7 @@ func runRepairTokens(ctx context.Context, database *db.DB, dryRun, asJSON bool) 
 			return fmt.Errorf("marshal repair report: %w", marshalErr)
 		}
 		fmt.Println(string(out))
-		return nil
+		return repairTokensVerdict(report)
 	}
 
 	fmt.Println()
@@ -2196,18 +2202,37 @@ func runRepairTokens(ctx context.Context, database *db.DB, dryRun, asJSON bool) 
 		report.Examined, report.Candidates, report.Elapsed.Round(time.Second))
 	fmt.Printf("  repaired               %d session(s), recovering %s cache tokens\n",
 		report.Repaired, formatTokens(report.CacheTokensRecovered))
+	if report.StrippedPayloads > 0 {
+		fmt.Printf("                         %d of those hold a line too large to store, so their total\n",
+			report.StrippedPayloads)
+		fmt.Println("                         may be short by that turn — far less wrong than the zero")
+		fmt.Println("                         leaving them alone would have kept")
+	}
 	fmt.Printf("  no cache usage         %d session(s) whose stored lines record none\n",
 		report.NoCacheUsage)
 	if report.Mismatched > 0 {
 		fmt.Printf("  left alone             %d session(s) whose stored lines do not account for the tokens the row counts\n",
 			report.Mismatched)
+		// Named by source, because the causes are not alike. A claude-code
+		// session here is usually missing turns its row still counts; every
+		// legacy codex session is here by construction, because codex records
+		// its token counts on event lines that never became turns and so
+		// never reached raw_json.
+		for _, source := range sortedKeys(report.MismatchedBySource) {
+			fmt.Printf("                         %d of them from %s\n", report.MismatchedBySource[source], source)
+		}
 	}
 	if report.Unreadable > 0 {
 		fmt.Printf("  unreadable             %d session(s) holding a turn with no stored line\n",
 			report.Unreadable)
 	}
-	for source, n := range report.UnsupportedBySource {
-		fmt.Printf("  %-22s %d session(s) cannot be re-derived from stored lines\n", source, n)
+	for _, source := range sortedKeys(report.UnsupportedBySource) {
+		fmt.Printf("  %-22s %d session(s) cannot be re-derived from stored lines\n",
+			source, report.UnsupportedBySource[source])
+	}
+	if report.Refused > 0 {
+		fmt.Printf("  not written            %d session(s) had moved on before the write reached them\n",
+			report.Refused)
 	}
 	if report.Failed > 0 {
 		fmt.Printf("  failed                 %d session(s)\n", report.Failed)
@@ -2228,7 +2253,34 @@ func runRepairTokens(ctx context.Context, database *db.DB, dryRun, asJSON bool) 
 		fmt.Println("Run 'ccvault build-cache' to carry the repair into the analytics cache.")
 	}
 
-	return nil
+	return repairTokensVerdict(report)
+}
+
+// repairTokensVerdict turns sessions the run could not read at all into a
+// non-zero exit, after the report has been printed.
+//
+// Same reason `stats --strict` exits non-zero on a malformed index: a verdict
+// that only shows up in prose is a verdict a script and an agent both miss. A
+// refusal is not a failure — those are counted and named and the archive is
+// left correct — but an error re-deriving a session means the run could not
+// tell, and a command that could not tell has not succeeded.
+func repairTokensVerdict(report sync.CacheBackfillReport) error {
+	if report.Failed == 0 {
+		return nil
+	}
+	return fmt.Errorf("could not re-derive %d session(s); the counts above cover the rest", report.Failed)
+}
+
+// sortedKeys returns a map's keys in order, so a report prints the same way
+// twice. Go randomizes map iteration, which in a report reads as the archive
+// having changed.
+func sortedKeys(m map[string]int) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // cacheCoverageJSON renders the cache-token coverage for --json consumers.

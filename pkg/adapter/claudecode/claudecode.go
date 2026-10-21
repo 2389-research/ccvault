@@ -78,11 +78,11 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 }
 
 // ParseTranscript reads the same transcript from a reader rather than from the
-// file at originalPath — see adapter.TranscriptReparser for why that is worth
-// having. originalPath still decides the path-derived answers (sidechain
-// identity, the parent's project) exactly as Parse's own path does.
-func (a *Adapter) ParseTranscript(originalPath string, r io.Reader) (*adapter.ParsedSession, error) {
-	path := originalPath
+// file at path — see adapter.TranscriptReparser for why that is worth having.
+// path is where the transcript came from and is not opened here, but it still
+// decides the path-derived answers (sidechain identity, the parent's project)
+// exactly as Parse's own path does.
+func (a *Adapter) ParseTranscript(path string, r io.Reader) (*adapter.ParsedSession, error) {
 	turns, session, stats, err := parser.ParseSessionReader(r, path)
 	if err != nil {
 		return nil, err

@@ -4,6 +4,7 @@
 package db
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -21,6 +22,21 @@ import (
 // and not a failure — the sentinel is here so the caller can tell the two
 // apart rather than treating "unrepairable" as "the run went wrong".
 var ErrNoStoredLine = errors.New("turn has no stored transcript line")
+
+// strippedMarker is the field pkg/parser's strippedRawJSON writes in place of
+// a transcript line that exceeded the raw_json cap. The placeholder keeps the
+// turn's identity and drops its message, so the usage object inside it is
+// gone — a turn that cannot be re-derived from, even though it parses.
+//
+// The _ccvault_ namespace is ccvault's own, so nothing a source writes can
+// collide with it.
+const strippedMarker = `"_ccvault_stripped"`
+
+// maxStrippedLineBytes bounds where the marker is looked for. A placeholder
+// holds six short fields and never reaches 300 bytes, so a line above this is
+// a real transcript line and is not scanned at all — which is what keeps the
+// check off the 4 GB of raw_json that matters for runtime.
+const maxStrippedLineBytes = 1024
 
 // CacheTokenCoverage is how much of the archive carries the prompt-cache
 // counters, and how much still reads zero.
@@ -176,6 +192,33 @@ type StoredTranscript struct {
 	// that stopped it. Sticky, so a caller that keeps reading keeps being told
 	// the same thing.
 	done error
+
+	// stripped counts the lines handed out that are ccvault's placeholder for
+	// an oversized original rather than the line a source wrote. They parse
+	// cleanly and carry no usage, so nothing downstream can tell that the
+	// turn's cost was dropped — see StrippedLines.
+	stripped int
+}
+
+// StrippedLines reports how many of the lines read so far were ccvault's
+// placeholder for a transcript line too large to store.
+//
+// Read it after the parse. It is the one caveat a re-derivation cannot work
+// out for itself: the placeholder keeps the turn and loses its usage object,
+// so a session holding one re-derives short by exactly that turn's cost and
+// looks complete. The token checksum catches the common case, because the
+// turn's input and output go missing with it — but not a turn whose usage was
+// input 0, output 0 and cache non-zero, which a fully-cached prompt really
+// does produce.
+//
+// What a caller should do with it is report it, not refuse on it. Measured on
+// the author's archive: 7 placeholder turns across 6 sessions, in 13,375 turns
+// holding 1.29 billion cache tokens. Refusing those sessions leaves all 1.29
+// billion uncounted to avoid being short by at most seven turns — and the
+// zero that refusal leaves behind is both the larger error and the one
+// indistinguishable from a session that spent no cache tokens.
+func (t *StoredTranscript) StrippedLines() int {
+	return t.stripped
 }
 
 // Read implements io.Reader.
@@ -202,11 +245,20 @@ func (t *StoredTranscript) Read(p []byte) (int, error) {
 			t.done = fmt.Errorf("scan stored line of session %s: %w", t.sessionID, err)
 			return 0, t.done
 		}
-		if !raw.Valid {
+		// An empty string is as unreadable as a NULL and has to end the stream
+		// the same way. It would otherwise become a bare newline, which
+		// pkg/parser drops without even counting it as a skipped line — the
+		// turn would vanish from the transcript with nothing to say so, which
+		// is the silent-undercount shape this sentinel exists to prevent.
+		if !raw.Valid || raw.String == "" {
 			t.done = fmt.Errorf("session %s: %w", t.sessionID, ErrNoStoredLine)
 			return 0, t.done
 		}
-		t.pending = append([]byte(raw.String), '\n')
+		line := append([]byte(raw.String), '\n')
+		if len(line) <= maxStrippedLineBytes && bytes.Contains(line, []byte(strippedMarker)) {
+			t.stripped++
+		}
+		t.pending = line
 	}
 
 	n := copy(p, t.pending)
@@ -229,39 +281,51 @@ type SessionTokenCounters struct {
 	CacheWrite int64
 }
 
-// WriteSessionTokenCounters stores repaired token counters and returns how many
-// rows it changed.
+// WriteSessionTokenCounters stores repaired token counters, and names the
+// sessions it refused to write.
 //
-// The UPDATE repeats the candidate condition — both cache columns still zero —
-// so it can only ever apply to a row nobody has repaired in the meantime.
-// Without that, two runs over the same archive, or a run racing a sync, could
-// each write a total the other had already accounted for.
+// The UPDATE repeats everything the caller read the row for: both cache
+// columns still zero, and input and output still the values the repair was
+// derived against. So it can only ever apply to a row nobody has touched in
+// between — a second run of the backfill, or a sync that re-parsed the session
+// from a transcript that is back on disk, leaves its own answer standing
+// instead of having this one written over it. The caller cannot do this check
+// itself: it read the row before the parse, and the parse takes long enough
+// for the row to move.
 //
-// All four columns, not just the cache pair, because for a source whose cached
-// count is a subset of its input count the repair is a split: the cached share
-// moves out of input and the session's total is unchanged. Writing only the
-// cache pair there would add the cached tokens a second time.
-func (db *DB) WriteSessionTokenCounters(ctx context.Context, counters []SessionTokenCounters) (int, error) {
+// All four columns are written rather than the cache pair alone. The two
+// counted columns are known to be unchanged — that is the caller's checksum
+// and now also this WHERE clause — so writing them changes nothing; they are
+// here so the statement sets the whole set of counters it is keyed on, rather
+// than leaving a reader to work out which two of the four it may be trusted
+// for.
+//
+// The returned slice holds the sessions whose row no longer matched, so the
+// caller can take them back out of its own counts instead of reporting a
+// repair the archive did not accept.
+func (db *DB) WriteSessionTokenCounters(ctx context.Context, counters []SessionTokenCounters) (written int, refused []string, err error) {
 	if len(counters) == 0 {
-		return 0, nil
+		return 0, nil, nil
 	}
 
-	written := 0
-	err := db.WithTxContext(ctx, func(tx *sql.Tx) error {
+	err = db.WithTxContext(ctx, func(tx *sql.Tx) error {
 		stmt, err := tx.PrepareContext(ctx, `
 			UPDATE sessions
 			SET input_tokens = ?, output_tokens = ?,
 			    cache_read_tokens = ?, cache_write_tokens = ?
 			WHERE id = ?
 			  AND COALESCE(cache_read_tokens, 0) = 0
-			  AND COALESCE(cache_write_tokens, 0) = 0`)
+			  AND COALESCE(cache_write_tokens, 0) = 0
+			  AND COALESCE(input_tokens, 0) = ?
+			  AND COALESCE(output_tokens, 0) = ?`)
 		if err != nil {
 			return fmt.Errorf("prepare token counter update: %w", err)
 		}
 		defer func() { _ = stmt.Close() }()
 
 		for _, c := range counters {
-			res, err := stmt.ExecContext(ctx, c.Input, c.Output, c.CacheRead, c.CacheWrite, c.SessionID)
+			res, err := stmt.ExecContext(ctx,
+				c.Input, c.Output, c.CacheRead, c.CacheWrite, c.SessionID, c.Input, c.Output)
 			if err != nil {
 				return fmt.Errorf("update token counters of session %s: %w", c.SessionID, err)
 			}
@@ -269,12 +333,16 @@ func (db *DB) WriteSessionTokenCounters(ctx context.Context, counters []SessionT
 			if err != nil {
 				return fmt.Errorf("count the token counter update of session %s: %w", c.SessionID, err)
 			}
+			if n == 0 {
+				refused = append(refused, c.SessionID)
+				continue
+			}
 			written += int(n)
 		}
 		return nil
 	})
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
-	return written, nil
+	return written, refused, nil
 }

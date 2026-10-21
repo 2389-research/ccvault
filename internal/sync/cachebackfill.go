@@ -18,10 +18,11 @@ import (
 // progress, large enough that 48,000 sessions are not 48,000 commits.
 const cacheBackfillBatch = 500
 
-// cacheBackfillFinalWrite bounds the commit of the last batch of a cancelled
-// run. Long enough to outwait a sync holding the writer (busyTimeoutMS is 5s),
-// short enough that Ctrl-C still ends the command promptly.
-const cacheBackfillFinalWrite = 30 * time.Second
+// cacheBackfillCommit bounds each commit, which runs on a context the run's
+// cancellation cannot reach. Long enough to outwait a sync holding the writer
+// (busyTimeoutMS is 5s), short enough that Ctrl-C still ends the command
+// promptly.
+const cacheBackfillCommit = 30 * time.Second
 
 // maxReportedBackfillErrors caps the errors carried back from a run. A
 // systematic fault would otherwise return one error per session and bury the
@@ -42,13 +43,24 @@ type CacheBackfillOptions struct {
 	// BatchSize overrides how many repairs are committed at once. Zero means
 	// cacheBackfillBatch.
 	BatchSize int
+
+	// afterSession is called once per examined candidate, with how many have
+	// been examined so far. A test seam, unexported so only this package can
+	// set one: it is how a test cancels a run mid-pass, which is the only way
+	// to reach the commit of a partly-filled batch. Same reason
+	// parseSessionReaderWithLimits takes its limits as arguments.
+	afterSession func(examined int)
 }
 
 // CacheBackfillReport is what one run did.
 //
 // Every candidate lands in exactly one of Repaired, NoCacheUsage, Unreadable,
 // Mismatched, Unsupported or Failed, which is what makes the report readable
-// as an account of the whole archive rather than a success count.
+// as an account of the whole archive rather than a success count. Two fields
+// qualify those buckets rather than joining them: Refused is a subtraction
+// from Repaired, for a session the archive declined to write after the run had
+// decided to repair it, and StrippedPayloads is a subset of Repaired whose
+// totals carry a caveat.
 type CacheBackfillReport struct {
 	// Candidates is how many sessions still read zero on both cache columns.
 	Candidates int
@@ -70,7 +82,21 @@ type CacheBackfillReport struct {
 	// equal the input and output the row already counts, so the stored lines
 	// do not account for what the session is known to have cost. Refused
 	// rather than written — see the guard in BackfillCacheTokens.
-	Mismatched int
+	//
+	// Broken down by source because the causes are not alike and one number
+	// cannot say which applies. A claude-code session here is usually missing
+	// turns its row still counts, which is the drift `stats` reports
+	// separately; every legacy codex session is here by construction, because
+	// codex records its token counts on event lines that never became turns.
+	Mismatched         int
+	MismatchedBySource map[string]int
+
+	// StrippedPayloads is how many of the repaired sessions hold a line
+	// ccvault replaced with a placeholder because the original exceeded the
+	// raw_json cap. They are counted inside Repaired, not instead of it, and
+	// reported because their totals are the only ones carrying a caveat — see
+	// db.StoredTranscript.StrippedLines.
+	StrippedPayloads int
 
 	// Unsupported is sessions from a source that cannot be re-derived at all,
 	// counted per source so the reason is nameable rather than a mystery.
@@ -81,6 +107,13 @@ type CacheBackfillReport struct {
 	// few verbatim.
 	Failed int
 	Errors []error
+
+	// Refused is sessions the run derived a repair for and the archive then
+	// declined to write, because the row had stopped matching what the repair
+	// was derived against — another run, or a sync that re-parsed it. They
+	// are counted here and taken back out of Repaired, so the headline figure
+	// is what the archive accepted rather than what this run intended.
+	Refused int
 
 	// CacheTokensRecovered is the cache total the repaired sessions were
 	// understating the archive by.
@@ -145,13 +178,22 @@ type CacheBackfillReport struct {
 //   - a session whose source has no reparser is counted and named rather than
 //     silently left out.
 //
+// One thing it deliberately does not refuse: a session holding a line ccvault
+// replaced with a placeholder because the original was too large to store.
+// Those are repaired and counted separately as StrippedPayloads, because
+// refusing them leaves a whole session at zero to avoid being short by one
+// turn — and zero is the wrong number this command exists to remove. The
+// measurement behind that is at the branch itself.
+//
 // Re-running is safe and resumes: the candidate condition is the cache pair
-// still being zero, and the UPDATE repeats it.
+// still being zero, and the UPDATE repeats it along with the counted pair the
+// repair was derived against.
 func BackfillCacheTokens(ctx context.Context, database *db.DB, opts CacheBackfillOptions) (CacheBackfillReport, error) {
 	started := time.Now()
 	report := CacheBackfillReport{
 		DryRun:              opts.DryRun,
 		UnsupportedBySource: make(map[string]int),
+		MismatchedBySource:  make(map[string]int),
 	}
 
 	batchSize := opts.BatchSize
@@ -171,22 +213,43 @@ func BackfillCacheTokens(ctx context.Context, database *db.DB, opts CacheBackfil
 	reparsers := make(map[string]adapter.TranscriptReparser)
 
 	pending := make([]db.SessionTokenCounters, 0, batchSize)
-	flush := func(writeCtx context.Context) error {
+	cacheTokensOf := func(sessionID string) int64 {
+		for _, c := range pending {
+			if c.SessionID == sessionID {
+				return c.CacheRead + c.CacheWrite
+			}
+		}
+		return 0
+	}
+	// Every commit runs on a context the run's cancellation cannot reach.
+	// Those repairs are already derived — reading 4 GB of stored lines is the
+	// expensive half, not the UPDATE — so a cancel arriving mid-commit should
+	// not throw a batch of them away and turn Ctrl-C into a failed command.
+	// Bounded, so a cancelled run cannot hang on a busy writer either.
+	flush := func() error {
 		if opts.DryRun || len(pending) == 0 {
 			pending = pending[:0]
 			return nil
 		}
-		written, err := database.WriteSessionTokenCounters(writeCtx, pending)
+		writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cacheBackfillCommit)
+		defer cancel()
+
+		_, refused, err := database.WriteSessionTokenCounters(writeCtx, pending)
 		if err != nil {
 			return err
 		}
-		if written != len(pending) {
-			// The guard in the UPDATE held: something else repaired these rows
-			// between the read and the write. Worth saying rather than
-			// reporting a count the archive does not agree with.
+		// A row the archive declined comes back out of the counts. The
+		// candidate list was read before the parse, so a row can be repaired
+		// by another run — or by a sync that re-read its transcript — in
+		// between, and reporting it as repaired here would be this run taking
+		// credit for a number it did not write.
+		for _, sessionID := range refused {
+			report.Refused++
+			report.Repaired--
+			report.CacheTokensRecovered -= cacheTokensOf(sessionID)
 			report.Errors = appendCapped(report.Errors, fmt.Errorf(
-				"wrote %d of %d session token counters; the rest were no longer zero (another run or a sync?)",
-				written, len(pending)))
+				"session %s was no longer the row this repair was derived from, so it was left alone "+
+					"(another run, or a sync that re-read its transcript?)", sessionID))
 		}
 		pending = pending[:0]
 		return nil
@@ -210,7 +273,7 @@ func BackfillCacheTokens(ctx context.Context, database *db.DB, opts CacheBackfil
 			continue
 		}
 
-		totals, err := rederiveTokenTotals(database, reparser, candidate)
+		totals, stripped, err := rederiveTokenTotals(database, reparser, candidate)
 		switch {
 		case errors.Is(err, db.ErrNoStoredLine):
 			report.Unreadable++
@@ -227,6 +290,7 @@ func BackfillCacheTokens(ctx context.Context, database *db.DB, opts CacheBackfil
 		// the swap back is not something this command should be able to do.
 		if totals.Input != candidate.StoredInput || totals.Output != candidate.StoredOutput {
 			report.Mismatched++
+			report.MismatchedBySource[candidate.Source]++
 			continue
 		}
 		if totals.CacheRead == 0 && totals.CacheWrite == 0 {
@@ -236,6 +300,20 @@ func BackfillCacheTokens(ctx context.Context, database *db.DB, opts CacheBackfil
 
 		report.Repaired++
 		report.CacheTokensRecovered += totals.CacheRead + totals.CacheWrite
+		// Repaired, and flagged. A placeholder line carries no usage, so if
+		// the turn behind it had any, this total is short by it — but the
+		// checksum just proved those turns reported no input and no output,
+		// which for a Claude Code transcript means either no usage object at
+		// all (an oversized *user* message, which is what the cap exists for)
+		// or a fully-cached prompt. Measured on the author's archive: 7
+		// placeholder turns across 6 sessions out of 13,375 turns, holding
+		// 1.29 billion cache tokens between them. Refusing those sessions
+		// would leave 100% of that uncounted to avoid being short by at most
+		// seven turns — the zero is the worse wrong number, and it is the one
+		// indistinguishable from "spent no cache tokens".
+		if stripped > 0 {
+			report.StrippedPayloads++
+		}
 		pending = append(pending, db.SessionTokenCounters{
 			SessionID:  candidate.ID,
 			Input:      totals.Input,
@@ -245,7 +323,7 @@ func BackfillCacheTokens(ctx context.Context, database *db.DB, opts CacheBackfil
 		})
 
 		if len(pending) >= batchSize {
-			if err := flush(ctx); err != nil {
+			if err := flush(); err != nil {
 				report.Elapsed = time.Since(started)
 				return report, err
 			}
@@ -255,21 +333,13 @@ func BackfillCacheTokens(ctx context.Context, database *db.DB, opts CacheBackfil
 			progress(opts, "  %d/%d examined, %d repaired, %d recovered so far",
 				i+1, len(candidates), report.Repaired, report.CacheTokensRecovered)
 		}
+		if opts.afterSession != nil {
+			opts.afterSession(report.Examined)
+		}
 	}
 
-	// The last batch is committed even when the run was cancelled, on a
-	// context the cancellation cannot reach. Those repairs are already
-	// derived — the reading of 4 GB of stored lines is the expensive half, not
-	// the UPDATE — and handing the cancelled context to the write instead
-	// would throw away up to a batch of them and turn Ctrl-C into a failed
-	// command. Bounded so a cancelled run cannot hang on a busy writer.
-	writeCtx := ctx
-	if report.Cancelled {
-		bounded, cancel := context.WithTimeout(context.WithoutCancel(ctx), cacheBackfillFinalWrite)
-		defer cancel()
-		writeCtx = bounded
-	}
-	if err := flush(writeCtx); err != nil {
+	// The last batch is committed even when the run was cancelled — see flush.
+	if err := flush(); err != nil {
 		report.Elapsed = time.Since(started)
 		return report, err
 	}
@@ -301,18 +371,20 @@ func BackfillCacheTokens(ctx context.Context, database *db.DB, opts CacheBackfil
 // The cursor is closed before this returns, and so before the caller writes
 // anything: the connection pool is one handle wide, so a write issued while a
 // transcript is still open would wait on a connection the read is holding.
-func rederiveTokenTotals(database *db.DB, reparser adapter.TranscriptReparser, candidate db.CacheBackfillCandidate) (adapter.TokenTotals, error) {
+// The second return value is how many of the lines read were ccvault's
+// placeholder for an oversized original, which the caller refuses on.
+func rederiveTokenTotals(database *db.DB, reparser adapter.TranscriptReparser, candidate db.CacheBackfillCandidate) (adapter.TokenTotals, int, error) {
 	transcript, err := database.StoredTranscript(candidate.ID)
 	if err != nil {
-		return adapter.TokenTotals{}, err
+		return adapter.TokenTotals{}, 0, err
 	}
 	defer func() { _ = transcript.Close() }()
 
 	parsed, err := reparser.ParseTranscript(candidate.SourceFile, transcript)
 	if err != nil {
-		return adapter.TokenTotals{}, err
+		return adapter.TokenTotals{}, transcript.StrippedLines(), err
 	}
-	return parsed.TokenTotals(), nil
+	return parsed.TokenTotals(), transcript.StrippedLines(), nil
 }
 
 // lookupReparser returns the adapter for a source if it can re-derive a

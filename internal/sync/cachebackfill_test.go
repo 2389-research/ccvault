@@ -5,6 +5,7 @@ package sync
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -213,31 +214,38 @@ func TestBackfillCacheTokens_SkipsUnreadableTurns(t *testing.T) {
 	}
 }
 
-// TestBackfillCacheTokens_RefusesAStrippedLine is the guard that keeps a
-// partial re-derivation from being written as if it were the whole session.
+// TestBackfillCacheTokens_FlagsAStrippedLineRatherThanRefusingIt is the one
+// caveat the run reports instead of acting on, and the measurement is the
+// whole argument.
 //
 // A turn whose original line exceeded the raw_json cap is stored as a
-// placeholder that preserves its identity and drops its message, so its usage
-// object is gone. Re-deriving such a session recovers the cache tokens of
-// every *other* turn and silently loses that one — a plausible-looking number
-// that is wrong, which is the failure mode #155 already is.
+// placeholder that keeps its identity and drops its message, so its usage went
+// with it. Such a session re-derives short by that turn — and refusing it
+// therefore trades a small undercount for a total zero, which is both the
+// larger error and the one indistinguishable from "spent no cache tokens".
+// Measured on the author's archive: 7 placeholder turns across 6 sessions,
+// which hold 1.29 billion cache tokens between them.
 //
-// It is deliberately not a search for placeholders. The arithmetic catches
-// every way a stored line can fail to carry its usage, including the one it
-// was not written for: codex reports its token counts on token_count event
-// lines, which never became turns, so a legacy codex session re-derives to
-// zero of everything.
-func TestBackfillCacheTokens_RefusesAStrippedLine(t *testing.T) {
+// So it is repaired, and counted in StrippedPayloads so the caveat is visible
+// on exactly the sessions that carry it. Note what the checksum has already
+// established by the time this branch runs: the stripped turn reported no
+// input and no output, so for a Claude Code transcript it is either an
+// oversized *user* message with no usage object at all — what the cap exists
+// for — or a fully-cached prompt.
+func TestBackfillCacheTokens_FlagsAStrippedLineRatherThanRefusingIt(t *testing.T) {
 	database, cleanup := setupTestDB(t)
 	defer cleanup()
 
 	claudeHome := t.TempDir()
 	const sessionID = "bacf3333-4444-5555-6666-777788889999"
-	// Two assistant turns, so stripping one leaves the other's cache tokens
-	// behind. A session with a single assistant turn would re-derive to zero
-	// cache tokens and be caught by the no-cache-usage branch instead, which
-	// would let this test pass with no guard at all.
-	writeTwoAssistantTurnSession(t, claudeHome, sessionID, "-Users-test-shrink")
+	// The second assistant turn reports no input and no output and 150 cache
+	// reads — the fully-cached prompt. That is the only shape that reaches
+	// this branch: give the stripped turn any input or output and the checksum
+	// refuses the session instead, which is the case the next test covers.
+	writeAssistantTurnsSession(t, claudeHome, sessionID, "-Users-test-stripped", []assistantUsage{
+		{input: 15, output: 7, cacheRead: 150, cacheWrite: 30},
+		{input: 0, output: 0, cacheRead: 150, cacheWrite: 30},
+	})
 
 	syncer := New(database, []config.SourceConfig{
 		{Name: "claude-code", Type: "claude-code", Path: claudeHome},
@@ -250,8 +258,8 @@ func TestBackfillCacheTokens_RefusesAStrippedLine(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSession: %v", err)
 	}
-	if stored.InputTokens != 30 || stored.CacheReadTokens != 300 {
-		t.Fatalf("fixture synced as input %d / cache read %d, want 30 / 300",
+	if stored.InputTokens != 15 || stored.CacheReadTokens != 300 {
+		t.Fatalf("fixture synced as input %d / cache read %d, want 15 / 300",
 			stored.InputTokens, stored.CacheReadTokens)
 	}
 
@@ -273,32 +281,47 @@ func TestBackfillCacheTokens_RefusesAStrippedLine(t *testing.T) {
 		t.Fatalf("BackfillCacheTokens: %v", err)
 	}
 
-	if report.Mismatched != 1 {
-		t.Errorf("Mismatched = %d, want 1 (report: %+v)", report.Mismatched, report)
+	if report.Repaired != 1 {
+		t.Errorf("Repaired = %d, want 1; the zero is the worse answer (report: %+v)",
+			report.Repaired, report)
 	}
-	if report.Repaired != 0 {
-		t.Errorf("Repaired = %d, want 0; a partial re-derivation is not a repair", report.Repaired)
+	if report.StrippedPayloads != 1 {
+		t.Errorf("StrippedPayloads = %d, want 1; the caveat has to be visible on the session that carries it",
+			report.StrippedPayloads)
+	}
+	if report.Mismatched != 0 {
+		t.Errorf("Mismatched = %d, want 0; input and output still add up", report.Mismatched)
 	}
 
 	session, err := database.GetSession(sessionID)
 	if err != nil {
 		t.Fatalf("GetSession: %v", err)
 	}
-	if session.InputTokens != 30 || session.OutputTokens != 14 {
-		t.Errorf("input/output = %d/%d, want 30/14 left alone",
-			session.InputTokens, session.OutputTokens)
-	}
-	if session.CacheReadTokens != 0 {
-		t.Errorf("CacheReadTokens = %d, want 0; 200 of the 300 is worse than the honest zero",
+	// Short by the stripped turn's 150, and that is the point: 150 recovered
+	// of 300 beats 0 of 300, and the shortfall is reported rather than hidden.
+	if session.CacheReadTokens != 150 {
+		t.Errorf("CacheReadTokens = %d, want 150 — the turns whose lines survived",
 			session.CacheReadTokens)
+	}
+	if session.InputTokens != 15 || session.OutputTokens != 7 {
+		t.Errorf("input/output = %d/%d, want 15/7 unchanged",
+			session.InputTokens, session.OutputTokens)
 	}
 }
 
-// writeTwoAssistantTurnSession writes a Claude Code transcript with one user
-// turn and two assistant turns, each carrying its own usage object.
+// assistantUsage is one assistant turn's usage object in a fixture.
+type assistantUsage struct {
+	input, output, cacheRead, cacheWrite int64
+}
+
+// writeAssistantTurnsSession writes a Claude Code transcript with one user
+// turn followed by an assistant turn per usage object given.
 //
-// Totals: input 30, output 14, cache read 300, cache write 60.
-func writeTwoAssistantTurnSession(t *testing.T, dir, sessionID, projectDir string) {
+// The shape of each usage matters to these tests rather than just its
+// presence: a stripped or deleted turn is only reachable by one branch of the
+// backfill depending on whether its input and output were zero, which is what
+// the checksum keys on.
+func writeAssistantTurnsSession(t *testing.T, dir, sessionID, projectDir string, usages []assistantUsage) {
 	t.Helper()
 	projDir := filepath.Join(dir, "projects", projectDir)
 	if err := os.MkdirAll(projDir, 0o755); err != nil {
@@ -306,23 +329,27 @@ func writeTwoAssistantTurnSession(t *testing.T, dir, sessionID, projectDir strin
 	}
 
 	now := time.Now().UTC().Truncate(time.Millisecond)
-	cwd := "/Users/test/shrink"
+	cwd := "/Users/test/assistantturns"
 	line := func(uuid, parent, turnType, body string, offset time.Duration) string {
 		return `{"uuid":"` + uuid + `","parentUuid":` + parent +
 			`,"sessionId":"` + sessionID + `","type":"` + turnType +
 			`","timestamp":"` + now.Add(offset).Format(time.RFC3339Nano) +
 			`","cwd":"` + cwd + `","gitBranch":"main","version":"1.0.0","message":` + body + `}`
 	}
-	assistant := func(text string) string {
-		return `{"role":"assistant","model":"claude-opus-4","content":[{"type":"text","text":"` + text +
-			`"}],"usage":{"input_tokens":15,"output_tokens":7,` +
-			`"cache_read_input_tokens":150,"cache_creation_input_tokens":30}}`
-	}
 
 	lines := []string{
 		line(sessionID+"-turn-1", "null", "user", `{"role":"user","content":"Hello world"}`, 0),
-		line(sessionID+"-turn-2", `"`+sessionID+`-turn-1"`, "assistant", assistant("first"), time.Second),
-		line(sessionID+"-turn-3", `"`+sessionID+`-turn-2"`, "assistant", assistant("second"), 2*time.Second),
+	}
+	for i, u := range usages {
+		body := fmt.Sprintf(
+			`{"role":"assistant","model":"claude-opus-4","content":[{"type":"text","text":"answer %d"}],`+
+				`"usage":{"input_tokens":%d,"output_tokens":%d,`+
+				`"cache_read_input_tokens":%d,"cache_creation_input_tokens":%d}}`,
+			i, u.input, u.output, u.cacheRead, u.cacheWrite)
+		lines = append(lines, line(
+			fmt.Sprintf("%s-turn-%d", sessionID, i+2),
+			fmt.Sprintf("%q", fmt.Sprintf("%s-turn-%d", sessionID, i+1)),
+			"assistant", body, time.Duration(i+1)*time.Second))
 	}
 
 	var buf []byte
@@ -332,6 +359,219 @@ func writeTwoAssistantTurnSession(t *testing.T, dir, sessionID, projectDir strin
 	}
 	if err := os.WriteFile(filepath.Join(projDir, sessionID+".jsonl"), buf, 0o600); err != nil {
 		t.Fatalf("write fixture: %v", err)
+	}
+}
+
+// TestBackfillCacheTokens_RefusesWhenTheLinesDoNotAddUp is the checksum on its
+// own, with every stored line genuine.
+//
+// The archive can hold fewer turns than the session row counts — rows deleted
+// underneath a session whose counters were maintained additively, which is the
+// drift `stats` reports (#91, #92). Nothing about those lines is malformed, so
+// only the arithmetic can tell: the re-derivation comes out short of the input
+// and output the row already counts, and a repair derived from a session with
+// turns missing is not that session's repair. Two of the three refusals on the
+// author's archive are exactly this.
+func TestBackfillCacheTokens_RefusesWhenTheLinesDoNotAddUp(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	claudeHome := t.TempDir()
+	const sessionID = "bacf8888-9999-aaaa-bbbb-ccccddddeeee"
+	writeAssistantTurnsSession(t, claudeHome, sessionID, "-Users-test-missingturns", []assistantUsage{
+		{input: 15, output: 7, cacheRead: 150, cacheWrite: 30},
+		{input: 15, output: 7, cacheRead: 150, cacheWrite: 30},
+	})
+
+	syncer := New(database, []config.SourceConfig{
+		{Name: "claude-code", Type: "claude-code", Path: claudeHome},
+	}, WithFullSync(true))
+	if _, err := syncer.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error: %v", err)
+	}
+
+	zeroCacheColumns(t, database, sessionID)
+	// Delete the second assistant turn's row, leaving the session row still
+	// counting its tokens. Every line that remains is the line its source
+	// wrote.
+	if _, err := database.Exec(
+		`DELETE FROM turns WHERE session_id = ? AND ordinal = 2`, sessionID); err != nil {
+		t.Fatalf("delete a turn: %v", err)
+	}
+
+	report, err := BackfillCacheTokens(context.Background(), database, CacheBackfillOptions{})
+	if err != nil {
+		t.Fatalf("BackfillCacheTokens: %v", err)
+	}
+
+	if report.Mismatched != 1 {
+		t.Errorf("Mismatched = %d, want 1 (report: %+v)", report.Mismatched, report)
+	}
+	if report.StrippedPayloads != 0 {
+		t.Errorf("StrippedPayloads = %d, want 0; every remaining line is genuine", report.StrippedPayloads)
+	}
+	if report.Repaired != 0 {
+		t.Errorf("Repaired = %d, want 0", report.Repaired)
+	}
+	// Named by source, because a bare count cannot say whether the cause is
+	// missing turns or a source whose counts were never stored as turns.
+	if report.MismatchedBySource["claude-code"] != 1 {
+		t.Errorf("MismatchedBySource = %v, want claude-code: 1", report.MismatchedBySource)
+	}
+
+	session, err := database.GetSession(sessionID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if session.CacheReadTokens != 0 || session.InputTokens != 30 {
+		t.Errorf("cache read %d / input %d, want 0 / 30 left alone",
+			session.CacheReadTokens, session.InputTokens)
+	}
+}
+
+// TestBackfillCacheTokens_CommitsEachBatchAsItGoes covers the resumability
+// claim, which until now no test reached: every fixture fit in one batch, so
+// the mid-run commit never ran.
+//
+// Reading 4 GB of stored lines takes minutes, so progress has to be committed
+// as it is made rather than at the end. With a batch size of one, each repair
+// is its own transaction and a cancellation after the first leaves that one
+// repaired and the rest still candidates.
+func TestBackfillCacheTokens_CommitsEachBatchAsItGoes(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	claudeHome := t.TempDir()
+	ids := []string{
+		"bacfaaaa-0000-0000-0000-000000000001",
+		"bacfaaaa-0000-0000-0000-000000000002",
+		"bacfaaaa-0000-0000-0000-000000000003",
+	}
+	for _, id := range ids {
+		writeTestSession(t, claudeHome, id, "-Users-test-batches")
+	}
+
+	syncer := New(database, []config.SourceConfig{
+		{Name: "claude-code", Type: "claude-code", Path: claudeHome},
+	}, WithFullSync(true))
+	if _, err := syncer.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error: %v", err)
+	}
+	for _, id := range ids {
+		zeroCacheColumns(t, database, id)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	report, err := BackfillCacheTokens(ctx, database, CacheBackfillOptions{
+		BatchSize: 1,
+		// Stop the run as soon as one session has been examined. The commit of
+		// that session's batch has already happened, so this is the state a
+		// Ctrl-C two minutes into a real run leaves behind.
+		afterSession: func(examined int) {
+			if examined == 1 {
+				cancel()
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("a cancelled run returned an error: %v", err)
+	}
+	if !report.Cancelled {
+		t.Error("report does not say the run was cancelled")
+	}
+	if report.Examined != 1 || report.Repaired != 1 {
+		t.Fatalf("examined %d / repaired %d, want 1 / 1 (report: %+v)",
+			report.Examined, report.Repaired, report)
+	}
+
+	// The committed repair survived the cancellation, and the other two are
+	// still candidates for the next run.
+	repaired := 0
+	for _, id := range ids {
+		session, err := database.GetSession(id)
+		if err != nil {
+			t.Fatalf("GetSession(%s): %v", id, err)
+		}
+		if session.CacheReadTokens == 100 && session.CacheWriteTokens == 20 {
+			repaired++
+		}
+	}
+	if repaired != 1 {
+		t.Errorf("%d of 3 sessions carry their cache tokens, want 1", repaired)
+	}
+
+	// The re-run finishes the job, which is the whole claim about resuming.
+	second, err := BackfillCacheTokens(context.Background(), database, CacheBackfillOptions{BatchSize: 1})
+	if err != nil {
+		t.Fatalf("second BackfillCacheTokens: %v", err)
+	}
+	if second.Candidates != 2 || second.Repaired != 2 {
+		t.Errorf("second run candidates %d / repaired %d, want 2 / 2 (report: %+v)",
+			second.Candidates, second.Repaired, second)
+	}
+}
+
+// TestBackfillCacheTokens_DoesNotClaimARepairTheArchiveRefused covers the
+// race the UPDATE's own WHERE clause exists for.
+//
+// The candidate list is read before any parsing, and the parse takes long
+// enough on a real archive for a row to move underneath it — another run, or a
+// sync that re-read a transcript that is back on disk. The write declines such
+// a row, and the run has to take it back out of its own counts rather than
+// report a repair the archive did not accept.
+func TestBackfillCacheTokens_DoesNotClaimARepairTheArchiveRefused(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	claudeHome := t.TempDir()
+	const sessionID = "bacfbbbb-0000-0000-0000-000000000001"
+	writeTestSession(t, claudeHome, sessionID, "-Users-test-raced")
+
+	syncer := New(database, []config.SourceConfig{
+		{Name: "claude-code", Type: "claude-code", Path: claudeHome},
+	}, WithFullSync(true))
+	if _, err := syncer.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error: %v", err)
+	}
+	zeroCacheColumns(t, database, sessionID)
+
+	report, err := BackfillCacheTokens(context.Background(), database, CacheBackfillOptions{
+		// Stand in for the other writer: by the time the batch is committed,
+		// this row has been repaired by someone else.
+		afterSession: func(int) {
+			if _, err := database.Exec(
+				`UPDATE sessions SET cache_read_tokens = 4096 WHERE id = ?`, sessionID); err != nil {
+				t.Errorf("simulate a concurrent repair: %v", err)
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("BackfillCacheTokens: %v", err)
+	}
+
+	if report.Refused != 1 {
+		t.Errorf("Refused = %d, want 1 (report: %+v)", report.Refused, report)
+	}
+	if report.Repaired != 0 {
+		t.Errorf("Repaired = %d, want 0; the archive did not accept it", report.Repaired)
+	}
+	if report.CacheTokensRecovered != 0 {
+		t.Errorf("CacheTokensRecovered = %d, want 0; the tokens came back out with the count",
+			report.CacheTokensRecovered)
+	}
+	if len(report.Errors) != 1 {
+		t.Errorf("Errors = %v, want one naming the session", report.Errors)
+	}
+
+	// The other writer's value stands.
+	session, err := database.GetSession(sessionID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if session.CacheReadTokens != 4096 {
+		t.Errorf("CacheReadTokens = %d, want 4096 — the other writer's value", session.CacheReadTokens)
 	}
 }
 

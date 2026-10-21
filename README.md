@@ -283,12 +283,24 @@ its input count, where Claude Code reports cache counters beside it, so one is
 a split and the other a copy.
 
 It refuses rather than guessing. A session whose re-derived input and output
-tokens disagree with the ones the row already counts is left alone: that
-equality is the checksum saying the stored lines are the whole session, and it
-is what catches a turn whose oversized line was stored as a placeholder without
-its usage object. A session holding a turn with no stored line at all cannot be
-re-derived and is skipped. Safe to re-run and to interrupt — a repaired session
-is no longer a candidate, and progress is committed as it goes. Run
+tokens disagree with the ones the row already counts is left alone: those two
+were counted correctly from the start, so re-deriving them is a checksum over
+the bytes the repair is about to trust. A session holding a turn with no stored
+line at all cannot be re-derived and is skipped. Both refusals are counted and
+named, and the mismatches are broken down by source — every pre-fix codex
+session is permanently among them, because codex reports its token counts on
+event lines that never became turns and so never reached `raw_json`.
+
+One case is reported rather than refused. A turn whose line was too large to
+store is kept as a placeholder without its usage, so a session holding one
+re-derives short by that turn. Refusing it would leave the whole session at
+zero to avoid being short by one turn — on the author's archive, 7 such turns
+across 6 sessions that hold 1.29 billion cache tokens between them — so those
+sessions are repaired and the caveat is printed against them.
+
+Safe to re-run and to interrupt: a repaired session is no longer a candidate,
+progress is committed as it goes, and each commit runs on a context the
+cancellation cannot reach, so Ctrl-C keeps what it had already derived. Run
 `ccvault build-cache` afterwards to carry the repair into the analytics cache.
 
 ### Running an older ccvault against a newer archive

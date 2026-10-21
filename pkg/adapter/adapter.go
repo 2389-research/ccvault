@@ -127,7 +127,15 @@ type SourceAdapter interface {
 // of a path for things the bytes do not carry (which session is a sidechain,
 // which nanoclaw group a session belongs to), so passing the stored
 // sessions.source_file keeps those answers the same as the first parse gave.
-// It is not opened.
+// The transcript is never read from it.
+//
+// Its *neighbours* may be, though, and that is the one thing to know before
+// trusting the result. A sidechain transcript's project and agent type are
+// read out of files beside it — ReadSubagentMeta and parser.SubagentProjectPath
+// — so when the directory is gone, those two fields fall back rather than
+// resolve. Everything derived from the lines themselves, token counters
+// included, is unaffected; a caller that needs the metadata should know it is
+// reading a degraded answer.
 //
 // Not every adapter implements it. hex stores a whole session as one JSON
 // document rather than a line per turn, so its turns cannot be reassembled
