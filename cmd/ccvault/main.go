@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -558,6 +559,36 @@ func printTurnCountSection(d db.TurnDrift) {
 	// the affected files, so an ordinary `ccvault sync` repairs them too — this
 	// names --full because it also reconciles what no source can supply.
 	fmt.Println("  Recover the missing turns with 'ccvault sync --full'.")
+	fmt.Println()
+}
+
+// printCacheTokenSection names the sessions whose prompt-cache counters were
+// never recorded, and the command that gives them back.
+//
+// Silent when there are none, like the turn-count section above it: a clean
+// archive should not have to read a line saying so. The figure reported is the
+// sessions that counted input or output tokens and still claim zero cache
+// tokens — a session with no tokens at all is either empty or came from a
+// source that records none, and counting those would turn the number into
+// noise nobody acts on.
+func printCacheTokenSection(c db.CacheTokenCoverage) {
+	if c.Complete() {
+		return
+	}
+	fmt.Println("Cache tokens:")
+	fmt.Printf("  %d of %d session(s) cost input or output tokens and report no cache tokens.\n",
+		c.MissingWithCost, c.Sessions)
+	// Nothing assigned the counters before the fix, so these sessions are
+	// understating the archive's token total — by 4.7x on the author's
+	// archive, where the repair recovered 23.1 billion cache tokens against
+	// 154 million counted ones.
+	fmt.Println("  Re-derive them from the stored transcript lines with 'ccvault repair-tokens'.")
+	// Said here because this line is otherwise a nag that never clears: 45 of
+	// the author's sessions cannot be re-derived at all — 42 hold turns whose
+	// stored line was nulled as unreadable (#101) and 3 are missing turns the
+	// row still counts — so they keep being reported after every repair.
+	// 'repair-tokens' names each refusal; this says the residue is expected.
+	fmt.Println("  A session whose stored lines are gone or incomplete cannot be repaired and stays here.")
 	fmt.Println()
 }
 
@@ -1183,6 +1214,16 @@ var statsCmd = &cobra.Command{
 			return fmt.Errorf("measure turn count drift: %w", err)
 		}
 
+		// Cheap enough for the default report — the sessions table only, no
+		// raw_json — and reported here because a repair nobody knows to run is
+		// half a fix. The understatement it names is invisible by
+		// construction: zero is a plausible cache reading, so nothing about
+		// the token totals looks wrong (#155).
+		cacheCoverage, err := database.CacheTokenCoverage()
+		if err != nil {
+			return fmt.Errorf("measure cache token coverage: %w", err)
+		}
+
 		if jsonOutput {
 			out := map[string]interface{}{
 				"projects":        projectCount,
@@ -1195,6 +1236,7 @@ var statsCmd = &cobra.Command{
 				"storage":         storageJSON(storage),
 				"search_index":    integrityJSON(integrity),
 				"raw_json":        rawJSONJSON(rawJSON, rawWithSource, rawWithoutSource),
+				"cache_tokens":    cacheCoverageJSON(cacheCoverage),
 			}
 			if drift.Drifted() {
 				out["turn_count_drift"] = map[string]interface{}{
@@ -1246,6 +1288,7 @@ var statsCmd = &cobra.Command{
 		}
 		printRawJSONSection(rawJSON, rawWithSource, rawWithoutSource)
 		printTurnCountSection(drift)
+		printCacheTokenSection(cacheCoverage)
 
 		if len(tokensByModel) > 0 {
 			fmt.Println("Tokens by Model:")
@@ -2026,6 +2069,179 @@ func repairVerdict(report db.FTSStrictReport) error {
 		strings.Join(report.Malformed(), ", "))
 }
 
+var repairTokensCmd = &cobra.Command{
+	Use:   "repair-tokens",
+	Short: "Re-derive the prompt-cache token counters of sessions that read zero",
+	Long: `Give back the cache_read and cache_write token counters that sessions
+ingested before the fix never recorded.
+
+Nothing ever assigned them, so every session synced before that fix reads zero
+on both — 48,064 of 49,226 sessions on the author's archive. Measured there:
+the repair recovers 23.1 billion cache tokens, 150 times the 154 million input
+and output tokens those sessions counted, and takes the archive's total from
+6.3 to 29.4 billion. 'ccvault sync' repairs a session it re-reads, but only a
+few hundred of those transcripts still exist under ~/.claude, so for the rest
+there is nothing on disk left to read.
+
+What it reads instead is the archive. turns.raw_json holds the complete JSONL
+line of every turn, so the lines are streamed back through the same adapter
+that first parsed them and summed the same way a live sync sums them. The
+per-source rule therefore has one implementation and cannot drift — and that
+rule is not uniform: codex reports a cached count contained inside its input
+count, where Claude Code reports cache counters beside it.
+
+It refuses more often than it repairs would suggest, on purpose:
+
+  - a session whose re-derived input and output tokens disagree with the ones
+    the row already counts is left alone. That equality is the checksum that
+    says the stored lines are the whole session.
+  - a session holding a turn with no stored line cannot be re-derived at all,
+    and is skipped rather than written as a zero.
+
+Safe to re-run and safe to interrupt: a repaired session is no longer a
+candidate, and progress is committed as it goes. Reading every stored line
+takes minutes on a large archive, so --dry-run reports what a run would do
+without writing anything.
+
+Run 'ccvault stats' for how many sessions are still missing their cache
+counters, and 'ccvault build-cache' afterwards to carry the repair into the
+analytics cache.`,
+	Args:         cobra.NoArgs,
+	SilenceUsage: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		asJSON, _ := cmd.Flags().GetBool("json")
+		dryRun, _ := cmd.Flags().GetBool("dry-run")
+
+		cfg, err := loadConfig(cmd)
+		if err != nil {
+			return fmt.Errorf("load config: %w", err)
+		}
+
+		// Opened here rather than inside runRepairTokens so the open is not
+		// handed a context it would have to ignore: db.Open inspects the
+		// schema on the way in and takes no context.
+		database, err := openArchiveForWrite(cfg.DataDir)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = database.Close() }()
+
+		return runRepairTokens(cmd.Context(), database, dryRun, asJSON)
+	},
+}
+
+// runRepairTokens re-derives the cache token counters of every session that
+// still reads zero, and reports what happened to each one.
+func runRepairTokens(ctx context.Context, database *db.DB, dryRun, asJSON bool) error {
+	before, err := database.CacheTokenCoverage()
+	if err != nil {
+		return err
+	}
+
+	opts := sync.CacheBackfillOptions{DryRun: dryRun}
+	// Progress goes to stderr under --json so the document on stdout stays a
+	// document.
+	if asJSON {
+		opts.Progress = func(format string, args ...any) {
+			fmt.Fprintf(os.Stderr, format+"\n", args...)
+		}
+	} else {
+		opts.Progress = func(format string, args ...any) {
+			fmt.Printf(format+"\n", args...)
+		}
+	}
+
+	report, err := sync.BackfillCacheTokens(ctx, database, opts)
+	if err != nil {
+		return fmt.Errorf("repair the cache token counters: %w", err)
+	}
+
+	after, err := database.CacheTokenCoverage()
+	if err != nil {
+		return err
+	}
+
+	if asJSON {
+		out, marshalErr := json.MarshalIndent(map[string]interface{}{
+			"archive":                database.Path(),
+			"dry_run":                report.DryRun,
+			"cancelled":              report.Cancelled,
+			"seconds":                report.Elapsed.Seconds(),
+			"candidates":             report.Candidates,
+			"examined":               report.Examined,
+			"repaired":               report.Repaired,
+			"no_cache_usage":         report.NoCacheUsage,
+			"unreadable":             report.Unreadable,
+			"mismatched":             report.Mismatched,
+			"unsupported":            report.UnsupportedBySource,
+			"failed":                 report.Failed,
+			"cache_tokens_recovered": report.CacheTokensRecovered,
+			"coverage_before":        cacheCoverageJSON(before),
+			"coverage_after":         cacheCoverageJSON(after),
+		}, "", "  ")
+		if marshalErr != nil {
+			return fmt.Errorf("marshal repair report: %w", marshalErr)
+		}
+		fmt.Println(string(out))
+		return nil
+	}
+
+	fmt.Println()
+	if report.DryRun {
+		fmt.Printf("Dry run over %s — nothing was written.\n", database.Path())
+	} else {
+		fmt.Printf("Repaired the cache token counters in %s\n", database.Path())
+	}
+	fmt.Printf("  examined               %d of %d candidate session(s) in %s\n",
+		report.Examined, report.Candidates, report.Elapsed.Round(time.Second))
+	fmt.Printf("  repaired               %d session(s), recovering %s cache tokens\n",
+		report.Repaired, formatTokens(report.CacheTokensRecovered))
+	fmt.Printf("  no cache usage         %d session(s) whose stored lines record none\n",
+		report.NoCacheUsage)
+	if report.Mismatched > 0 {
+		fmt.Printf("  left alone             %d session(s) whose stored lines do not account for the tokens the row counts\n",
+			report.Mismatched)
+	}
+	if report.Unreadable > 0 {
+		fmt.Printf("  unreadable             %d session(s) holding a turn with no stored line\n",
+			report.Unreadable)
+	}
+	for source, n := range report.UnsupportedBySource {
+		fmt.Printf("  %-22s %d session(s) cannot be re-derived from stored lines\n", source, n)
+	}
+	if report.Failed > 0 {
+		fmt.Printf("  failed                 %d session(s)\n", report.Failed)
+	}
+	for _, e := range report.Errors {
+		fmt.Printf("    %v\n", e)
+	}
+	if report.Cancelled {
+		fmt.Println("  cancelled              the sessions already repaired are committed; re-run to finish")
+	}
+	fmt.Println()
+	fmt.Printf("Sessions missing cache tokens: %d before, %d after\n",
+		before.MissingWithCost, after.MissingWithCost)
+	fmt.Printf("Cache tokens in the archive:   %s before, %s after\n",
+		formatTokens(before.CacheTokens), formatTokens(after.CacheTokens))
+	if !report.DryRun && report.Repaired > 0 {
+		fmt.Println()
+		fmt.Println("Run 'ccvault build-cache' to carry the repair into the analytics cache.")
+	}
+
+	return nil
+}
+
+// cacheCoverageJSON renders the cache-token coverage for --json consumers.
+func cacheCoverageJSON(c db.CacheTokenCoverage) map[string]interface{} {
+	return map[string]interface{}{
+		"sessions":          c.Sessions,
+		"missing_cache":     c.MissingCache,
+		"missing_with_cost": c.MissingWithCost,
+		"cache_tokens":      c.CacheTokens,
+		"complete":          c.Complete(),
+	}
+}
+
 var importCmd = &cobra.Command{
 	Use:     "import <database-path>",
 	Aliases: []string{"merge"},
@@ -2135,6 +2351,7 @@ func init() {
 	rootCmd.AddCommand(mcpCmd)
 	rootCmd.AddCommand(buildCacheCmd)
 	rootCmd.AddCommand(repairIndexCmd)
+	rootCmd.AddCommand(repairTokensCmd)
 	rootCmd.AddCommand(importCmd)
 
 	// Orient flags
@@ -2160,6 +2377,10 @@ func init() {
 
 	// Repair-index flags
 	repairIndexCmd.Flags().Bool("json", false, "Output the rebuild timings and the strict verdict as JSON")
+
+	repairTokensCmd.Flags().Bool("json", false, "Output the repair counts as JSON")
+	repairTokensCmd.Flags().Bool("dry-run", false,
+		"Examine every candidate and write nothing, reporting the counts a real run would produce")
 
 	// Import flags
 	importCmd.Flags().Bool("json", false, "Output merge counts as JSON")

@@ -94,6 +94,7 @@ ccvault stats
 | `sync` | Sync conversations from Claude Code (see [Sync modes](#sync-modes)) |
 | `import [db-path]` | Merge another ccvault database into this archive |
 | `repair-index` | Rebuild the full-text search indexes from the archive's own rows |
+| `repair-tokens` | Re-derive the prompt-cache token counters of sessions that read zero |
 | `tui` | Launch interactive terminal UI |
 | `search [query]` | Full-text search across conversations |
 | `stats` | Show archive statistics, including reclaimable space |
@@ -255,6 +256,40 @@ calendar date out of it by character position, so a value in a different shape
 sorts and indexes wherever its bytes land. Such a value is still readable, and
 an import could legitimately carry one, so this is reported rather than
 refused — it does not change the exit code.
+
+### Repairing the cache token counters
+
+```bash
+ccvault repair-tokens --dry-run   # what it would repair
+ccvault repair-tokens             # repair it
+```
+
+`sessions.cache_read_tokens` and `cache_write_tokens` were never assigned, so
+every session synced before that fix reads zero on both — 48,064 of 49,226
+sessions on the author's archive. Measured there: the repair recovered 23.1
+billion cache tokens, 150 times the 154 million input and output tokens those
+sessions counted, taking the archive's reported total from 6.3 to 29.4 billion
+in under two minutes. `ccvault stats` reports how many sessions are in that
+state, and says nothing when there are none.
+
+`ccvault sync` repairs a session it re-reads, but only a few hundred of those
+transcripts still exist under `~/.claude`, so for the rest there is nothing on
+disk left to read. `repair-tokens` reads the archive instead: `turns.raw_json`
+holds the complete JSONL line of every turn, so the lines are streamed back
+through the same adapter that first parsed them and summed the way a live sync
+sums them. That keeps one implementation of the per-source rule, which matters
+because the rule is not uniform — codex reports a cached count contained inside
+its input count, where Claude Code reports cache counters beside it, so one is
+a split and the other a copy.
+
+It refuses rather than guessing. A session whose re-derived input and output
+tokens disagree with the ones the row already counts is left alone: that
+equality is the checksum saying the stored lines are the whole session, and it
+is what catches a turn whose oversized line was stored as a placeholder without
+its usage object. A session holding a turn with no stored line at all cannot be
+re-derived and is skipped. Safe to re-run and to interrupt — a repaired session
+is no longer a candidate, and progress is committed as it goes. Run
+`ccvault build-cache` afterwards to carry the repair into the analytics cache.
 
 ### Running an older ccvault against a newer archive
 
