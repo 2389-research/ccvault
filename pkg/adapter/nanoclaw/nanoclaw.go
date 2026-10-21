@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -132,17 +133,31 @@ func nanoclawProjectPath(group string) (projectPath, display string) {
 // Dispatches to the subagent branch when the path lives under a subagents/ directory,
 // otherwise treats it as a parent session.
 func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
-	if adapter.IsSubagentPath(path) {
-		return parseSubagent(path)
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("opening nanoclaw session: %w", err)
 	}
-	return parseParent(path)
+	defer func() { _ = f.Close() }()
+
+	return a.ParseTranscript(path, f)
+}
+
+// ParseTranscript reads the same transcript from a reader rather than from the
+// file at originalPath — see adapter.TranscriptReparser for why that is worth
+// having. The parent/subagent split stays keyed on originalPath, as does the
+// nanoclaw group, because neither is something the lines carry.
+func (a *Adapter) ParseTranscript(originalPath string, r io.Reader) (*adapter.ParsedSession, error) {
+	if adapter.IsSubagentPath(originalPath) {
+		return parseSubagent(originalPath, r)
+	}
+	return parseParent(originalPath, r)
 }
 
 // parseParent handles the top-level session JSONL — the same format Claude Code
 // writes, with nanoclaw's [SCHEDULED TASK - ...] user injections reclassified
 // as system turns.
-func parseParent(path string) (*adapter.ParsedSession, error) {
-	turns, session, stats, err := parser.ParseSession(path)
+func parseParent(path string, r io.Reader) (*adapter.ParsedSession, error) {
+	turns, session, stats, err := parser.ParseSessionReader(r, path)
 	if err != nil {
 		return nil, err
 	}
@@ -173,8 +188,8 @@ func parseParent(path string) (*adapter.ParsedSession, error) {
 // parseSubagent handles sidechain JSONLs — same wire format as parent sessions
 // but sessionId inside the file points at the *parent* session, so we
 // disambiguate the ccvault-side ID with the file-derived agent ID.
-func parseSubagent(path string) (*adapter.ParsedSession, error) {
-	turns, session, stats, err := parser.ParseSession(path)
+func parseSubagent(path string, r io.Reader) (*adapter.ParsedSession, error) {
+	turns, session, stats, err := parser.ParseSessionReader(r, path)
 	if err != nil {
 		return nil, err
 	}

@@ -5,6 +5,9 @@ package claudecode
 
 import (
 	"encoding/json"
+	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 
 	"github.com/2389-research/ccvault/pkg/adapter"
@@ -65,7 +68,22 @@ func (a *Adapter) Discover(root string) ([]adapter.SessionFile, error) {
 // Parse reads a Claude Code JSONL session file and converts it to adapter.ParsedSession.
 // It also detects errors and subagent usage, storing them in Metadata.
 func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
-	turns, session, stats, err := parser.ParseSession(path)
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open session file: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	return a.ParseTranscript(path, f)
+}
+
+// ParseTranscript reads the same transcript from a reader rather than from the
+// file at path — see adapter.TranscriptReparser for why that is worth having.
+// path is where the transcript came from and is not opened here, but it still
+// decides the path-derived answers (sidechain identity, the parent's project)
+// exactly as Parse's own path does.
+func (a *Adapter) ParseTranscript(path string, r io.Reader) (*adapter.ParsedSession, error) {
+	turns, session, stats, err := parser.ParseSessionReader(r, path)
 	if err != nil {
 		return nil, err
 	}

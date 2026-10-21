@@ -201,7 +201,27 @@ func (a *Adapter) Parse(path string) (*adapter.ParsedSession, error) {
 	}
 	defer func() { _ = f.Close() }()
 
-	reader := bufio.NewReader(f)
+	return a.ParseTranscript(path, f)
+}
+
+// ParseTranscript reads the same transcript from a reader rather than from the
+// file at originalPath — see adapter.TranscriptReparser for why that is worth
+// having.
+//
+// A codex rollout answers everything from its own lines: the session id, cwd
+// and git branch arrive in the session_meta line, so originalPath is unused
+// here and kept only to satisfy the interface.
+//
+// Worth knowing before trusting this against stored lines: codex reports its
+// token counts on token_count *event* lines, and the loop below folds them
+// into the preceding assistant turn rather than making turns of their own. A
+// re-derivation reading turns.raw_json therefore sees no token counts at all,
+// which is why the backfill refuses any session whose re-derived total falls
+// below the total already stored.
+func (a *Adapter) ParseTranscript(originalPath string, r io.Reader) (*adapter.ParsedSession, error) {
+	_ = originalPath
+
+	reader := bufio.NewReader(r)
 
 	var (
 		sessionID   string

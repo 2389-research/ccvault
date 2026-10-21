@@ -5,6 +5,7 @@ package adapter
 
 import (
 	"encoding/json"
+	"io"
 	"time"
 )
 
@@ -102,4 +103,82 @@ type SourceAdapter interface {
 	Name() string
 	Discover(root string) ([]SessionFile, error)
 	Parse(path string) (*ParsedSession, error)
+}
+
+// TranscriptReparser is a SourceAdapter that can read a transcript from
+// somewhere other than its original file.
+//
+// It exists because the source files are gone. Only a few hundred of the
+// author's 49,226 archived transcripts still exist in ~/.claude, so repairing
+// a counter that was never stored (#155's cache pair) cannot re-read them —
+// but turns.raw_json holds the complete JSONL line of every turn, so the lines
+// themselves survive inside the archive.
+//
+// ParseTranscript is Parse with the bytes supplied by the caller: Parse opens
+// the file and hands the reader straight to it, so there is exactly one
+// implementation of each source's rules and nothing can drift between a live
+// sync and a re-derivation. That matters most where the rules disagree —
+// codex's cached_input_tokens is contained in its input_tokens while Claude
+// Code's cache counters sit beside them (see ParsedTurn.CacheReadTokens) — and
+// a second implementation of that difference, in SQL or anywhere else, is two
+// copies of one rule waiting to diverge.
+//
+// originalPath is the path the transcript came from. Adapters read the layout
+// of a path for things the bytes do not carry (which session is a sidechain,
+// which nanoclaw group a session belongs to), so passing the stored
+// sessions.source_file keeps those answers the same as the first parse gave.
+// The transcript is never read from it.
+//
+// Its *neighbours* may be, though, and that is the one thing to know before
+// trusting the result. A sidechain transcript's project and agent type are
+// read out of files beside it — ReadSubagentMeta and parser.SubagentProjectPath
+// — so when the directory is gone, those two fields fall back rather than
+// resolve. Everything derived from the lines themselves, token counters
+// included, is unaffected; a caller that needs the metadata should know it is
+// reading a degraded answer.
+//
+// Not every adapter implements it. hex stores a whole session as one JSON
+// document rather than a line per turn, so its turns cannot be reassembled
+// into a transcript; jeff records no token usage of any kind, so there is
+// nothing about it for a re-derivation to recover. Which adapter is on which
+// side of that line is pinned by TestTranscriptReparsers, so a new source that
+// records usage cannot be left silently unrepairable.
+type TranscriptReparser interface {
+	SourceAdapter
+	ParseTranscript(originalPath string, r io.Reader) (*ParsedSession, error)
+}
+
+// TokenTotals is a session's four token counters, summed over its turns.
+type TokenTotals struct {
+	Input      int64
+	Output     int64
+	CacheRead  int64
+	CacheWrite int64
+}
+
+// Total is what the session cost altogether.
+//
+// The four counters are disjoint by contract — see ParsedTurn.CacheReadTokens
+// for the per-source work that makes them so — which is what lets them be
+// added rather than reconciled.
+func (t TokenTotals) Total() int64 {
+	return t.Input + t.Output + t.CacheRead + t.CacheWrite
+}
+
+// TokenTotals sums the session's turns into the four counters the session row
+// carries.
+//
+// One implementation, used by both callers: the sync layer filling a session
+// it just parsed, and the backfill re-deriving one from the lines the archive
+// already holds. A second summation is how one of them ends up adding three
+// counters out of four, which is #155 itself.
+func (ps *ParsedSession) TokenTotals() TokenTotals {
+	var totals TokenTotals
+	for _, turn := range ps.Turns {
+		totals.Input += turn.InputTokens
+		totals.Output += turn.OutputTokens
+		totals.CacheRead += turn.CacheReadTokens
+		totals.CacheWrite += turn.CacheWriteTokens
+	}
+	return totals
 }
