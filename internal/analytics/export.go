@@ -46,6 +46,18 @@ type SessionRecord struct {
 	// them (#74), and a parquet file copied away from the archive has no
 	// join back to SQLite to recover the split.
 	ParentSessionID string `parquet:"name=parent_session_id, type=BYTE_ARRAY, convertedtype=UTF8"`
+
+	// CacheWriteTokens completes the set TotalTokens already sums. Exporting
+	// the read counter and not the write one meant the cache could not
+	// reproduce its own total from its own columns, and could not tell cheap
+	// spend from expensive: a cache read costs roughly a tenth of a cache
+	// write, so read-vs-write is what a cache-efficiency number is made of
+	// (#167).
+	//
+	// Appended for the same reason ParentSessionID was, rather than placed
+	// beside CacheReadTokens where it reads better: existing column positions
+	// stay put.
+	CacheWriteTokens int64 `parquet:"name=cache_write_tokens, type=INT64"`
 }
 
 // sessionRecordColumns returns the parquet column names SessionRecord
@@ -153,19 +165,20 @@ func (e *Exporter) exportSessions() error {
 
 	for _, s := range sessions {
 		record := SessionRecord{
-			ID:              s.ID,
-			ProjectID:       s.ProjectID,
-			ProjectPath:     projectPaths[s.ProjectID],
-			StartedAt:       s.StartedAt.UnixMilli(),
-			EndedAt:         s.EndedAt.UnixMilli(),
-			Model:           s.Model,
-			TurnCount:       int32(s.TurnCount),
-			InputTokens:     s.InputTokens,
-			OutputTokens:    s.OutputTokens,
-			CacheReadTokens: s.CacheReadTokens,
-			TotalTokens:     s.InputTokens + s.OutputTokens + s.CacheReadTokens + s.CacheWriteTokens,
-			Source:          s.Source,
-			ParentSessionID: s.ParentSessionID,
+			ID:               s.ID,
+			ProjectID:        s.ProjectID,
+			ProjectPath:      projectPaths[s.ProjectID],
+			StartedAt:        s.StartedAt.UnixMilli(),
+			EndedAt:          s.EndedAt.UnixMilli(),
+			Model:            s.Model,
+			TurnCount:        int32(s.TurnCount),
+			InputTokens:      s.InputTokens,
+			OutputTokens:     s.OutputTokens,
+			CacheReadTokens:  s.CacheReadTokens,
+			CacheWriteTokens: s.CacheWriteTokens,
+			TotalTokens:      s.InputTokens + s.OutputTokens + s.CacheReadTokens + s.CacheWriteTokens,
+			Source:           s.Source,
+			ParentSessionID:  s.ParentSessionID,
 		}
 		if err := pw.Write(record); err != nil {
 			return fmt.Errorf("write record: %w", err)
