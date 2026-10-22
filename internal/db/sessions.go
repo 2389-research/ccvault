@@ -550,47 +550,7 @@ func (db *DB) GetSessionStats() (count int, totalTurns int, totalTokens int64, e
 	return count, totalTurns, totalTokens, nil
 }
 
-// TurnDrift is what sessions.turn_count claims against what turns holds.
-type TurnDrift struct {
-	// Counted is SUM(sessions.turn_count) — what the sessions say they hold.
-	Counted int
-	// Rows is COUNT(*) FROM turns — what the archive actually holds.
-	Rows int
-	// Sessions is how many session rows disagree with their own turns, in
-	// either direction.
-	Sessions int
-}
-
-// Drifted reports whether the counter and the rows disagree at all.
-func (d TurnDrift) Drifted() bool {
-	return d.Counted != d.Rows || d.Sessions > 0
-}
-
-// TurnCountDrift measures sessions.turn_count against the turns table.
-//
-// #91 asks for the discrepancy to be surfaced rather than quietly corrected,
-// in the same shape `stats` already uses for reclaimable storage. The reason is
-// that the drift is not a cosmetic accounting error: a session claiming more
-// turns than it holds means its rows were deleted, which is what #92 is, and a
-// visible disagreement is strictly better than a confident wrong number.
-//
-// Both directions count. A counter below the rows is just as much a sign the
-// two have come apart, and reporting only the over-count would hide it.
-func (db *DB) TurnCountDrift() (TurnDrift, error) {
-	var d TurnDrift
-	err := db.QueryRow(`
-		SELECT
-			(SELECT COALESCE(SUM(COALESCE(turn_count, 0)), 0) FROM sessions),
-			(SELECT COUNT(*) FROM turns),
-			(SELECT COUNT(*) FROM sessions s
-			 WHERE COALESCE(s.turn_count, 0) <>
-			       (SELECT COUNT(*) FROM turns t WHERE t.session_id = s.id))
-	`).Scan(&d.Counted, &d.Rows, &d.Sessions)
-	if err != nil {
-		return TurnDrift{}, fmt.Errorf("measure turn count drift: %w", err)
-	}
-	return d, nil
-}
+// TurnDrift, its causes and TurnCountDrift live in turndrift.go.
 
 // ReconcileSessionTurnCounts rewrites sessions.turn_count from the rows each
 // session actually holds, and returns how many counters it corrected.
