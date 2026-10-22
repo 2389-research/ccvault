@@ -124,7 +124,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_session_ordinal ON turns(session_id,
 -- tool_uses.turn_id's reference was doubly inert between migrations 012 and
 -- 016: turns.id alone stopped being a unique key, so the clause did not even
 -- name one. Migration 016 rebuilt the table to point it at turns' real key,
--- (id, session_id), as the table-level constraint at the bottom of this
+-- (session_id, id), as the table-level constraint at the bottom of this
 -- definition — both columns, because a call belongs to the turn with its uuid
 -- *in its own session*, and one uuid in two sessions is two turns (#92).
 -- Enforcing it is still a separate decision: PRAGMA foreign_key_check reports
@@ -168,11 +168,15 @@ CREATE TABLE IF NOT EXISTS tool_uses (
                   || ' ccvym' || substr(timestamp, 1, 4) || substr(timestamp, 6, 2)
              ELSE 'ccvymx' END
     ) VIRTUAL,
-    -- turns' real key, with its columns in the order a reference to it must
-    -- list them (#122, migration 016). Inert like every other foreign key in
-    -- this file — see the note above tool_uses — but it now names something
-    -- that exists, so whoever enables enforcement is not blocked by a clause
-    -- SQLite would reject outright.
+    -- turns' real key (#122, migration 016). That key is declared
+    -- (session_id, id); SQLite resolves a reference's parent columns against a
+    -- unique index by set rather than by position, so naming them
+    -- (id, session_id) here matches it. Written in this order to read as "the
+    -- turn, in its session", which is what the pair means.
+    --
+    -- Inert like every other foreign key in this file — see the note above
+    -- tool_uses — but it now names something that exists, so whoever enables
+    -- enforcement is not blocked by a clause SQLite would reject outright.
     FOREIGN KEY (turn_id, session_id) REFERENCES turns(id, session_id) ON DELETE CASCADE
 );
 

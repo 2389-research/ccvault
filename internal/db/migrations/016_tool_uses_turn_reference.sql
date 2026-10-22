@@ -102,8 +102,14 @@ CREATE TABLE IF NOT EXISTS tool_uses_new (
              ELSE 'ccvymx' END
     ) VIRTUAL,
     -- The whole point of this migration: a reference that names a key which
-    -- exists. (id, session_id) is turns' primary key with its columns in the
-    -- order a reference to it must list them.
+    -- exists. turns' primary key is (session_id, id); SQLite resolves a
+    -- reference's parent columns against a unique index by set rather than by
+    -- position, so naming them (id, session_id) here matches that key.
+    -- Verified rather than assumed: with enforcement on, an insert whose pair
+    -- exists in turns is accepted and one whose pair does not is rejected, and
+    -- PRAGMA foreign_key_check names exactly the rows that do not satisfy it
+    -- even while enforcement is off. The column order is written to read as
+    -- "the turn, in its session", which is what the pair means.
     FOREIGN KEY (turn_id, session_id) REFERENCES turns(id, session_id) ON DELETE CASCADE
 );
 

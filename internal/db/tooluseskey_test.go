@@ -88,9 +88,18 @@ func seedPre016(t *testing.T) string {
 	// reference does not silently delete anything. #87's orphans are real rows
 	// on the author's archive, and a migration that quietly dropped them would
 	// destroy the evidence of a defect that is still open.
+	//
+	// Its id is set explicitly, and far above the others, so the ids in this
+	// fixture are sparse the way the real archive's are — 333,245 rows whose
+	// ids run to 961,068. Without the gap the four auto-assigned rows take ids
+	// 1 to 4, which a rebuild that dropped `id` from its INSERT ... SELECT
+	// would hand out again in the same order, and both id-preservation tests
+	// would pass while renumbering every row. The gap is what makes them able
+	// to fail: a renumbering rebuild gives this row id 5, and the id-keyed
+	// comparison reports 900 missing.
 	if _, err := raw.Exec(`
-		INSERT INTO tool_uses (turn_id, session_id, tool_name, timestamp, turn_ordinal)
-		VALUES ('turn-that-is-gone', 'sess-a', 'Read', ?, 0)`,
+		INSERT INTO tool_uses (id, turn_id, session_id, tool_name, timestamp, turn_ordinal)
+		VALUES (900, 'turn-that-is-gone', 'sess-a', 'Read', ?, 0)`,
 		FormatTimestamp(ts)); err != nil {
 		t.Fatalf("seed orphaned tool use: %v", err)
 	}
@@ -136,6 +145,54 @@ func TestMigration016PointsTheReferenceAtAKeyThatExists(t *testing.T) {
 	if strings.Contains(stmt, "turn_id TEXT REFERENCES turns(id)") {
 		t.Errorf("tool_uses still references turns(id), which is not a unique key:\n%s", stmt)
 	}
+
+	// The text is what the migration wrote; this is what SQLite made of it,
+	// and only the second establishes that the reference resolves. A parent
+	// column list naming something that is not a unique key makes
+	// foreign_key_check fail with "foreign key mismatch" rather than report
+	// rows, which is exactly the state #122 describes — so a check that
+	// returns row counts at all is the evidence the declaration is real.
+	//
+	// It runs with enforcement off, which is how ccvault opens every
+	// connection: foreign_key_check is a report, not a constraint.
+	//
+	// turns' primary key is declared (session_id, id) and this reference names
+	// (id, session_id). SQLite resolves parent columns against a unique index
+	// by set rather than by position, so that matches — and this is the
+	// assertion that says so, rather than the comment claiming it.
+	violations := foreignKeyViolations(t, database)
+	if violations != 1 {
+		t.Errorf("foreign_key_check(tool_uses) reported %d violation(s), want 1 — "+
+			"the fixture's single orphan, and nothing else", violations)
+	}
+}
+
+// foreignKeyViolations counts what PRAGMA foreign_key_check(tool_uses)
+// reports. Its own function so the cursor is closed before the caller's next
+// statement: the pool is a single connection.
+func foreignKeyViolations(t *testing.T, database *DB) int {
+	t.Helper()
+
+	rows, err := database.Query(`PRAGMA foreign_key_check(tool_uses)`)
+	if err != nil {
+		t.Fatalf("foreign_key_check: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	violations := 0
+	for rows.Next() {
+		var table, parent string
+		var rowID sql.NullInt64
+		var fkID int
+		if err := rows.Scan(&table, &rowID, &parent, &fkID); err != nil {
+			t.Fatalf("scan foreign_key_check: %v", err)
+		}
+		violations++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read foreign_key_check: %v", err)
+	}
+	return violations
 }
 
 // TestMigration016LeavesNoRowOrphanedAgainstTheCompositeKey is the assertion
