@@ -1769,6 +1769,48 @@ func (s *Server) getStats(args map[string]interface{}) (interface{}, error) {
 	return result, nil
 }
 
+// refreshStaleAnalyticsCache rebuilds the Parquet cache when its schema
+// predates the exporter, and returns a warning when it cannot.
+//
+// #149 gave the TUI's Analytics tab this behaviour and this server never got
+// it: NewServer built an Analyzer and nothing ever called
+// SessionsParquetMissingColumns, so `ccvault mcp` served a pre-#167 cache's
+// numbers indefinitely. It did not error, either, because no production query
+// selects the column that was added — the cache is simply old, silently, and
+// the one consumer that self-heals is the one a human is watching. This is the
+// agent-facing surface, where a wrong number is acted on rather than looked at.
+//
+// One call covers both staleness and absence: a missing file reports every
+// column as absent. The check follows SessionRecord rather than naming a
+// column, so a cache written before any later column addition is detected
+// without anybody remembering to edit a list.
+//
+// A failure comes back as a warning rather than an error, in the list
+// get_analytics already keeps for a degraded DuckDB query. An agent that asked
+// for analytics and got an error learns less than one that got the SQLite
+// summary plus a sentence saying the Parquet half is stale and how to fix it.
+func (s *Server) refreshStaleAnalyticsCache() string {
+	cacheDir := filepath.Join(s.cfg.DataDir, "analytics")
+
+	missing, err := s.analyzer.SessionsParquetMissingColumns()
+	if err != nil {
+		return fmt.Sprintf(
+			"analytics cache schema could not be checked (%v), so the figures below may come "+
+				"from a cache older than this ccvault. Rebuild it with 'ccvault build-cache'", err)
+	}
+	if len(missing) == 0 {
+		return ""
+	}
+
+	if err := analytics.NewExporter(s.db, cacheDir).Export(); err != nil {
+		return fmt.Sprintf(
+			"analytics cache is older than this ccvault (missing %s) and could not be rebuilt "+
+				"(%v), so the figures below are from the stale cache. Rebuild it with "+
+				"'ccvault build-cache'", strings.Join(missing, ", "), err)
+	}
+	return ""
+}
+
 func (s *Server) getAnalytics(args map[string]interface{}) (interface{}, error) {
 	days := 30
 	if d, ok := args["days"].(float64); ok {
@@ -1797,6 +1839,10 @@ func (s *Server) getAnalytics(args map[string]interface{}) (interface{}, error) 
 
 	// DuckDB analytics: report failures instead of silently omitting sections
 	if s.analyzer != nil {
+		if warning := s.refreshStaleAnalyticsCache(); warning != "" {
+			warnings = append(warnings, warning)
+		}
+
 		dailyTokens, err := s.analyzer.GetTokensByDay(days)
 		if err != nil {
 			warnings = append(warnings, fmt.Sprintf("tokens_by_day unavailable: %v", err))
