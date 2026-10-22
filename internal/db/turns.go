@@ -237,15 +237,29 @@ func checkDistinctOrdinals(turns []models.Turn) error {
 // (MCP's get_turns slices it by offset and limit) would silently skip and
 // repeat rows. ordinal is unique per session, so the sort is total and the
 // same every time.
+// A caller that wants one page of a long session wants GetTurnsPage instead:
+// this loads every turn, and on the author's archive that is up to 56,030
+// rows or 56.8 MB of content and raw_json for a session (#169). The callers
+// left here — the export, the analytics exporter, the TUI's conversation view
+// — legitimately want all of them.
 func (db *DB) GetTurns(sessionID string) ([]models.Turn, error) {
 	query := `
-		SELECT id, session_id, parent_id, type, timestamp, ordinal, content, raw_json, input_tokens, output_tokens
+		SELECT ` + turnColumns + `
 		FROM turns WHERE session_id = ? ORDER BY ordinal ASC`
 
 	rows, err := db.Query(query, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("query turns: %w", err)
 	}
+	return scanTurnRows(rows)
+}
+
+// scanTurnRows reads a (turnColumns) result set into turns. Shared by GetTurns
+// and GetTurnsPage so the whole-session read and the paged one cannot come to
+// disagree about how a stored turn becomes a models.Turn — in particular about
+// the raw_json validation below, which is the difference between an unreadable
+// payload being dropped and it crashing a caller's json.Marshal.
+func scanTurnRows(rows *sql.Rows) ([]models.Turn, error) {
 	defer func() { _ = rows.Close() }()
 
 	var turns []models.Turn

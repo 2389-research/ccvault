@@ -22,7 +22,6 @@ import (
 	"github.com/2389-research/ccvault/internal/export"
 	"github.com/2389-research/ccvault/internal/projectref"
 	"github.com/2389-research/ccvault/internal/search"
-	"github.com/2389-research/ccvault/pkg/models"
 )
 
 // Server handles MCP protocol communication
@@ -1295,40 +1294,44 @@ func (s *Server) getTurns(args map[string]interface{}) (interface{}, error) {
 
 	typeFilter, _ := args["type"].(string)
 
-	turns, err := s.db.GetTurns(sessionID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get turns: %w", err)
-	}
-
-	// Filter by type if specified
-	if typeFilter != "" {
-		var filtered []models.Turn
-		for _, t := range turns {
-			if t.Type == typeFilter {
-				filtered = append(filtered, t)
-			}
-		}
-		turns = filtered
-	}
-
-	totalCount := len(turns)
-
 	// after_ordinal and offset are two ways to say the same thing, so taking
 	// both would mean applying one on top of the other. A position wins:
 	// nothing else in the response is as specific.
 	if resumeFromOrdinal {
 		offset = 0
-		kept := turns[:0]
-		for _, t := range turns {
-			if t.Ordinal > afterOrdinal {
-				kept = append(kept, t)
-			}
-		}
-		turns = kept
-	} else if offset >= len(turns) {
-		turns = nil
-	} else {
-		turns = turns[offset:]
+	}
+
+	// The session's total, read as a count rather than taken as the length of
+	// every turn the handler had loaded. Scoped by the same type filter the
+	// page is, because that is what it meant before: total_turns names the
+	// turns a caller walking *this* filter will see.
+	totalCount, err := s.db.CountTurns(sessionID, typeFilter)
+	if err != nil {
+		return nil, fmt.Errorf("failed to count turns: %w", err)
+	}
+
+	// One page of turns, read as a page. This handler used to call
+	// db.GetTurns, which loads every turn of the session, and then filter and
+	// slice in Go — so the cost of returning fifty rows followed the session
+	// rather than the page. On the author's archive that is up to 56,030 rows
+	// (one session) or 56.8 MB of content and raw_json (a different one), per
+	// call, and it was paid again on every after_ordinal resume, which is
+	// exactly what #79's resumable pagination exists to avoid (#169).
+	//
+	// limit+1 is how has_more is answered without a second query: the extra
+	// row is read, never rendered, and its presence is the whole signal. One
+	// more row is the smallest thing that can distinguish "this is the last
+	// page" from "there is more", and it is what the Go slicing was doing
+	// implicitly by holding the whole session.
+	turns, err := s.db.GetTurnsPage(sessionID, db.TurnPage{
+		Type:         typeFilter,
+		AfterOrdinal: afterOrdinal,
+		FromOrdinal:  resumeFromOrdinal,
+		Offset:       offset,
+		Limit:        limit + 1,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get turns: %w", err)
 	}
 
 	// Check for more
@@ -1766,6 +1769,48 @@ func (s *Server) getStats(args map[string]interface{}) (interface{}, error) {
 	return result, nil
 }
 
+// refreshStaleAnalyticsCache rebuilds the Parquet cache when its schema
+// predates the exporter, and returns a warning when it cannot.
+//
+// #149 gave the TUI's Analytics tab this behaviour and this server never got
+// it: NewServer built an Analyzer and nothing ever called
+// SessionsParquetMissingColumns, so `ccvault mcp` served a pre-#167 cache's
+// numbers indefinitely. It did not error, either, because no production query
+// selects the column that was added — the cache is simply old, silently, and
+// the one consumer that self-heals is the one a human is watching. This is the
+// agent-facing surface, where a wrong number is acted on rather than looked at.
+//
+// One call covers both staleness and absence: a missing file reports every
+// column as absent. The check follows SessionRecord rather than naming a
+// column, so a cache written before any later column addition is detected
+// without anybody remembering to edit a list.
+//
+// A failure comes back as a warning rather than an error, in the list
+// get_analytics already keeps for a degraded DuckDB query. An agent that asked
+// for analytics and got an error learns less than one that got the SQLite
+// summary plus a sentence saying the Parquet half is stale and how to fix it.
+func (s *Server) refreshStaleAnalyticsCache() string {
+	cacheDir := filepath.Join(s.cfg.DataDir, "analytics")
+
+	missing, err := s.analyzer.SessionsParquetMissingColumns()
+	if err != nil {
+		return fmt.Sprintf(
+			"analytics cache schema could not be checked (%v), so the figures below may come "+
+				"from a cache older than this ccvault. Rebuild it with 'ccvault build-cache'", err)
+	}
+	if len(missing) == 0 {
+		return ""
+	}
+
+	if err := analytics.NewExporter(s.db, cacheDir).Export(); err != nil {
+		return fmt.Sprintf(
+			"analytics cache is older than this ccvault (missing %s) and could not be rebuilt "+
+				"(%v), so the figures below are from the stale cache. Rebuild it with "+
+				"'ccvault build-cache'", strings.Join(missing, ", "), err)
+	}
+	return ""
+}
+
 func (s *Server) getAnalytics(args map[string]interface{}) (interface{}, error) {
 	days := 30
 	if d, ok := args["days"].(float64); ok {
@@ -1794,6 +1839,10 @@ func (s *Server) getAnalytics(args map[string]interface{}) (interface{}, error) 
 
 	// DuckDB analytics: report failures instead of silently omitting sections
 	if s.analyzer != nil {
+		if warning := s.refreshStaleAnalyticsCache(); warning != "" {
+			warnings = append(warnings, warning)
+		}
+
 		dailyTokens, err := s.analyzer.GetTokensByDay(days)
 		if err != nil {
 			warnings = append(warnings, fmt.Sprintf("tokens_by_day unavailable: %v", err))

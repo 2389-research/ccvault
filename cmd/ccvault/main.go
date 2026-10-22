@@ -546,6 +546,16 @@ func printTimestampLayoutSection(r db.TimestampLayoutReport) {
 // section uses for reclaimable space. Said out loud, it is a repairable fault
 // with an instruction attached; reconciled, it is an archive that is silently
 // short.
+//
+// The drift is broken down by cause, and that is #121. It used to be one
+// figure with one instruction — "recover the missing turns with
+// `ccvault sync --full`" — and on the author's archive that instruction could
+// not be satisfied: of 8,716 drifted turns, 8,694 belong to transcripts that
+// are no longer on disk and the other 22 are lines no re-parse can store. So
+// the line appeared on every run, could never be cleared, and stopped being
+// read — including for the day it would have reported something real. Naming
+// the causes turns a permanent nag into an accounting a user reads once, and
+// keeps the instruction for the sessions a sync can actually repair.
 func printTurnCountSection(d db.TurnDrift) {
 	if !d.Drifted() {
 		return
@@ -553,13 +563,73 @@ func printTurnCountSection(d db.TurnDrift) {
 	fmt.Println("Turn counts:")
 	fmt.Printf("  %d session(s) claim turns the archive does not hold (%d claimed, %d present).\n",
 		d.Sessions, d.Counted, d.Rows)
-	// --full, not --rebuild: --full re-reads every transcript and restores
-	// whatever the sources still hold, where --rebuild would also discard every
-	// session whose file is gone. Migration 012 already forgot the mtimes of
-	// the affected files, so an ordinary `ccvault sync` repairs them too — this
-	// names --full because it also reconciles what no source can supply.
-	fmt.Println("  Recover the missing turns with 'ccvault sync --full'.")
+
+	for _, c := range d.Causes {
+		switch c.Cause {
+		case db.DriftTranscriptGone:
+			fmt.Printf("  - %d session(s): the transcript is no longer on disk, so these turns\n",
+				c.Sessions)
+			fmt.Printf("    are unrecoverable (%d claimed, %d present).\n", c.Claimed, c.Rows)
+		case db.DriftUnstorable:
+			fmt.Printf("  - %d session(s): the transcript was parsed exactly as it now stands and\n",
+				c.Sessions)
+			fmt.Printf("    these turns cannot be stored (%d claimed, %d present). A transcript\n",
+				c.Claimed, c.Rows)
+			fmt.Println("    repeating a turn uuid within itself is the known cause (#121): within")
+			fmt.Println("    one session two such lines are the same turn. Re-reading changes nothing.")
+		case db.DriftUnparsed:
+			fmt.Printf("  - %d session(s): the transcript is on disk and has not been re-read since\n",
+				c.Sessions)
+			fmt.Printf("    it changed (%d claimed, %d present). These are recoverable.\n",
+				c.Claimed, c.Rows)
+		case db.DriftUnclassified:
+			fmt.Printf("  - %d session(s): more drift than this report classifies, so the cause of\n",
+				c.Sessions)
+			fmt.Println("    these is unexamined. Treated as recoverable until shown otherwise.")
+		}
+	}
+
+	if d.Actionable() {
+		// --full, not --rebuild: --full re-reads every transcript and restores
+		// whatever the sources still hold, where --rebuild would also discard
+		// every session whose file is gone. Migration 012 already forgot the
+		// mtimes of the affected files, so an ordinary `ccvault sync` repairs
+		// them too — this names --full because it also reconciles what no
+		// source can supply.
+		fmt.Println("  Recover the recoverable turns with 'ccvault sync --full'.")
+	} else {
+		// Said here because the alternative is the line that got ignored:
+		// every turn of this drift is accounted for, so there is nothing to
+		// run and the next run will print the same thing.
+		fmt.Println("  Every drifted turn above is accounted for; nothing will recover them.")
+	}
 	fmt.Println()
+}
+
+// turnCountDriftJSON renders the drift breakdown for `stats --json`, alongside
+// storageJSON, integrityJSON and cacheCoverageJSON.
+//
+// The causes are here as well as in the printed section because `--json` is
+// what an agent reads, and an agent that cannot see that 8,694 of the drifted
+// turns are unrecoverable will keep proposing the sync that cannot recover
+// them. `actionable` is the single field a caller can branch on.
+func turnCountDriftJSON(d db.TurnDrift) map[string]interface{} {
+	causes := make([]map[string]interface{}, 0, len(d.Causes))
+	for _, c := range d.Causes {
+		causes = append(causes, map[string]interface{}{
+			"cause":    c.Cause.String(),
+			"sessions": c.Sessions,
+			"claimed":  c.Claimed,
+			"rows":     c.Rows,
+		})
+	}
+	return map[string]interface{}{
+		"claimed":    d.Counted,
+		"rows":       d.Rows,
+		"sessions":   d.Sessions,
+		"actionable": d.Actionable(),
+		"causes":     causes,
+	}
 }
 
 // printCacheTokenSection names the sessions whose prompt-cache counters were
@@ -1242,11 +1312,7 @@ var statsCmd = &cobra.Command{
 				"cache_tokens":    cacheCoverageJSON(cacheCoverage),
 			}
 			if drift.Drifted() {
-				out["turn_count_drift"] = map[string]interface{}{
-					"claimed":  drift.Counted,
-					"rows":     drift.Rows,
-					"sessions": drift.Sessions,
-				}
+				out["turn_count_drift"] = turnCountDriftJSON(drift)
 			}
 			if !first.IsZero() && !last.IsZero() {
 				out["activity"] = map[string]interface{}{

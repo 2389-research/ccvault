@@ -121,14 +121,18 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_session_ordinal ON turns(session_id,
 -- database file cannot require a connection setting of whatever opens it, and
 -- #93 is the story of what happens when correctness rests on one.
 --
--- tool_uses.turn_id's reference is doubly inert since migration 012: turns.id
--- alone is not a unique key any more, so the clause does not even name one.
--- Correcting it means rebuilding tool_uses for a declaration that enforces
--- nothing; anything that enables enforcement has to do that and point the
--- reference at (session_id, id).
+-- tool_uses.turn_id's reference was doubly inert between migrations 012 and
+-- 016: turns.id alone stopped being a unique key, so the clause did not even
+-- name one. Migration 016 rebuilt the table to point it at turns' real key,
+-- (session_id, id), as the table-level constraint at the bottom of this
+-- definition — both columns, because a call belongs to the turn with its uuid
+-- *in its own session*, and one uuid in two sessions is two turns (#92).
+-- Enforcing it is still a separate decision: PRAGMA foreign_key_check reports
+-- pre-existing violations elsewhere in this schema, and #87's orphaned
+-- tool_uses rows are still here.
 CREATE TABLE IF NOT EXISTS tool_uses (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    turn_id TEXT REFERENCES turns(id) ON DELETE CASCADE,
+    turn_id TEXT,
     session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
     tool_name TEXT NOT NULL,
     file_path TEXT,
@@ -163,7 +167,17 @@ CREATE TABLE IF NOT EXISTS tool_uses (
              THEN 'ccvd' || substr(timestamp, 1, 4) || substr(timestamp, 6, 2) || substr(timestamp, 9, 2)
                   || ' ccvym' || substr(timestamp, 1, 4) || substr(timestamp, 6, 2)
              ELSE 'ccvymx' END
-    ) VIRTUAL
+    ) VIRTUAL,
+    -- turns' real key (#122, migration 016). That key is declared
+    -- (session_id, id); SQLite resolves a reference's parent columns against a
+    -- unique index by set rather than by position, so naming them
+    -- (id, session_id) here matches it. Written in this order to read as "the
+    -- turn, in its session", which is what the pair means.
+    --
+    -- Inert like every other foreign key in this file — see the note above
+    -- tool_uses — but it now names something that exists, so whoever enables
+    -- enforcement is not blocked by a clause SQLite would reject outright.
+    FOREIGN KEY (turn_id, session_id) REFERENCES turns(id, session_id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_tool_uses_session ON tool_uses(session_id);
