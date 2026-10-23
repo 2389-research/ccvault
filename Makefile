@@ -71,11 +71,14 @@ test-precommit:
 	@pkgs=$$(go list ./... | grep -Ev '$(PRECOMMIT_SKIP)') || exit 1; \
 	go test -race -count=1 -timeout 5m $$pkgs
 
-# Profiles every package, because the result is uploaded to Codecov and
-# labelled as this project's coverage. It used to profile ./internal/db/...
-# and ./pkg/parser/... alone -- 2 packages of 22 -- which made the published
-# figure describe something other than what it was named, and meant a change
-# landing in a thinly-tested package moved it by exactly zero.
+# Profiles every package, because the result is labelled as this project's
+# coverage. It used to profile ./internal/db/... and ./pkg/parser/... alone
+# -- 2 packages of 22 -- which made the reported figure describe something
+# other than what it was named, and meant a change landing in a thinly-tested
+# package moved it by exactly zero.
+#
+# The number used to be uploaded to Codecov. That upload never succeeded and
+# nothing read it, so it is gone (#170); the figure is now read in-repo.
 #
 # No -coverpkg: per-package attribution is what "unit test coverage" is
 # normally taken to mean, and crediting each package with the lines its own
