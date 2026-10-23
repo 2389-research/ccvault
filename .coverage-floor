@@ -1,0 +1,32 @@
+# The minimum total statement coverage this repo accepts, as a percentage.
+#
+# scripts/coverage-floor.sh sums covered and total statements straight out of
+# coverage.out and fails if the ratio has fallen under the single bare number
+# below. CI runs that check after `make test-coverage`; `make coverage-check`
+# runs it locally.
+#
+# This number will not match `go tool cover -func`'s total line, which reads
+# about six points higher. That tool drops any block not inside a top-level
+# func declaration, and cmd/ccvault declares its sixteen cobra commands as
+# package-level vars, so ~600 statements of largely untested CLI body are
+# invisible to it. The script explains the measurement in full; the short
+# version is that this figure agrees with `go test`'s own per-package numbers
+# for all 21 packages and `-func`'s does not.
+#
+# This is a floor, not a target. It exists to catch coverage being *lost* --
+# a deleted test, a new package with no tests, an assertion quietly dropped --
+# without demanding anyone chase a percentage. Nothing here asks you to raise
+# it to land a change.
+#
+# To raise it: run `make test-coverage`, read the total, and change the number
+# in a commit of its own. Keeping that diff separate is the point of the file
+# existing rather than the number living in ci.yml -- the floor moving is a
+# decision someone made, and it should be reviewable as one.
+#
+# Do not lower this to make a red build green. A drop means coverage was lost;
+# the number is the symptom. Lower it only when tests were deliberately
+# removed, and say in the commit message which ones and why.
+#
+# Format: comments (#) and blank lines are ignored. Exactly one other line,
+# holding a bare decimal number. Two numbers is an error, not a guess.
+72.4
