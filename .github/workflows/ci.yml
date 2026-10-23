@@ -134,13 +134,35 @@ jobs:
       # while publishing nothing. Nothing consumed the figure either: no
       # badge, no codecov.yml, no gate. Removed rather than given a token
       # (#170) -- a metric nobody reads is cheaper to delete than to maintain.
-      #
-      # The profile is still written to coverage.out on every run, so it is
-      # there to read in the job log and for anything later that wants to
-      # gate on it.
+      # The step below is what reads the number now, in-repo, with no
+      # credential and no third party.
       - name: Run tests with coverage
         if: matrix.go-version != 'stable'
         run: make test-coverage
+
+      # The ratchet. The step above computes the number; this is what makes a
+      # drop in it fail the build rather than scroll past in a log nobody
+      # opens -- which is what the Codecov upload would have been doing even
+      # on the runs where it worked.
+      #
+      # Deliberately a separate step from the one that measures, so a red X
+      # distinguishes "the test suite broke" from "the suite passed and
+      # coverage fell". Those want different fixes, and one combined step
+      # would hide which happened.
+      #
+      # Not calling `make coverage-check`: that target re-runs the profiling
+      # pass, and the step above has already paid for it.
+      #
+      # Here rather than in .pre-commit-config.yaml. The profiling pass costs
+      # ~23s on top of the commit hook's existing ~35s `make test-precommit`,
+      # and a minute-long commit gate is one people start reaching for
+      # `--no-verify` against. That is the shape #160 came from: a gate weak
+      # enough to be ignored is worse than one that cannot be, because it
+      # still reads as protection. Anyone who wants the check before pushing
+      # has `make coverage-check`.
+      - name: Check coverage against the floor
+        if: matrix.go-version != 'stable'
+        run: ./scripts/coverage-floor.sh coverage.out
 
   lint:
     name: Lint

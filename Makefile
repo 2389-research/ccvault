@@ -1,7 +1,7 @@
 # ABOUTME: Build and development targets for ccvault
 # ABOUTME: Provides build, test, and release automation
 
-.PHONY: build test test-race test-short test-precommit test-coverage clean install lint release
+.PHONY: build test test-race test-short test-precommit test-coverage coverage-check clean install lint release
 
 # Packages excluded from the commit-time gate, as an extended-regexp anchored
 # at a path segment. Measured on a warm build cache with -race: internal/mcp
@@ -87,6 +87,13 @@ test-precommit:
 # it touches, which is the opposite of the point.
 test-coverage:
 	go test ./... -coverprofile=coverage.out -covermode=atomic
+
+# The ratchet: measure, then compare against .coverage-floor. CI runs these as
+# two steps rather than one so a red build says which half broke -- "the suite
+# failed" and "the suite passed and coverage fell" want different fixes. This
+# target is the local convenience that runs both.
+coverage-check: test-coverage
+	./scripts/coverage-floor.sh coverage.out
 
 lint:
 	golangci-lint run
