@@ -85,7 +85,15 @@ test-precommit:
 # tests exercise is the measure that responds when a change lands somewhere
 # untested. -coverpkg=./... would let the integration suite inflate everything
 # it touches, which is the opposite of the point.
+# coverage.out is removed first, not just overwritten. Measured: running this
+# target twice without deleting it leaves each block in the file three times
+# over two runs, because the profile is appended to rather than truncated. The
+# ratio survives identical duplicates, so the percentage looked right -- but a
+# profile holding two runs is one that could hold two different commits, and
+# averaging those is not a measurement. The script rejects duplicate blocks
+# too; this is the half that stops them being produced.
 test-coverage:
+	rm -f coverage.out
 	go test ./... -coverprofile=coverage.out -covermode=atomic
 
 # The ratchet: measure, then compare against .coverage-floor. CI runs these as

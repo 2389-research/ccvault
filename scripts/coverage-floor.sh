@@ -73,9 +73,19 @@ read_total=$(awk '
 	$1 !~ /^.+:[0-9]+\.[0-9]+,[0-9]+\.[0-9]+$/ ||
 	$2 !~ /^[0-9]+$/ ||
 	$3 !~ /^[0-9]+$/ { bad++; next }
+	# A block position must appear exactly once. `go test -coverprofile`
+	# appends to an existing profile rather than truncating it, so running the
+	# target twice without deleting the file leaves every block in there
+	# repeatedly. Identical duplicates happen to preserve the ratio, which is
+	# precisely why this is rejected rather than tolerated: the same shape
+	# could be two runs of *different* code, and averaging those measures
+	# neither. `make test-coverage` deletes the file first; this is the
+	# backstop for a profile produced some other way.
+	seen[$1]++ { dup++; next }
 	{ total += $2; if ($3 > 0) covered += $2 }
 	END {
 		if (bad > 0)     { print "BAD " bad; exit }
+		if (dup > 0)     { print "DUP " dup; exit }
 		if (total == 0)  { print "EMPTY"; exit }
 		printf "%.1f %d %d\n", 100 * covered / total, covered, total
 	}
@@ -83,6 +93,7 @@ read_total=$(awk '
 
 case "$read_total" in
 BAD\ *) die "$profile has $(printf '%s' "$read_total" | cut -d' ' -f2) line(s) that are not coverage blocks" ;;
+DUP\ *) die "$profile repeats $(printf '%s' "$read_total" | cut -d' ' -f2) block(s); it holds more than one run. Delete it and re-run \`make test-coverage\`." ;;
 EMPTY) die "$profile contains no coverage blocks" ;;
 esac
 
