@@ -20,6 +20,7 @@ import (
 	_ "github.com/2389-research/ccvault/pkg/adapter/hex"
 	_ "github.com/2389-research/ccvault/pkg/adapter/jeff"
 	_ "github.com/2389-research/ccvault/pkg/adapter/nanoclaw"
+	_ "github.com/2389-research/ccvault/pkg/adapter/pi"
 
 	"golang.org/x/term"
 

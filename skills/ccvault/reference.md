@@ -158,11 +158,15 @@ printed nothing leaves no text to read a failure out of, and a failing
 `is_error` is stored rather than inferred.
 
 **Which sources it covers.** claude-code and nanoclaw write an `is_error` flag
-on their `tool_result` blocks, and those are the rows that carry a `0` or a
-`1`. codex (`function_call_output`) and jeff (`tool_result`) record the output
-and nothing about whether it failed, so their rows stay `NULL` — "no flag
-recorded" rather than a `0` asserting a success the transcript never claimed.
-hex records no tool calls at all.
+on their `tool_result` blocks, and pi writes one on every `toolResult` message;
+those are the rows that carry a `0` or a `1`. codex (`function_call_output`)
+and jeff (`tool_result`) record the output and nothing about whether it failed,
+so their rows stay `NULL` — "no flag recorded" rather than a `0` asserting a
+success the transcript never claimed. hex records no tool calls at all.
+
+A pi call that nothing answered — the session was interrupted while the tool
+was still running — stays `NULL` too, for the same reason: pi flags results,
+not calls, so an unanswered call has had nothing said about it.
 
 **What the backfill could not reach.** Migration 013 reads `turns.raw_json`,
 and 216,978 turns hold `raw_json` that does not parse (#101) — 1,808 of them
