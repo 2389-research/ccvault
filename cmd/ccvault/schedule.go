@@ -10,8 +10,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/2389-research/ccvault/internal/config"
 	"github.com/2389-research/ccvault/internal/schedule"
 	"github.com/spf13/cobra"
 )
@@ -499,4 +501,161 @@ func scheduleStatusJSON(r schedule.Report) map[string]interface{} {
 	}
 	out["archive"] = archive
 	return out
+}
+
+// scheduleOfferInputs is everything the decision to ask depends on.
+//
+// A struct, and the decision a pure function over it, because the rule has
+// five clauses and four of them are "do not ask" — the kind of logic that is
+// easy to get subtly wrong and impossible to test through a prompt.
+type scheduleOfferInputs struct {
+	// Supported is whether this platform has a mechanism at all.
+	Supported bool
+
+	// DataDirGiven is whether --data-dir was passed on this invocation.
+	DataDirGiven bool
+
+	// StdinTTY is whether a prompt could be answered.
+	StdinTTY bool
+
+	// Declined is schedule.declined from the config file.
+	Declined bool
+
+	// AlreadyRegistered is whether a unit is already there.
+	AlreadyRegistered bool
+}
+
+// shouldOfferSchedule decides whether quickstart offers to install the
+// schedule, and says why not when it does not.
+//
+// Each refusal is from #171, and the third is the one that matters most here:
+//
+//   - Unsupported platform: there is nothing to offer.
+//   - Already registered: nothing to do.
+//   - --data-dir: agents drive ccvault against throwaway archives dozens of
+//     times in a single session of this repo's own development. Offering per
+//     run would accumulate units pointing at deleted temp directories, each
+//     hourly-retrying a sync against nothing, and it would stay invisible
+//     until there were forty of them.
+//   - Not a TTY: ccvault is mostly consumed by agents and the MCP server, and
+//     a blocking prompt would hang them. Same helper #36 uses so `--full`
+//     refuses to run unattended.
+//   - Declined before: asking again would make "no" mean "not this time",
+//     which is not what was said.
+//
+// The reason is returned rather than discarded so quickstart can say what it
+// skipped and why. A step that silently does not happen is one nobody can
+// debug.
+func shouldOfferSchedule(in scheduleOfferInputs) (bool, string) {
+	switch {
+	case !in.Supported:
+		return false, fmt.Sprintf("ccvault cannot schedule a background sync on %s yet.", schedule.Platform())
+	case in.AlreadyRegistered:
+		return false, "A scheduled sync is already registered. `ccvault schedule status` reports on it."
+	case in.DataDirGiven:
+		return false, "Skipping the scheduled-sync offer: --data-dir names a throwaway archive, and a unit pointing at one would outlive it."
+	case !in.StdinTTY:
+		return false, "Skipping the scheduled-sync offer: stdin is not a terminal. Run `ccvault schedule install` to set it up."
+	case in.Declined:
+		return false, "Scheduled sync was declined earlier (declined = true under [schedule]). Delete that line to be asked again."
+	default:
+		return true, ""
+	}
+}
+
+// offerScheduleInstall is quickstart's offer, defaulting to yes.
+//
+// Never registers silently: installing an OS-level background job without
+// asking is doing something the user did not request. Declining is written to
+// the config file so the offer is not repeated — and written somewhere the
+// user can find and delete, rather than into hidden state.
+//
+// A failure to install, or to remember a decline, is reported and not
+// returned: quickstart's job is to get someone started, and neither is worth
+// failing that over.
+func offerScheduleInstall(cmd *cobra.Command, cfg *config.Config) {
+	dataDirGiven, _ := cmd.Flags().GetString("data-dir")
+
+	in := scheduleOfferInputs{
+		Supported:    schedule.Supported(),
+		DataDirGiven: dataDirGiven != "",
+		StdinTTY:     isStdinTTY(),
+		Declined:     cfg.Schedule.Declined,
+	}
+	// Only asked on a platform that has an answer, and only when the cheap
+	// refusals have not already settled it — Inspect shells out.
+	if in.Supported && !in.DataDirGiven && in.StdinTTY && !in.Declined {
+		if manager, err := schedule.New(); err == nil {
+			if reg, inspectErr := manager.Inspect(schedule.DefaultLabel); inspectErr == nil {
+				in.AlreadyRegistered = reg.Found
+			}
+		}
+	}
+
+	ask, reason := shouldOfferSchedule(in)
+	if !ask {
+		if reason != "" {
+			fmt.Println(reason)
+			fmt.Println()
+		}
+		return
+	}
+
+	fmt.Println("Keep the archive current automatically?")
+	fmt.Println()
+	fmt.Println("  ccvault only archives what it has seen, and Claude Code keeps transcripts")
+	fmt.Println("  on disk for about 38 days. An hourly background sync means completeness")
+	fmt.Printf("  stops depending on remembering. It is a user-level %s job, needs no\n", schedule.Platform())
+	fmt.Println("  sudo, runs plain `ccvault sync`, and `ccvault schedule uninstall` removes it.")
+	fmt.Println()
+	fmt.Print("Install it? [Y/n] ")
+
+	var answer string
+	// A read error is an empty answer, which is the default: yes. Fscanln
+	// returns an error for a bare newline, which is exactly the Enter press
+	// the default exists for.
+	_, _ = fmt.Fscanln(os.Stdin, &answer)
+	if declinedAnswer(answer) {
+		fmt.Println()
+		fmt.Println("Not installed. Run `ccvault schedule install` whenever you want it.")
+		if err := cfg.RememberScheduleDeclined(); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not record that you declined, so you may be asked again: %v\n", err)
+		}
+		fmt.Println()
+		return
+	}
+
+	binary, err := scheduleBinaryPath()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not work out which ccvault to schedule: %v\n", err)
+		return
+	}
+	job := schedule.NewJob(binary, filepath.Join(cfg.DataDir, ScheduleLogName))
+	manager, err := schedule.New()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: %v\n", err)
+		return
+	}
+	if err := manager.Install(job); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not install the scheduled sync: %v\n", err)
+		fmt.Fprintln(os.Stderr, "Run `ccvault schedule install` to see the full error.")
+		return
+	}
+
+	fmt.Println()
+	fmt.Printf("Installed. %s will run `ccvault sync` every %s, starting in about %s.\n",
+		manager.Platform(), job.Interval, job.Interval)
+	fmt.Println("Check on it any time with `ccvault schedule status`.")
+	fmt.Println()
+}
+
+// declinedAnswer reads a [Y/n] answer. Anything that is not a clear no is
+// yes, because the prompt said the default was yes.
+func declinedAnswer(answer string) bool {
+	switch strings.ToLower(strings.TrimSpace(answer)) {
+	case "n", "no":
+		return true
+	default:
+		return false
+	}
 }

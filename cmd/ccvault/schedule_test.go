@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/2389-research/ccvault/internal/config"
 	"github.com/2389-research/ccvault/internal/schedule"
 	"github.com/spf13/cobra"
 )
@@ -349,5 +350,164 @@ func TestJoinArgs(t *testing.T) {
 func TestYesNo(t *testing.T) {
 	if yesNo(true) != "yes" || yesNo(false) != "no" {
 		t.Errorf("yesNo = %q/%q, want yes/no", yesNo(true), yesNo(false))
+	}
+}
+
+// shouldOfferSchedule is five clauses, four of them refusals. Each is from
+// #171 and each gets its own case, because a prompt that appears when it
+// should not is a unit registered that nobody asked for.
+func TestShouldOfferSchedule_AsksOnAPlainInteractiveFirstRun(t *testing.T) {
+	ask, reason := shouldOfferSchedule(scheduleOfferInputs{Supported: true, StdinTTY: true})
+	if !ask {
+		t.Errorf("shouldOfferSchedule() = false (%q) on a supported platform, at a TTY, nothing registered, never declined", reason)
+	}
+	if reason != "" {
+		t.Errorf("reason = %q, want empty when the offer is made", reason)
+	}
+}
+
+// The guard that matters most. Agents drive ccvault against throwaway
+// archives dozens of times a session; offering per run would accumulate units
+// pointing at deleted temp directories.
+func TestShouldOfferSchedule_NeverOnADataDirRun(t *testing.T) {
+	ask, reason := shouldOfferSchedule(scheduleOfferInputs{
+		Supported: true, StdinTTY: true, DataDirGiven: true,
+	})
+	if ask {
+		t.Error("shouldOfferSchedule() = true on a --data-dir run; units would accumulate pointing at deleted temp dirs")
+	}
+	if !strings.Contains(reason, "--data-dir") {
+		t.Errorf("reason = %q, want it to name --data-dir", reason)
+	}
+}
+
+// ccvault is mostly consumed by agents and the MCP server. A blocking prompt
+// would hang them, which is why #36's TTY helper is reused here.
+func TestShouldOfferSchedule_NeverWithoutATTY(t *testing.T) {
+	ask, reason := shouldOfferSchedule(scheduleOfferInputs{Supported: true, StdinTTY: false})
+	if ask {
+		t.Error("shouldOfferSchedule() = true with no TTY; a blocking prompt would hang an agent")
+	}
+	if !strings.Contains(reason, "not a terminal") {
+		t.Errorf("reason = %q, want it to say stdin is not a terminal", reason)
+	}
+	if !strings.Contains(reason, "schedule install") {
+		t.Errorf("reason = %q, want it to name the command that does it by hand", reason)
+	}
+}
+
+// "No" has to mean no. Asking again would make it mean "not this time".
+func TestShouldOfferSchedule_NeverAfterADecline(t *testing.T) {
+	ask, reason := shouldOfferSchedule(scheduleOfferInputs{
+		Supported: true, StdinTTY: true, Declined: true,
+	})
+	if ask {
+		t.Error("shouldOfferSchedule() = true after the offer was declined")
+	}
+	// And it says how to undo it, so the dismissal is reversible rather than
+	// permanent-by-accident.
+	if !strings.Contains(reason, "declined = true") {
+		t.Errorf("reason = %q, want it to name the config line that is suppressing the offer", reason)
+	}
+}
+
+func TestShouldOfferSchedule_NeverWhenAlreadyRegistered(t *testing.T) {
+	ask, reason := shouldOfferSchedule(scheduleOfferInputs{
+		Supported: true, StdinTTY: true, AlreadyRegistered: true,
+	})
+	if ask {
+		t.Error("shouldOfferSchedule() = true with a unit already registered")
+	}
+	if !strings.Contains(reason, "already registered") {
+		t.Errorf("reason = %q, want it to say one is already registered", reason)
+	}
+}
+
+func TestShouldOfferSchedule_NeverOnAnUnsupportedPlatform(t *testing.T) {
+	ask, reason := shouldOfferSchedule(scheduleOfferInputs{Supported: false, StdinTTY: true})
+	if ask {
+		t.Error("shouldOfferSchedule() = true on a platform with no scheduler")
+	}
+	if !strings.Contains(reason, "cannot schedule") {
+		t.Errorf("reason = %q, want it to say the platform is unsupported", reason)
+	}
+}
+
+// --data-dir outranks a TTY: an agent at a terminal pointed at a scratch
+// archive must still not be offered a unit.
+func TestShouldOfferSchedule_DataDirBeatsATTY(t *testing.T) {
+	if ask, _ := shouldOfferSchedule(scheduleOfferInputs{
+		Supported: true, StdinTTY: true, DataDirGiven: true, Declined: false,
+	}); ask {
+		t.Error("a --data-dir run at a TTY was offered the schedule")
+	}
+}
+
+// Enter means yes: the prompt says [Y/n], so anything that is not a clear no
+// has to be taken as yes or the default is a lie.
+func TestDeclinedAnswer(t *testing.T) {
+	declines := []string{"n", "N", "no", "NO", " no ", "No"}
+	for _, in := range declines {
+		if !declinedAnswer(in) {
+			t.Errorf("declinedAnswer(%q) = false, want true", in)
+		}
+	}
+	accepts := []string{"", " ", "y", "Y", "yes", "\n", "sure"}
+	for _, in := range accepts {
+		if declinedAnswer(in) {
+			t.Errorf("declinedAnswer(%q) = true, want false — the prompt says the default is yes", in)
+		}
+	}
+}
+
+// Under --data-dir the offer must print its reason and register nothing. This
+// drives the real function, not just the decision, because the bug worth
+// preventing is offerScheduleInstall reaching schedule.Install at all.
+func TestOfferScheduleInstall_DataDirRunRegistersNothing(t *testing.T) {
+	dir := t.TempDir()
+	cmd := newScheduleFlagSet(t)
+	if err := cmd.Flags().Set("data-dir", dir); err != nil {
+		t.Fatalf("set --data-dir: %v", err)
+	}
+	cfg := &config.Config{DataDir: dir}
+
+	out := captureStdout(t, func() { offerScheduleInstall(cmd, cfg) })
+
+	if !strings.Contains(out, "--data-dir") {
+		t.Errorf("output does not explain the skip:\n%s", out)
+	}
+	if strings.Contains(out, "Install it?") {
+		t.Errorf("a --data-dir run was prompted:\n%s", out)
+	}
+	// Nothing was written where a unit file would go, and no config file was
+	// created to remember a decline that was never offered.
+	if entries, err := os.ReadDir(dir); err == nil && len(entries) != 0 {
+		names := make([]string, len(entries))
+		for i, e := range entries {
+			names[i] = e.Name()
+		}
+		t.Errorf("the offer wrote %v into the data dir", names)
+	}
+}
+
+// Declining has to be remembered, in a file the user can read and delete.
+func TestRememberScheduleDeclined_SurvivesAReload(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{DataDir: dir}
+	if err := cfg.RememberScheduleDeclined(); err != nil {
+		t.Fatalf("RememberScheduleDeclined: %v", err)
+	}
+
+	reloaded, err := config.LoadWith(config.Options{DataDir: dir})
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if !reloaded.Schedule.Declined {
+		t.Error("the decline did not survive a reload; quickstart would ask again every run")
+	}
+	if ask, _ := shouldOfferSchedule(scheduleOfferInputs{
+		Supported: true, StdinTTY: true, Declined: reloaded.Schedule.Declined,
+	}); ask {
+		t.Error("the reloaded decline did not suppress the offer")
 	}
 }

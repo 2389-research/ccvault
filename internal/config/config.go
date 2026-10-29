@@ -39,6 +39,17 @@ type Config struct {
 	ClaudeHome string         `mapstructure:"claude_home"`
 	DataDir    string         `mapstructure:"data_dir"`
 	Sources    []SourceConfig `mapstructure:"sources"`
+	Schedule   ScheduleConfig `mapstructure:"schedule"`
+
+	// ConfigFile is the file this Config was read from, or "" when no file
+	// was found. Never read from a config file — it is a fact about how this
+	// Config was resolved, like SourceConfig.Implied.
+	//
+	// Recorded because a setting that has to be written back has to go to the
+	// file that was read, not to a guess at the default path. A run pointed at
+	// a throwaway archive writes its own config file there and leaves the
+	// real one alone.
+	ConfigFile string `mapstructure:"-"`
 }
 
 // DefaultClaudeHome returns the default Claude Code data directory
@@ -132,6 +143,10 @@ func LoadWith(opts Options) (*Config, error) {
 	// Set defaults
 	v.SetDefault("claude_home", DefaultClaudeHome())
 	v.SetDefault("data_dir", DefaultDataDir())
+	// On by default: the notice is silent unless something is actually wrong,
+	// and someone who has never run `ccvault schedule` is exactly who it is
+	// for. notify = false turns it off.
+	v.SetDefault(ScheduleNotifyKey, true)
 
 	// Environment variables
 	v.SetEnvPrefix("CCVAULT")
@@ -185,6 +200,7 @@ func LoadWith(opts Options) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	cfg.ConfigFile = v.ConfigFileUsed()
 
 	// Done after defaults so it overwrites a synthesized source as well as a
 	// declared one.

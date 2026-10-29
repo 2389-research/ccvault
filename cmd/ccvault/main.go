@@ -250,6 +250,13 @@ var quickstartCmd = &cobra.Command{
 			fmt.Println()
 		}
 
+		// Offered here rather than anywhere else because quickstart is the
+		// one command that already has permission to ask questions, and
+		// because someone running it is deciding how ccvault should work for
+		// them. Defaults to yes; every reason it might not ask at all is in
+		// shouldOfferSchedule.
+		offerScheduleInstall(cmd, cfg)
+
 		// Show next steps
 		fmt.Println("What would you like to do?")
 		fmt.Println()
@@ -258,6 +265,7 @@ var quickstartCmd = &cobra.Command{
 		fmt.Println("  ccvault stats            View detailed statistics")
 		fmt.Println("  ccvault sync             Update with latest conversations")
 		fmt.Println("  ccvault mcp              Start MCP server for AI integration")
+		fmt.Println("  ccvault schedule status  Check the hourly background sync")
 		fmt.Println()
 		fmt.Println("Run 'ccvault --help' for all available commands.")
 
