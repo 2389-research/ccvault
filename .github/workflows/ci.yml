@@ -112,79 +112,57 @@ jobs:
       - name: Run tests
         run: make test-race
 
-      # Coverage comes from the floor job: one upload, from the version the
-      # project supports rather than whatever `stable` happens to be.
+      # Coverage runs on the floor version only, selected by excluding
+      # `stable` rather than by naming the floor, so raising go.mod's Go
+      # version cannot silently switch coverage off here by leaving a stale
+      # literal behind. A third pinned entry in the matrix would give two
+      # measurements of the same thing, which is loud; a stale literal gives
+      # none, which is not.
       #
-      # Selected by excluding `stable` rather than by naming the floor, so
-      # raising go.mod's Go version cannot silently switch coverage off here by
-      # leaving a stale literal behind. A third pinned entry in the matrix
-      # would give two uploads, which is loud; a stale literal gives none,
-      # which is not.
+      # This profiles every package rather than two of them, so it is a second
+      # full pass over the suite after `make test-race` above and the job is
+      # correspondingly longer. Worth it: the number is labelled as the
+      # project's, and a second run without -race is what makes that label
+      # true. Not folded into the -race run, because -covermode=atomic there
+      # would measure a differently-instrumented binary and slow the pass
+      # everyone reads for pass/fail.
       #
-      # This profiles every package now rather than two of them, so it is a
-      # second full pass over the suite after `make test-race` above and the
-      # job is correspondingly longer. Worth it: the number this uploads is
-      # labelled as the project's, and a second run without -race is what
-      # makes that label true. Not folded into the -race run, because
-      # -covermode=atomic there would measure a differently-instrumented
-      # binary and slow the pass everyone reads for pass/fail.
+      # There used to be a `codecov/codecov-action` upload after this step. It
+      # never once succeeded -- every run was rejected with
+      # `{"message":"Token required because branch is protected"}`, and
+      # `fail_ci_if_error: false` swallowed that so the step reported green
+      # while publishing nothing. Nothing consumed the figure either: no
+      # badge, no codecov.yml, no gate. Removed rather than given a token
+      # (#170) -- a metric nobody reads is cheaper to delete than to maintain.
+      # The step below is what reads the number now, in-repo, with no
+      # credential and no third party.
       - name: Run tests with coverage
         if: matrix.go-version != 'stable'
         run: make test-coverage
 
-      # v7 is the Node 24 major, and getting here from v4 crosses a rewrite,
-      # so this is not the drop-in the other action bumps were. v5 replaced the
-      # action's own uploader with a wrapper around the Codecov CLI, and
-      # renamed inputs in the process: `file` became `files`, and `file` is
-      # simply absent from v7's action.yml.
+      # The ratchet. The step above computes the number; this is what makes a
+      # drop in it fail the build rather than scroll past in a log nobody
+      # opens -- which is what the Codecov upload would have been doing even
+      # on the runs where it worked.
       #
-      # That rename is the whole risk, because GitHub only *warns* about an
-      # input an action does not declare. Left as `file`, this step would keep
-      # passing, keep saying it uploaded, and never be told which file to
-      # upload -- the CLI would fall back to searching the tree, so the
-      # outcome would depend on what it happened to find rather than on what
-      # `make test-coverage` just wrote. A silent change of meaning is worse
-      # here than a failure would be.
+      # Deliberately a separate step from the one that measures, so a red X
+      # distinguishes "the test suite broke" from "the suite passed and
+      # coverage fell". Those want different fixes, and one combined step
+      # would hide which happened.
       #
-      # v6 is Node 24 by default; v7 only changes which account holds
-      # Codecov's GPG signing key.
+      # Not calling `make coverage-check`: that target re-runs the profiling
+      # pass, and the step above has already paid for it.
       #
-      # No token is set, and this comment used to claim none was needed
-      # because the repo is public. That is false, measured. The upload is
-      # rejected every run, and has been since before the flag below changed:
-      #
-      #   info  -- Found 1 coverage files to report
-      #   info  -- > /home/runner/work/ccvault/ccvault/coverage.out
-      #   info  -- Upload queued for processing complete
-      #   error -- Upload queued for processing failed:
-      #            {"message":"Token required because branch is protected"}
-      #
-      # `fail_ci_if_error: false` is why nobody noticed -- it is there so a
-      # Codecov outage cannot redden a PR that has nothing wrong with it, and
-      # it swallows this too, so the step goes green while publishing nothing.
-      # Note the ordering: "complete" is printed before the error, so reading
-      # only the happy line tells you the opposite of what happened.
-      #
-      # Fixing it needs a CODECOV_TOKEN repository secret, which is a
-      # credential decision and not this PR's to make. Left failing and
-      # documented rather than silently papered over; the point of #151 is
-      # that the profile is now honest, and the number is not published at
-      # all until that token exists.
-      #
-      # `flags: project`, not the `unittests` it said before. That label was
-      # inherited from a `make test-coverage` that profiled two packages of
-      # 22, so the figure under it described neither the project nor its unit
-      # tests. The target now profiles everything, integration suite included,
-      # and this is the only upload, so `project` is what the number is. The
-      # old flag's history is left where it is: it measured a different thing
-      # and merging the two series would hide the step.
-      - name: Upload coverage to Codecov
+      # Here rather than in .pre-commit-config.yaml. The profiling pass costs
+      # ~23s on top of the commit hook's existing ~35s `make test-precommit`,
+      # and a minute-long commit gate is one people start reaching for
+      # `--no-verify` against. That is the shape #160 came from: a gate weak
+      # enough to be ignored is worse than one that cannot be, because it
+      # still reads as protection. Anyone who wants the check before pushing
+      # has `make coverage-check`.
+      - name: Check coverage against the floor
         if: matrix.go-version != 'stable'
-        uses: codecov/codecov-action@v7
-        with:
-          files: ./coverage.out
-          flags: project
-          fail_ci_if_error: false
+        run: ./scripts/coverage-floor.sh coverage.out
 
   lint:
     name: Lint

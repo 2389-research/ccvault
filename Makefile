@@ -1,7 +1,7 @@
 # ABOUTME: Build and development targets for ccvault
 # ABOUTME: Provides build, test, and release automation
 
-.PHONY: build test test-race test-short test-precommit test-coverage clean install lint release
+.PHONY: build test test-race test-short test-precommit test-coverage coverage-check clean install lint release
 
 # Packages excluded from the commit-time gate, as an extended-regexp anchored
 # at a path segment. Measured on a warm build cache with -race: internal/mcp
@@ -71,19 +71,37 @@ test-precommit:
 	@pkgs=$$(go list ./... | grep -Ev '$(PRECOMMIT_SKIP)') || exit 1; \
 	go test -race -count=1 -timeout 5m $$pkgs
 
-# Profiles every package, because the result is uploaded to Codecov and
-# labelled as this project's coverage. It used to profile ./internal/db/...
-# and ./pkg/parser/... alone -- 2 packages of 22 -- which made the published
-# figure describe something other than what it was named, and meant a change
-# landing in a thinly-tested package moved it by exactly zero.
+# Profiles every package, because the result is labelled as this project's
+# coverage. It used to profile ./internal/db/... and ./pkg/parser/... alone
+# -- 2 packages of 22 -- which made the reported figure describe something
+# other than what it was named, and meant a change landing in a thinly-tested
+# package moved it by exactly zero.
+#
+# The number used to be uploaded to Codecov. That upload never succeeded and
+# nothing read it, so it is gone (#170); the figure is now read in-repo.
 #
 # No -coverpkg: per-package attribution is what "unit test coverage" is
 # normally taken to mean, and crediting each package with the lines its own
 # tests exercise is the measure that responds when a change lands somewhere
 # untested. -coverpkg=./... would let the integration suite inflate everything
 # it touches, which is the opposite of the point.
+# coverage.out is removed first, not just overwritten. Measured: running this
+# target twice without deleting it leaves each block in the file three times
+# over two runs, because the profile is appended to rather than truncated. The
+# ratio survives identical duplicates, so the percentage looked right -- but a
+# profile holding two runs is one that could hold two different commits, and
+# averaging those is not a measurement. The script rejects duplicate blocks
+# too; this is the half that stops them being produced.
 test-coverage:
+	rm -f coverage.out
 	go test ./... -coverprofile=coverage.out -covermode=atomic
+
+# The ratchet: measure, then compare against .coverage-floor. CI runs these as
+# two steps rather than one so a red build says which half broke -- "the suite
+# failed" and "the suite passed and coverage fell" want different fixes. This
+# target is the local convenience that runs both.
+coverage-check: test-coverage
+	./scripts/coverage-floor.sh coverage.out
 
 lint:
 	golangci-lint run
