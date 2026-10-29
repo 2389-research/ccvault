@@ -427,6 +427,36 @@ registered command, so the unit syncs the archive you were looking at rather
 than a different one. A default install registers plain `ccvault sync` and
 nothing more.
 
+### The staleness notice in `stats`
+
+`ccvault stats` prints a short notice when the scheduled sync is not working
+or the archive has fallen more than a day behind, and says nothing at all
+otherwise:
+
+```
+Scheduled sync:
+  - no launchd job is registered under "ai.2389.ccvault.sync"; run `ccvault schedule install`
+  - the archive last advanced 30 days ago (2026-09-29 15:34); anything Claude Code has pruned since is gone
+  Run `ccvault schedule status` for detail, or set notify = false under [schedule] in your
+  config file to stop this notice.
+```
+
+Turn it off with a line in the config file, so the dismissal is something you
+can find again:
+
+```toml
+[schedule]
+notify = false
+```
+
+It is also silent on any `--data-dir` run. A throwaway archive is stale by
+construction and carries no schedule, so the notice would fire on every
+fixture run — and a warning that is always wrong teaches people to stop
+reading warnings.
+
+`stats --json` carries the same verdict under a `schedule` key, as problem
+codes, and omits the key entirely on a clean run.
+
 ### The log
 
 Under launchd the job appends stdout and stderr to `<data_dir>/schedule.log`,

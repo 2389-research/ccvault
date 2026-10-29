@@ -1306,6 +1306,15 @@ var statsCmd = &cobra.Command{
 			return fmt.Errorf("measure cache token coverage: %w", err)
 		}
 
+		// The archive's own answer to "when did a sync last write anything",
+		// which is what the scheduled-sync notice is judged against. A read
+		// failure leaves the zero time, which reads as "never synced" — the
+		// conservative direction, and not worth failing the report over.
+		lastSynced, err := database.LastSyncedAt()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not read the last sync time: %v\n", err)
+		}
+
 		if jsonOutput {
 			out := map[string]interface{}{
 				"projects":        projectCount,
@@ -1322,6 +1331,10 @@ var statsCmd = &cobra.Command{
 			}
 			if drift.Drifted() {
 				out["turn_count_drift"] = turnCountDriftJSON(drift)
+			}
+			// Absent on a clean run, exactly as the printed notice is silent.
+			if problems := scheduleNoticeJSON(cmd, cfg, lastSynced); len(problems) > 0 {
+				out["schedule"] = problems
 			}
 			if !first.IsZero() && !last.IsZero() {
 				out["activity"] = map[string]interface{}{
@@ -1385,6 +1398,14 @@ var statsCmd = &cobra.Command{
 			for tool, count := range toolStats {
 				fmt.Printf("  %-20s %d uses\n", tool, count)
 			}
+		}
+
+		// Last, because it is the call to action rather than a statistic --
+		// and silent whenever there is nothing to act on. #171's backstop for
+		// anyone who never runs quickstart.
+		if notice := scheduleNotice(cmd, cfg, lastSynced); notice != "" {
+			fmt.Println()
+			fmt.Print(notice)
 		}
 
 		// Also print _ tokens from project stats if different (shouldn't be, but just in case)

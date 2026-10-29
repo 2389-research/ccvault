@@ -659,3 +659,90 @@ func declinedAnswer(answer string) bool {
 		return false
 	}
 }
+
+// scheduleNotice is the staleness warning `ccvault stats` prints, or "" when
+// there is nothing worth saying.
+//
+// Silent when clean is the whole contract — the same shape as #106's
+// `--strict` hint and #155's `repair-tokens` hint: say nothing when the
+// archive is fine, and name the command that fixes it when it is not. A
+// notice on every run is one that gets trained away inside a week.
+//
+// Two things suppress it:
+//
+//   - notify = false under [schedule], which is a line in the config file
+//     rather than hidden state, so a dismissal is inspectable.
+//   - a --data-dir run. A throwaway archive is stale by construction and
+//     carries no schedule, so the notice would fire on every one of the
+//     dozens of fixture runs an agent makes in a session. Nagging that is
+//     always wrong teaches people to stop reading.
+//
+// lastSynced is passed in rather than re-read: stats already has the archive
+// open, and opening it twice to print one line would be work for nothing.
+func scheduleNotice(cmd *cobra.Command, cfg *config.Config, lastSynced time.Time) string {
+	if !cfg.Schedule.Notify {
+		return ""
+	}
+	if dataDir, _ := cmd.Flags().GetString("data-dir"); dataDir != "" {
+		return ""
+	}
+	return scheduleNoticeReport(cfg, lastSynced).Notice()
+}
+
+// scheduleNoticeReport gathers just enough to judge the schedule for the
+// notice.
+//
+// Split out so the cheap parts stay testable: it does not open the archive,
+// and on a platform with no scheduler it asks the OS nothing.
+func scheduleNoticeReport(cfg *config.Config, lastSynced time.Time) schedule.Report {
+	facts := schedule.Facts{
+		Platform:   schedule.Platform(),
+		Supported:  schedule.Supported(),
+		Label:      schedule.DefaultLabel,
+		LastSynced: lastSynced,
+		LogPath:    filepath.Join(cfg.DataDir, ScheduleLogName),
+		Now:        time.Now(),
+	}
+	if facts.Supported {
+		if manager, err := schedule.New(); err == nil {
+			if reg, inspectErr := manager.Inspect(schedule.DefaultLabel); inspectErr == nil {
+				facts.Registration = reg
+				facts.ProgramResolved = resolveOrEmpty(reg.Program)
+				if reg.LogPath != "" {
+					facts.LogPath = reg.LogPath
+				}
+			}
+			// An Inspect failure leaves the zero Registration, which reads as
+			// "nothing registered" — the message that is useful anyway, and
+			// `schedule status` is where the real error belongs.
+		}
+		if onPath, lookErr := exec.LookPath("ccvault"); lookErr == nil {
+			facts.PathProgram = onPath
+			facts.PathResolved = resolveOrEmpty(onPath)
+		}
+	}
+	return schedule.Assemble(facts)
+}
+
+// scheduleNoticeJSON renders the same verdict for `stats --json`.
+//
+// Problem codes rather than the prose, because a consumer wants to branch on
+// them. Returns nil when there is nothing to say, so the key is absent on a
+// clean run exactly as the printed notice is.
+func scheduleNoticeJSON(cmd *cobra.Command, cfg *config.Config, lastSynced time.Time) []map[string]string {
+	if !cfg.Schedule.Notify {
+		return nil
+	}
+	if dataDir, _ := cmd.Flags().GetString("data-dir"); dataDir != "" {
+		return nil
+	}
+	r := scheduleNoticeReport(cfg, lastSynced)
+	if r.Notice() == "" {
+		return nil
+	}
+	out := make([]map[string]string, 0, len(r.Problems))
+	for _, p := range r.Problems {
+		out = append(out, map[string]string{"code": p.Code, "detail": p.Detail})
+	}
+	return out
+}

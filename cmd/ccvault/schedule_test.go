@@ -511,3 +511,114 @@ func TestRememberScheduleDeclined_SurvivesAReload(t *testing.T) {
 		t.Error("the reloaded decline did not suppress the offer")
 	}
 }
+
+// Silent when clean is the whole contract. A notice on every stats run is
+// one that gets trained away inside a week.
+func TestScheduleNotice_SilentWhenTheArchiveIsFreshAndRegistered(t *testing.T) {
+	r := registeredReport()
+	if got := r.Notice(); got != "" {
+		t.Errorf("Notice() = %q on a sound schedule, want silence", got)
+	}
+}
+
+// notify = false is the dismissal, and it is a line in config.toml so the
+// dismissal is inspectable rather than hidden.
+func TestScheduleNotice_NotifyFalseSilencesIt(t *testing.T) {
+	cmd := newScheduleFlagSet(t)
+	cfg := &config.Config{DataDir: t.TempDir(), Schedule: config.ScheduleConfig{Notify: false}}
+
+	// A never-synced archive: the loudest thing the notice has to say.
+	if got := scheduleNotice(cmd, cfg, time.Time{}); got != "" {
+		t.Errorf("scheduleNotice() = %q with notify = false, want silence", got)
+	}
+	if got := scheduleNoticeJSON(cmd, cfg, time.Time{}); got != nil {
+		t.Errorf("scheduleNoticeJSON() = %v with notify = false, want nil", got)
+	}
+
+	// And with notify on, the same inputs must produce something — otherwise
+	// the test above passes for the wrong reason.
+	cfg.Schedule.Notify = true
+	if got := scheduleNotice(cmd, cfg, time.Time{}); got == "" {
+		t.Error("scheduleNotice() = \"\" with notify = true and a never-synced archive; the notify=false case proves nothing")
+	}
+}
+
+// A throwaway archive is stale by construction and carries no schedule, so
+// the notice would fire on every one of the dozens of fixture runs an agent
+// makes in a session. Nagging that is always wrong teaches people to stop
+// reading.
+func TestScheduleNotice_SilentOnADataDirRun(t *testing.T) {
+	dir := t.TempDir()
+	cmd := newScheduleFlagSet(t)
+	if err := cmd.Flags().Set("data-dir", dir); err != nil {
+		t.Fatalf("set --data-dir: %v", err)
+	}
+	cfg := &config.Config{DataDir: dir, Schedule: config.ScheduleConfig{Notify: true}}
+
+	if got := scheduleNotice(cmd, cfg, time.Time{}); got != "" {
+		t.Errorf("scheduleNotice() = %q on a --data-dir run, want silence", got)
+	}
+	if got := scheduleNoticeJSON(cmd, cfg, time.Time{}); got != nil {
+		t.Errorf("scheduleNoticeJSON() = %v on a --data-dir run, want nil", got)
+	}
+}
+
+// The notice has to name both the problem and the way to turn itself off.
+func TestScheduleNotice_NamesTheProblemAndItsOwnOffSwitch(t *testing.T) {
+	cmd := newScheduleFlagSet(t)
+	cfg := &config.Config{DataDir: t.TempDir(), Schedule: config.ScheduleConfig{Notify: true}}
+
+	got := scheduleNotice(cmd, cfg, time.Now().Add(-30*24*time.Hour))
+
+	for _, want := range []string{"30 days", "schedule status", "notify = false"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("scheduleNotice() = %q, want it to contain %q", got, want)
+		}
+	}
+}
+
+// --json gets codes, not prose, and the key is absent on a clean run exactly
+// as the printed notice is silent.
+func TestScheduleNoticeJSON_CarriesCodes(t *testing.T) {
+	cmd := newScheduleFlagSet(t)
+	cfg := &config.Config{DataDir: t.TempDir(), Schedule: config.ScheduleConfig{Notify: true}}
+
+	problems := scheduleNoticeJSON(cmd, cfg, time.Now().Add(-30*24*time.Hour))
+
+	if len(problems) == 0 {
+		t.Fatal("scheduleNoticeJSON() = nothing for a 30-day-stale archive")
+	}
+	codes := map[string]bool{}
+	for _, p := range problems {
+		codes[p["code"]] = true
+		if p["detail"] == "" {
+			t.Errorf("problem %q carries no detail", p["code"])
+		}
+	}
+	if !codes[schedule.ProblemArchiveStale] {
+		t.Errorf("problems = %v, want %s among them", problems, schedule.ProblemArchiveStale)
+	}
+}
+
+// A fresh archive with no schedule still has something to say -- "nothing is
+// registered" is the notice's whole reason for existing as a backstop for
+// anyone who never runs quickstart. But it must not also claim staleness.
+func TestScheduleNotice_FreshArchiveWithNoScheduleSaysOnlyThat(t *testing.T) {
+	cmd := newScheduleFlagSet(t)
+	cfg := &config.Config{DataDir: t.TempDir(), Schedule: config.ScheduleConfig{Notify: true}}
+
+	got := scheduleNotice(cmd, cfg, time.Now())
+
+	if !schedule.Supported() {
+		if got != "" {
+			t.Errorf("scheduleNotice() = %q on an unsupported platform, want silence", got)
+		}
+		return
+	}
+	if !strings.Contains(got, "schedule install") {
+		t.Errorf("scheduleNotice() = %q, want it to say nothing is registered", got)
+	}
+	if strings.Contains(got, "pruned since is gone") {
+		t.Errorf("scheduleNotice() = %q, want no staleness line for an archive synced just now", got)
+	}
+}
