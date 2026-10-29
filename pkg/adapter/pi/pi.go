@@ -95,37 +95,116 @@ func (a *Adapter) Discover(root string) ([]adapter.SessionFile, error) {
 
 	var files []adapter.SessionFile
 
-	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if info.IsDir() {
-			return nil
-		}
-		if !strings.HasSuffix(path, ".jsonl") {
-			return nil
-		}
+	// A session file can be reachable by more than one path once symlinks are
+	// followed — sessions/current -> sessions/--some-project-- leaves every
+	// file in that project reachable both ways. Keyed on the resolved path, so
+	// whichever route arrives first wins and the rest are the same file again.
+	// Reporting it twice would give one session two source files, and each
+	// sync would rewrite the same rows from whichever path it reached last.
+	seen := make(map[string]bool)
 
+	// collect reports one walked path, naming it reportAs. The two differ only
+	// when the walk is running inside a symlink's target — see below.
+	collect := func(path, reportAs string, info os.FileInfo) {
+		if info.IsDir() || !strings.HasSuffix(path, ".jsonl") {
+			return
+		}
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			resolved = path
+		}
+		if seen[resolved] {
+			return
+		}
 		hdr, err := readSessionHeader(path)
 		if err != nil {
 			// Not a pi session. Declining it here keeps Discover and Parse
 			// agreeing on which files are sessions: a file with no header has
 			// no id for Parse to key a session row on either.
-			return nil
+			return
 		}
-
+		seen[resolved] = true
 		files = append(files, adapter.SessionFile{
-			Path:        path,
+			Path:        reportAs,
 			ProjectPath: hdr.CWD,
 			ModTime:     info.ModTime(),
 		})
+	}
+
+	if err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		collect(path, path, info)
 		return nil
-	})
-	if err != nil {
+	}); err != nil {
 		return nil, fmt.Errorf("walking pi sessions: %w", err)
 	}
 
+	if err := walkSymlinkedProjectDirs(dir, collect); err != nil {
+		return nil, err
+	}
+
 	return files, nil
+}
+
+// walkSymlinkedProjectDirs covers the project directories that are symlinks.
+//
+// pi goes out of its way to support them: its own session listing keeps a
+// child of the sessions directory when it `isDirectory() || isSymbolicLink()`.
+// filepath.Walk deliberately does not follow symlinks, so the walk above finds
+// nothing inside one — and finds it silently, which is the reason this exists.
+// A session missing from the archive is indistinguishable from a session that
+// was never written.
+//
+// Only immediate children are considered, so what gets followed is what the
+// user deliberately placed in pi's sessions directory, not wherever a link
+// deeper in the tree happens to point.
+//
+// Files are reported at their path *through* the link rather than at the
+// link's target, so the archive records a session where the configured root
+// actually holds it and an incremental sync keeps checking it there.
+func walkSymlinkedProjectDirs(dir string, collect func(path, reportAs string, info os.FileInfo)) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("reading pi sessions directory: %w", err)
+	}
+
+	for _, entry := range entries {
+		if entry.Type()&os.ModeSymlink == 0 {
+			continue
+		}
+		link := filepath.Join(dir, entry.Name())
+
+		// Stat follows the link. A dangling one, or one pointing at a file
+		// rather than a directory, is left alone: the walk above already
+		// reported a symlinked *file*, and a broken link is not a session
+		// directory and must not fail the whole source's discovery.
+		if info, err := os.Stat(link); err != nil || !info.IsDir() {
+			continue
+		}
+
+		target, err := filepath.EvalSymlinks(link)
+		if err != nil {
+			continue
+		}
+
+		if err := filepath.Walk(target, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			rel, relErr := filepath.Rel(target, path)
+			if relErr != nil {
+				return relErr
+			}
+			collect(path, filepath.Join(link, rel), info)
+			return nil
+		}); err != nil {
+			return fmt.Errorf("walking pi sessions through %s: %w", link, err)
+		}
+	}
+
+	return nil
 }
 
 // readSessionHeader reads the session header from the start of a pi session

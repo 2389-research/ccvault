@@ -117,6 +117,97 @@ func TestDiscover_FlatRootIsTheSessionsDir(t *testing.T) {
 	}
 }
 
+// TestDiscover_FollowsASymlinkedProjectDirectory covers a layout pi itself
+// supports and goes out of its way to support: its own session listing keeps a
+// child of the sessions directory when it `isDirectory() || isSymbolicLink()`,
+// so a project directory may be a link to somewhere else on disk.
+//
+// filepath.Walk does not descend into symlinked directories, so the obvious
+// implementation finds nothing here — and finds it silently, which is the
+// reason this test exists. Sessions missing from the archive look exactly like
+// sessions that were never there.
+func TestDiscover_FollowsASymlinkedProjectDirectory(t *testing.T) {
+	root := t.TempDir()
+	elsewhere := filepath.Join(t.TempDir(), "elsewhere")
+	writeSession(t, filepath.Join(elsewhere, "s.jsonl"), header("sym1", "/Users/dyl/work/linked"))
+
+	sessions := filepath.Join(root, "agent", "sessions")
+	if err := os.MkdirAll(sessions, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(sessions, "--Users-dyl-work-linked--")
+	if err := os.Symlink(elsewhere, link); err != nil {
+		t.Fatal(err)
+	}
+
+	files, err := New().Discover(root)
+	if err != nil {
+		t.Fatalf("Discover() error: %v", err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("found %d sessions behind a symlinked project directory, want 1", len(files))
+	}
+	// The path is reported through the link, not through its target, so the
+	// archive records the file where the configured root actually holds it.
+	if want := filepath.Join(link, "s.jsonl"); files[0].Path != want {
+		t.Errorf("Path = %q, want %q", files[0].Path, want)
+	}
+	if files[0].ProjectPath != "/Users/dyl/work/linked" {
+		t.Errorf("ProjectPath = %q, want %q", files[0].ProjectPath, "/Users/dyl/work/linked")
+	}
+}
+
+// TestDiscover_ASessionReachableTwoWaysIsFoundOnce covers the convenience link
+// somebody will eventually make — sessions/current -> sessions/--some-project--
+// — which leaves every file in that project reachable both directly and
+// through the link.
+//
+// Reporting it twice would give one session two source files, so each sync
+// would rewrite the same rows from whichever path it reached last and the
+// incremental mtime check would never settle.
+func TestDiscover_ASessionReachableTwoWaysIsFoundOnce(t *testing.T) {
+	root := t.TempDir()
+	sessions := filepath.Join(root, "agent", "sessions")
+	writeSession(t, filepath.Join(sessions, "--Users-dyl-work-alpha--", "s.jsonl"),
+		header("a1", "/Users/dyl/work/alpha"))
+	if err := os.Symlink(filepath.Join(sessions, "--Users-dyl-work-alpha--"),
+		filepath.Join(sessions, "current")); err != nil {
+		t.Fatal(err)
+	}
+
+	files, err := New().Discover(root)
+	if err != nil {
+		t.Fatalf("Discover() error: %v", err)
+	}
+	if len(files) != 1 {
+		paths := make([]string, len(files))
+		for i, f := range files {
+			paths[i] = f.Path
+		}
+		t.Fatalf("Discover() returned %d files, want 1: %v", len(files), paths)
+	}
+}
+
+// TestDiscover_ABrokenSymlinkIsSkipped because a dangling link is not a
+// session directory and must not fail the whole source's discovery.
+func TestDiscover_ABrokenSymlinkIsSkipped(t *testing.T) {
+	root := t.TempDir()
+	sessions := filepath.Join(root, "agent", "sessions")
+	writeSession(t, filepath.Join(sessions, "--Users-dyl-work-alpha--", "s.jsonl"),
+		header("a1", "/Users/dyl/work/alpha"))
+	if err := os.Symlink(filepath.Join(t.TempDir(), "gone"), filepath.Join(sessions, "--dangling--")); err != nil {
+		t.Fatal(err)
+	}
+
+	files, err := New().Discover(root)
+	if err != nil {
+		t.Fatalf("Discover() error: %v", err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("Discover() returned %d files, want 1", len(files))
+	}
+}
+
 func TestDiscover_SkipsNonJSONLFiles(t *testing.T) {
 	root := t.TempDir()
 	sessions := filepath.Join(root, "agent", "sessions", "--Users-dyl-work-alpha--")
