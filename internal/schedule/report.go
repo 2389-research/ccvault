@@ -32,6 +32,11 @@ type Registration struct {
 	// Arguments is the registered argument vector, program included.
 	Arguments []string
 
+	// LogPath is where the OS says the job's output goes, when it says.
+	// Read back rather than assumed, for the same reason Program is: the
+	// registered value is the one that is actually in effect.
+	LogPath string
+
 	// Interval is the period the OS has registered, when it says.
 	Interval time.Duration
 
