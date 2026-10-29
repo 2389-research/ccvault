@@ -17,6 +17,8 @@ func header(id, cwd string) string {
 		`","provider":"anthropic","modelId":"claude-opus-4-5","thinkingLevel":"off"}`
 }
 
+// writeSession writes one JSONL session file, creating its directory, with a
+// trailing newline on every line the way pi appends them.
 func writeSession(t *testing.T, path string, lines ...string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {

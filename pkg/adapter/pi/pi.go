@@ -549,7 +549,14 @@ func (a *Adapter) ParseTranscript(originalPath string, r io.Reader) (*adapter.Pa
 			if line.Type == "usage" {
 				content = usageEntryText(line.Kind, line.Note)
 			}
-			line.Usage.applyTo(&turns[appendTurn(line, raw, ts, "system", content)])
+			// The index is taken in its own statement, not inlined into
+			// &turns[...]: Go leaves the order between reading the `turns`
+			// operand and calling a function in the index expression
+			// unspecified, and appendTurn reassigns `turns`. Read first and the
+			// slice still has its old length while the returned index is one
+			// past it, which is an out-of-range panic mid-sync.
+			idx := appendTurn(line, raw, ts, "system", content)
+			line.Usage.applyTo(&turns[idx])
 
 		case "custom_message":
 			// An extension injecting content the model then saw, unlike a

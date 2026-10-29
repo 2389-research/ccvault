@@ -12,6 +12,9 @@ import (
 	"github.com/2389-research/ccvault/pkg/adapter"
 )
 
+// parseLines writes the given entries to a session file and parses it, which
+// is how every test here exercises the adapter: through Parse, on a real file,
+// rather than against an internal helper.
 func parseLines(t *testing.T, lines ...string) *adapter.ParsedSession {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "s.jsonl")
