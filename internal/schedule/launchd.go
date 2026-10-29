@@ -244,9 +244,21 @@ func parseLaunchctlPrint(out string) Registration {
 				reg.RunsKnown = true
 			}
 		case "last exit code":
-			// "(never exited)" for a job that has not run. Recorded as
-			// unknown rather than as 0, because 0 means success.
-			if n, err := strconv.Atoi(value); err == nil {
+			// Three shapes, observed on macOS 15:
+			//
+			//   last exit code = 0
+			//   last exit code = 78: EX_CONFIG
+			//   last exit code = (never exited)
+			//
+			// The annotated form is the one that matters and the one that was
+			// nearly missed: a bare Atoi on "78: EX_CONFIG" fails, and a
+			// failed run then read as "outcome not reported" — a real failure
+			// rendered as an unanswerable question. Found by firing the job at
+			// a deleted binary rather than by reading the man page.
+			//
+			// "(never exited)" stays unknown rather than becoming 0, because
+			// 0 means the sync succeeded.
+			if n, err := strconv.Atoi(leadingInt(value)); err == nil {
 				reg.LastExitCode = n
 				reg.LastExitKnown = true
 			}
@@ -259,6 +271,15 @@ func parseLaunchctlPrint(out string) Registration {
 		reg.Program = reg.Arguments[0]
 	}
 	return reg
+}
+
+// leadingInt returns the value up to the first ':', so launchd's annotated
+// exit codes ("78: EX_CONFIG") parse as the number they lead with.
+func leadingInt(value string) string {
+	if i := strings.IndexByte(value, ':'); i >= 0 {
+		return strings.TrimSpace(value[:i])
+	}
+	return value
 }
 
 // splitLaunchdField splits "key = value" on the first " = ".

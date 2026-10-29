@@ -30,6 +30,7 @@ import (
 	"github.com/2389-research/ccvault/internal/export"
 	"github.com/2389-research/ccvault/internal/mcp"
 	"github.com/2389-research/ccvault/internal/projectref"
+	"github.com/2389-research/ccvault/internal/schedule"
 	"github.com/2389-research/ccvault/internal/search"
 	"github.com/2389-research/ccvault/internal/sync"
 	"github.com/2389-research/ccvault/internal/tui"
@@ -2471,6 +2472,7 @@ func init() {
 	rootCmd.AddCommand(repairIndexCmd)
 	rootCmd.AddCommand(repairTokensCmd)
 	rootCmd.AddCommand(importCmd)
+	rootCmd.AddCommand(scheduleCmd)
 
 	// Orient flags
 	orientCmd.Flags().Bool("json", false, "Output as JSON for machine parsing")
@@ -2521,6 +2523,19 @@ func init() {
 
 	// Show flags
 	showCmd.Flags().Bool("json", false, "Output as JSON")
+
+	// Schedule flags. --label exists so a second archive can carry a second
+	// unit, and so a test run never touches the registration a real user
+	// depends on. It is the key install is idempotent on, so the same value
+	// has to be given to status and uninstall.
+	scheduleCmd.AddCommand(scheduleInstallCmd)
+	scheduleCmd.AddCommand(scheduleStatusCmd)
+	scheduleCmd.AddCommand(scheduleUninstallCmd)
+	for _, c := range []*cobra.Command{scheduleInstallCmd, scheduleStatusCmd, scheduleUninstallCmd} {
+		c.Flags().String("label", schedule.DefaultLabel,
+			"Name the job is registered under: the launchd label on macOS, the systemd unit stem on Linux. Give the same value to all three subcommands")
+	}
+	scheduleStatusCmd.Flags().Bool("json", false, "Output the four facts as JSON for machine parsing")
 
 	// Export flags
 	exportCmd.Flags().StringP("output", "o", "", "Output file path (default: stdout)")

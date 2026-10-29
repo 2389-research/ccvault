@@ -570,3 +570,40 @@ func (s *sequencedRunner) Run(name string, args ...string) (string, int, error) 
 	s.n++
 	return r.out, r.code, nil
 }
+
+// Observed on macOS 15 by firing a job whose binary had been deleted:
+// launchd annotates the code with its sysexits name. A bare Atoi fails on
+// that, and the failed run then reported as "outcome not reported by
+// launchd" — a real failure rendered as an unanswerable question, which is
+// the exact confusion this command exists to prevent.
+func TestParseLaunchctlPrint_ReadsAnAnnotatedExitCode(t *testing.T) {
+	for value, want := range map[string]int{
+		"78: EX_CONFIG":    78,
+		"1":                1,
+		"127: EX_NOTFOUND": 127,
+		"2: EX_USAGE":      2,
+	} {
+		reg := parseLaunchctlPrint(printOutput("/bin/ccvault", "/tmp/l.log", 1, value))
+		if !reg.LastExitKnown {
+			t.Errorf("last exit code = %q read as unknown; a failed run must not look unanswerable", value)
+			continue
+		}
+		if reg.LastExitCode != want {
+			t.Errorf("last exit code = %q parsed as %d, want %d", value, reg.LastExitCode, want)
+		}
+	}
+}
+
+func TestLeadingInt(t *testing.T) {
+	cases := map[string]string{
+		"78: EX_CONFIG":  "78",
+		"0":              "0",
+		"(never exited)": "(never exited)",
+		"":               "",
+	}
+	for in, want := range cases {
+		if got := leadingInt(in); got != want {
+			t.Errorf("leadingInt(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

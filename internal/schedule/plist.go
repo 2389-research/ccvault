@@ -21,9 +21,10 @@ import (
 // A calendar entry would skip the tick outright.
 //
 // RunAtLoad is deliberately absent. The agent loads at login, and syncing
-// every time the user logs in is work nobody asked for; the first tick comes
-// an interval later. `install` runs one sync itself so the archive is not
-// left waiting for it.
+// every time the user logs in is work nobody asked for, at the moment the
+// machine is busiest. The first tick comes an interval later instead, which
+// `ccvault schedule install` says out loud rather than leaving the user to
+// wonder whether anything happened.
 func RenderLaunchdPlist(j Job) (string, error) {
 	if err := j.Validate(); err != nil {
 		return "", err
