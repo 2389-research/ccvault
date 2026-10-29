@@ -307,10 +307,12 @@ func roundDuration(d time.Duration) string {
 // #155 (`repair-tokens`): say nothing when the archive is fine, and name the
 // command that fixes it when it is not. A notice that printed on every run
 // would be trained away inside a week.
+// There is deliberately no `if r.Healthy() { return "" }` guard at the top.
+// It read well and was unreachable: a healthy report has no problems, so the
+// actionable list below is empty and the check at the end already returns "".
+// Mutation-testing the guard changed no test's verdict, which is the
+// signature of a branch that only looks like it is doing something.
 func (r Report) Notice() string {
-	if r.Healthy() {
-		return ""
-	}
 	// An unsupported platform is not something the user can act on, so it is
 	// not worth a line on every stats run.
 	if _, ok := r.Problem(ProblemUnsupported); ok {
