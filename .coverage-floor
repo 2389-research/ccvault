@@ -29,4 +29,4 @@
 #
 # Format: comments (#) and blank lines are ignored. Exactly one other line,
 # holding a bare decimal number. Two numbers is an error, not a guess.
-72.4
+72.3
