@@ -41,12 +41,19 @@ func toolErrorTestDB(t *testing.T) *db.DB {
 		t.Fatalf("insert turns: %v", err)
 	}
 
+	// input_json repeats what the raw_json blocks above carry, because that is
+	// what a real row holds: every one of the 343,375 tool_uses rows in the
+	// author's archive has it, across all three sources. The view renders the
+	// arguments from the row (#179), so a fixture omitting them would assert
+	// against a call with none.
 	yes, no := true, false
 	if err := database.InsertToolUses([]models.ToolUse{
 		{TurnID: "turn-tui-e", SessionID: "sess-tui-e", ToolName: "Bash", Timestamp: ts,
-			ToolUseID: "toolu_TUI_OK", HasResult: true, ResultContent: "ok", ResultLength: 2, IsError: &no},
+			ToolUseID: "toolu_TUI_OK", InputJSON: `{"command":"go build ./..."}`,
+			HasResult: true, ResultContent: "ok", ResultLength: 2, IsError: &no},
 		{TurnID: "turn-tui-e", SessionID: "sess-tui-e", ToolName: "Edit", Timestamp: ts,
-			ToolUseID: "toolu_TUI_FAIL", HasResult: true,
+			ToolUseID: "toolu_TUI_FAIL", InputJSON: `{"file_path":"/tmp/x.go"}`,
+			HasResult:     true,
 			ResultContent: "String to replace not found in file", ResultLength: 34, IsError: &yes},
 	}); err != nil {
 		t.Fatalf("insert tool uses: %v", err)
