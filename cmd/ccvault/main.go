@@ -30,6 +30,7 @@ import (
 	"github.com/2389-research/ccvault/internal/export"
 	"github.com/2389-research/ccvault/internal/mcp"
 	"github.com/2389-research/ccvault/internal/projectref"
+	"github.com/2389-research/ccvault/internal/schedule"
 	"github.com/2389-research/ccvault/internal/search"
 	"github.com/2389-research/ccvault/internal/sync"
 	"github.com/2389-research/ccvault/internal/tui"
@@ -249,6 +250,13 @@ var quickstartCmd = &cobra.Command{
 			fmt.Println()
 		}
 
+		// Offered here rather than anywhere else because quickstart is the
+		// one command that already has permission to ask questions, and
+		// because someone running it is deciding how ccvault should work for
+		// them. Defaults to yes; every reason it might not ask at all is in
+		// shouldOfferSchedule.
+		offerScheduleInstall(cmd, cfg)
+
 		// Show next steps
 		fmt.Println("What would you like to do?")
 		fmt.Println()
@@ -257,6 +265,7 @@ var quickstartCmd = &cobra.Command{
 		fmt.Println("  ccvault stats            View detailed statistics")
 		fmt.Println("  ccvault sync             Update with latest conversations")
 		fmt.Println("  ccvault mcp              Start MCP server for AI integration")
+		fmt.Println("  ccvault schedule status  Check the hourly background sync")
 		fmt.Println()
 		fmt.Println("Run 'ccvault --help' for all available commands.")
 
@@ -1297,6 +1306,15 @@ var statsCmd = &cobra.Command{
 			return fmt.Errorf("measure cache token coverage: %w", err)
 		}
 
+		// The archive's own answer to "when did a sync last write anything",
+		// which is what the scheduled-sync notice is judged against. A read
+		// failure leaves the zero time, which reads as "never synced" — the
+		// conservative direction, and not worth failing the report over.
+		lastSynced, err := database.LastSyncedAt()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not read the last sync time: %v\n", err)
+		}
+
 		if jsonOutput {
 			out := map[string]interface{}{
 				"projects":        projectCount,
@@ -1313,6 +1331,10 @@ var statsCmd = &cobra.Command{
 			}
 			if drift.Drifted() {
 				out["turn_count_drift"] = turnCountDriftJSON(drift)
+			}
+			// Absent on a clean run, exactly as the printed notice is silent.
+			if problems := scheduleNoticeJSON(cmd, cfg, lastSynced); len(problems) > 0 {
+				out["schedule"] = problems
 			}
 			if !first.IsZero() && !last.IsZero() {
 				out["activity"] = map[string]interface{}{
@@ -1376,6 +1398,14 @@ var statsCmd = &cobra.Command{
 			for tool, count := range toolStats {
 				fmt.Printf("  %-20s %d uses\n", tool, count)
 			}
+		}
+
+		// Last, because it is the call to action rather than a statistic --
+		// and silent whenever there is nothing to act on. #171's backstop for
+		// anyone who never runs quickstart.
+		if notice := scheduleNotice(cmd, cfg, lastSynced); notice != "" {
+			fmt.Println()
+			fmt.Print(notice)
 		}
 
 		// Also print _ tokens from project stats if different (shouldn't be, but just in case)
@@ -2471,6 +2501,7 @@ func init() {
 	rootCmd.AddCommand(repairIndexCmd)
 	rootCmd.AddCommand(repairTokensCmd)
 	rootCmd.AddCommand(importCmd)
+	rootCmd.AddCommand(scheduleCmd)
 
 	// Orient flags
 	orientCmd.Flags().Bool("json", false, "Output as JSON for machine parsing")
@@ -2521,6 +2552,19 @@ func init() {
 
 	// Show flags
 	showCmd.Flags().Bool("json", false, "Output as JSON")
+
+	// Schedule flags. --label exists so a second archive can carry a second
+	// unit, and so a test run never touches the registration a real user
+	// depends on. It is the key install is idempotent on, so the same value
+	// has to be given to status and uninstall.
+	scheduleCmd.AddCommand(scheduleInstallCmd)
+	scheduleCmd.AddCommand(scheduleStatusCmd)
+	scheduleCmd.AddCommand(scheduleUninstallCmd)
+	for _, c := range []*cobra.Command{scheduleInstallCmd, scheduleStatusCmd, scheduleUninstallCmd} {
+		c.Flags().String("label", schedule.DefaultLabel,
+			"Name the job is registered under: the launchd label on macOS, the systemd unit stem on Linux. Give the same value to all three subcommands")
+	}
+	scheduleStatusCmd.Flags().Bool("json", false, "Output the four facts as JSON for machine parsing")
 
 	// Export flags
 	exportCmd.Flags().StringP("output", "o", "", "Output file path (default: stdout)")

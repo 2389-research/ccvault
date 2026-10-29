@@ -731,3 +731,28 @@ func (db *DB) GetTokensByModel() (map[string]int64, error) {
 
 	return result, rows.Err()
 }
+
+// LastSyncedAt returns the newest source_files.synced_at in the archive, or
+// the zero time when nothing has ever been synced.
+//
+// This is the archive's own answer to "when did a sync last write anything",
+// and it is deliberately not the scheduler's answer. A timer that fires on
+// the hour into a binary that refuses to write — the #105 schema guard, a
+// permissions change, a moved claude_home — looks perfect from the
+// scheduler's side and advances this value not at all. `ccvault schedule
+// status` reports both and lets them disagree out loud.
+//
+// An unparseable value reads as the zero time rather than failing, matching
+// GetFirstAndLastActivity: MAX() produces a result column with no declared
+// type, so the driver hands the text through instead of parsing it.
+func (db *DB) LastSyncedAt() (time.Time, error) {
+	var newest sql.NullString
+	if err := db.QueryRow("SELECT MAX(synced_at) FROM source_files").Scan(&newest); err != nil {
+		return time.Time{}, fmt.Errorf("read last sync time: %w", err)
+	}
+	if !newest.Valid {
+		return time.Time{}, nil
+	}
+	ts, _ := ParseTimestamp(newest.String)
+	return ts, nil
+}
