@@ -40,18 +40,17 @@ type ConversationModel struct {
 	statusMsg   string
 	statusClear time.Time
 
-	// failedCalls holds the provider ids of this session's calls whose result
-	// reported a failure, from tool_uses.is_error (#83). Keyed on the id
-	// because that is what the rendered tool_use block carries: the view draws
-	// the call out of the turn's raw_json, so the id is the only thing the two
-	// have in common.
+	// toolCalls holds this session's tool calls grouped by the turn that issued
+	// them, in the order each turn made them, read from tool_uses (#179). It is
+	// where the view gets an assistant turn's calls: the stored rows are filled
+	// identically by every source, where raw_json's block shape is not.
 	//
-	// A call whose source minted no id — jeff leaves it empty on 633 of 742 —
-	// simply goes unmarked. Marking by position instead would risk putting the
-	// mark on the wrong call of a turn that made fifteen, and a wrong mark is
-	// worse than a missing one: it sends a reader looking for a failure that
-	// is somewhere else.
-	failedCalls map[string]bool
+	// Each call carries its own failure flag, which is why nothing here is
+	// keyed on the provider's tool_use id any more. Matching on that id was the
+	// cost of drawing the call out of raw_json and the failure out of the
+	// table, and it left a call whose source minted no id unmarked — jeff
+	// leaves it empty on 633 of 742. A call read from its own row has both.
+	toolCalls map[string][]db.ToolCall
 }
 
 // NewConversationModel creates a new conversation model
@@ -128,28 +127,21 @@ func (m *ConversationModel) loadConversation() tea.Msg {
 		return ErrorMsg{Err: err}
 	}
 
-	// Which of this session's calls failed, read once here rather than per
-	// rendered block. One indexed query against idx_tool_uses_is_error, in the
-	// same command that already fetches the turns, so opening a conversation
-	// still costs one round of loading.
-	failures, err := m.db.GetFailedToolCalls(m.sessionID)
+	// What each turn called, read once here rather than per rendered turn, in
+	// the same command that already fetches the turns — so opening a
+	// conversation still costs one round of loading.
+	toolCalls, err := m.db.SessionToolCallsByTurn(m.sessionID)
 	if err != nil {
 		return ErrorMsg{Err: err}
 	}
-	failed := make(map[string]bool, len(failures))
-	for _, f := range failures {
-		if f.ToolUseID != "" {
-			failed[f.ToolUseID] = true
-		}
-	}
 
-	return conversationLoadedMsg{session: session, turns: turns, failedCalls: failed}
+	return conversationLoadedMsg{session: session, turns: turns, toolCalls: toolCalls}
 }
 
 type conversationLoadedMsg struct {
-	session     *models.Session
-	turns       []models.Turn
-	failedCalls map[string]bool
+	session   *models.Session
+	turns     []models.Turn
+	toolCalls map[string][]db.ToolCall
 }
 
 type exportCompleteMsg struct {
@@ -260,7 +252,7 @@ func (m *ConversationModel) Update(msg tea.Msg) tea.Cmd {
 	case conversationLoadedMsg:
 		m.session = msg.session
 		m.turns = msg.turns
-		m.failedCalls = msg.failedCalls
+		m.toolCalls = msg.toolCalls
 		m.loading = false
 		m.initViewport()
 		return nil
@@ -455,67 +447,107 @@ func (m *ConversationModel) renderConversation() string {
 	return b.String()
 }
 
-// renderAssistantContent renders assistant message with tool details
+// renderAssistantContent renders an assistant turn: what it said, then what it
+// called.
+//
+// The two halves come from different places on purpose (#179). Prose is read
+// out of the turn's raw_json, because that is where the formatting survives —
+// the `content` column holds a flattened summary. Tool calls are read out of
+// tool_uses, because that is the one place every source agrees: codex records
+// each call on a transcript line of its own, so a codex turn's calls are not in
+// its raw_json at all, and pi writes a `toolCall` block the Claude Code shape
+// does not have. Rendering calls from the stored rows makes this right for a
+// source nobody has written yet, where a switch over block types renders a
+// blank line until somebody remembers to extend it.
+//
+// Calls render after the prose rather than interleaved with it. Interleaving
+// was only ever available for the one source whose blocks arrive in order, and
+// an assistant turn says what it is about to do before it does it.
 func (m *ConversationModel) renderAssistantContent(t models.Turn) string {
-	if len(t.RawJSON) == 0 {
-		content := t.Content
-		if len(content) > 2000 {
-			content = content[:2000] + "\n... (truncated)"
-		}
-		return m.renderMarkdown(content)
+	parts := m.renderAssistantProse(t)
+	for _, call := range m.toolCalls[t.ID] {
+		parts = append(parts, m.formatToolUseBlock(call.ToolName, json.RawMessage(call.InputJSON), call.Failed))
 	}
-
-	// Parse raw JSON for detailed tool info
-	var raw struct {
-		Message struct {
-			Content []struct {
-				Type     string          `json:"type"`
-				Text     string          `json:"text,omitempty"`
-				Thinking string          `json:"thinking,omitempty"`
-				Name     string          `json:"name,omitempty"`
-				Input    json.RawMessage `json:"input,omitempty"`
-				// ID is the provider's tool_use id, read so a block can be
-				// matched against the failed calls loaded from tool_uses.
-				// Absent on every other block type, which is harmless.
-				ID string `json:"id,omitempty"`
-			} `json:"content"`
-		} `json:"message"`
-	}
-
-	if err := json.Unmarshal(t.RawJSON, &raw); err != nil {
-		content := t.Content
-		if len(content) > 2000 {
-			content = content[:2000] + "\n... (truncated)"
-		}
-		return m.renderMarkdown(content)
-	}
-
-	var parts []string
-	for _, c := range raw.Message.Content {
-		switch c.Type {
-		case "text":
-			if c.Text != "" {
-				text := c.Text
-				if len(text) > 2000 {
-					text = text[:2000] + "\n... (truncated)"
-				}
-				parts = append(parts, m.renderMarkdown(text))
-			}
-		case "thinking":
-			if c.Thinking != "" {
-				thinking := c.Thinking
-				if len(thinking) > 500 {
-					thinking = thinking[:500] + "..."
-				}
-				parts = append(parts, thinkingStyle.Render("💭 "+wrapText(thinking, m.width-6)))
-			}
-		case "tool_use":
-			toolBlock := m.formatToolUseBlock(c.Name, c.Input, m.failedCalls[c.ID])
-			parts = append(parts, toolBlock)
-		}
-	}
-
 	return strings.Join(parts, "\n")
+}
+
+// renderAssistantProse renders what an assistant turn said — its text and its
+// thinking, not its calls.
+//
+// Two sources for one answer, and which one is used turns on whether the
+// turn's raw_json carried a content block this knows. It did: render those
+// blocks, and leave the `content` column alone even if no prose came out of
+// them. A turn whose only block was a `tool_use` has `content` stored as
+// ccvault's own summary of that call — "[Tool: Bash]" — and printing it
+// directly above the call it summarises is noise.
+//
+// It did not: fall back to the `content` column. This is the half #179 turned
+// on. The old code consulted `content` only when raw_json was absent or
+// unparseable, and codex's raw_json is neither — it parses perfectly into a
+// shape with no `message` object, yielding zero blocks and an empty line under
+// the turn's header, for all 7,035 codex assistant turns in the author's
+// archive. The fallback has to fire when parsing succeeds and recognises
+// nothing, which is also what lets an unrecognised future shape degrade to its
+// stored text instead of to nothing.
+func (m *ConversationModel) renderAssistantProse(t models.Turn) []string {
+	var parts []string
+
+	if len(t.RawJSON) > 0 {
+		// Parse raw JSON for the prose blocks this view knows.
+		var raw struct {
+			Message struct {
+				Content []struct {
+					Type     string `json:"type"`
+					Text     string `json:"text,omitempty"`
+					Thinking string `json:"thinking,omitempty"`
+				} `json:"content"`
+			} `json:"message"`
+		}
+
+		if err := json.Unmarshal(t.RawJSON, &raw); err == nil {
+			// recognised means a block type this switch knows appeared, empty
+			// or not — including tool_use, which is rendered from tool_uses
+			// but still says the shape was understood. See the comment above
+			// on why that distinction is the one that matters.
+			recognised := false
+			for _, c := range raw.Message.Content {
+				switch c.Type {
+				case "text":
+					recognised = true
+					if c.Text != "" {
+						text := c.Text
+						if len(text) > 2000 {
+							text = text[:2000] + "\n... (truncated)"
+						}
+						parts = append(parts, m.renderMarkdown(text))
+					}
+				case "thinking":
+					recognised = true
+					if c.Thinking != "" {
+						thinking := c.Thinking
+						if len(thinking) > 500 {
+							thinking = thinking[:500] + "..."
+						}
+						parts = append(parts, thinkingStyle.Render("💭 "+wrapText(thinking, m.width-6)))
+					}
+				case "tool_use":
+					recognised = true
+				}
+			}
+			if recognised {
+				return parts
+			}
+		}
+	}
+
+	if t.Content == "" {
+		return parts
+	}
+	content := t.Content
+	if len(content) > 2000 {
+		content = content[:2000] + "\n... (truncated)"
+	}
+	return append(parts, m.renderMarkdown(content))
 }
 
 // failedCallMarker is what a failed call is labelled with. Text rather than
@@ -543,8 +575,27 @@ func (m *ConversationModel) formatToolUseBlock(toolName string, input json.RawMe
 		return b.String()
 	}
 
+	// Arguments that are not a JSON object are rendered as the text they are.
+	// Most of the archive's codex calls are exactly that — 26,552 of 33,294 —
+	// because codex's custom_tool_call carries a plain-text body: a JavaScript
+	// snippet for `exec`, a diff for `apply_patch`. Dropping them would answer
+	// "a command ran" without answering which one.
+	//
+	// Truncated at the same 500 the thinking block uses. These bodies average
+	// 666 bytes and reach 32,469, and the whole of one is in the turn's
+	// raw_json for a reader who needs it.
+	//
+	// ToValidUTF8 because this is the one truncation in the file that cuts
+	// bytes nobody validated — a diff or a shell command, where a 500-byte cut
+	// can land inside a multi-byte rune and leave the terminal a fragment to
+	// draw.
 	var params map[string]interface{}
 	if err := json.Unmarshal(input, &params); err != nil {
+		text := string(input)
+		if len(text) > 500 {
+			text = strings.ToValidUTF8(text[:500], "") + "..."
+		}
+		b.WriteString(codeStyle.Render(wrapText(text, m.width-6)))
 		return b.String()
 	}
 
