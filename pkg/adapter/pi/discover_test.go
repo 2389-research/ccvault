@@ -157,6 +157,67 @@ func TestDiscover_FollowsASymlinkedProjectDirectory(t *testing.T) {
 	}
 }
 
+// TestDiscover_FollowsASymlinkedSessionsDirectory covers the sessions
+// directory itself being a link — someone keeping ~/.pi on an external disk or
+// in a synced folder.
+//
+// filepath.Walk lstats its root, so a symlink there is reported once as a
+// symlink and descended into never. Following only symlinked *children* is not
+// enough: the real project directories under the target are reached through
+// the link, not past it.
+func TestDiscover_FollowsASymlinkedSessionsDirectory(t *testing.T) {
+	root := t.TempDir()
+	elsewhere := filepath.Join(t.TempDir(), "on-another-disk")
+	writeSession(t, filepath.Join(elsewhere, "--Users-dyl-work-alpha--", "s.jsonl"),
+		header("a1", "/Users/dyl/work/alpha"))
+
+	if err := os.MkdirAll(filepath.Join(root, "agent"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sessions := filepath.Join(root, "agent", "sessions")
+	if err := os.Symlink(elsewhere, sessions); err != nil {
+		t.Fatal(err)
+	}
+
+	files, err := New().Discover(root)
+	if err != nil {
+		t.Fatalf("Discover() error: %v", err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("found %d sessions under a symlinked sessions directory, want 1", len(files))
+	}
+	if want := filepath.Join(sessions, "--Users-dyl-work-alpha--", "s.jsonl"); files[0].Path != want {
+		t.Errorf("Path = %q, want %q — reported through the link", files[0].Path, want)
+	}
+	if files[0].ProjectPath != "/Users/dyl/work/alpha" {
+		t.Errorf("ProjectPath = %q, want %q", files[0].ProjectPath, "/Users/dyl/work/alpha")
+	}
+}
+
+// TestDiscover_FollowsASymlinkedFlatRoot is the same hole on the bb side,
+// where the configured root is itself the sessions directory and so is itself
+// the symlink.
+func TestDiscover_FollowsASymlinkedFlatRoot(t *testing.T) {
+	elsewhere := filepath.Join(t.TempDir(), "bridge-sessions")
+	writeSession(t, filepath.Join(elsewhere, "01999-abc.jsonl"), header("abc", "/Users/dyl/work/gamma"))
+
+	link := filepath.Join(t.TempDir(), "pi-bridge-sessions")
+	if err := os.Symlink(elsewhere, link); err != nil {
+		t.Fatal(err)
+	}
+
+	files, err := New().Discover(link)
+	if err != nil {
+		t.Fatalf("Discover() error: %v", err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("found %d sessions under a symlinked flat root, want 1", len(files))
+	}
+	if want := filepath.Join(link, "01999-abc.jsonl"); files[0].Path != want {
+		t.Errorf("Path = %q, want %q — reported through the link", files[0].Path, want)
+	}
+}
+
 // TestDiscover_ASessionReachableTwoWaysIsFoundOnce covers the convenience link
 // somebody will eventually make — sessions/current -> sessions/--some-project--
 // — which leaves every file in that project reachable both directly and

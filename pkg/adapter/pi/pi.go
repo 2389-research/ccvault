@@ -131,13 +131,12 @@ func (a *Adapter) Discover(root string) ([]adapter.SessionFile, error) {
 		})
 	}
 
-	if err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		collect(path, path, info)
-		return nil
-	}); err != nil {
+	// The sessions directory may itself be a link — ~/.pi kept on another disk
+	// or in a synced folder. filepath.Walk lstats its root, so a symlink there
+	// is reported once as a symlink and descended into never, and the project
+	// directories under it are reached through the link rather than past it.
+	// Resolving the root first is what makes the walk see them at all.
+	if err := walkReportingThrough(dir, collect); err != nil {
 		return nil, fmt.Errorf("walking pi sessions: %w", err)
 	}
 
@@ -146,6 +145,34 @@ func (a *Adapter) Discover(root string) ([]adapter.SessionFile, error) {
 	}
 
 	return files, nil
+}
+
+// walkReportingThrough walks dir, resolving it if it is a symlink, and names
+// every file by the path it has *under dir* rather than under the resolved
+// target.
+//
+// That distinction is the whole reason this is not a bare filepath.Walk. The
+// archive stores a session's path and an incremental sync re-checks its mtime
+// there, so a session has to be recorded where the configured root holds it.
+// Recording the resolved path instead would work until the link moved, and
+// would then orphan every row that named the old target.
+func walkReportingThrough(dir string, collect func(path, reportAs string, info os.FileInfo)) error {
+	walkRoot := dir
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		walkRoot = resolved
+	}
+
+	return filepath.Walk(walkRoot, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, relErr := filepath.Rel(walkRoot, path)
+		if relErr != nil {
+			return relErr
+		}
+		collect(path, filepath.Join(dir, rel), info)
+		return nil
+	})
 }
 
 // walkSymlinkedProjectDirs covers the project directories that are symlinks.
@@ -184,22 +211,9 @@ func walkSymlinkedProjectDirs(dir string, collect func(path, reportAs string, in
 			continue
 		}
 
-		target, err := filepath.EvalSymlinks(link)
-		if err != nil {
-			continue
-		}
-
-		if err := filepath.Walk(target, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return err
-			}
-			rel, relErr := filepath.Rel(target, path)
-			if relErr != nil {
-				return relErr
-			}
-			collect(path, filepath.Join(link, rel), info)
-			return nil
-		}); err != nil {
+		// Same rule as the sessions root itself: walk what the link points at,
+		// name what the link holds.
+		if err := walkReportingThrough(link, collect); err != nil {
 			return fmt.Errorf("walking pi sessions through %s: %w", link, err)
 		}
 	}
