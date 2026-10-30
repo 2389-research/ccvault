@@ -1,5 +1,5 @@
 // ABOUTME: Reads over tool_uses that the turn and session readers have no business carrying — today, the failed calls (#83).
-// ABOUTME: Serves the MCP tool-use surface and the TUI conversation view from the stored is_error column, not from raw_json.
+// ABOUTME: Serves the MCP tool-use surface from the stored is_error column, not from raw_json.
 
 package db
 
@@ -9,11 +9,11 @@ import (
 )
 
 // FailedToolCall names one tool call whose result reported a failure. Enough
-// to find it and to say what it was, and nothing more: both callers go on to
-// read the call out of material they already hold — the TUI from the turn's
-// raw_json, MCP from the turn it is already emitting — so returning the
-// payloads here would copy a quarter of a megabyte per session to be thrown
-// away.
+// to find it and to say what it was, and nothing more: the caller goes on to
+// read the call out of material it already holds — MCP from the turn it is
+// already emitting — so returning the payloads here would copy a quarter of a
+// megabyte per session to be thrown away. ToolCall in toolcalls.go is the shape
+// for a caller that has no such material and must render the call itself.
 type FailedToolCall struct {
 	// TurnID is the turn that issued the call, which is what a reader
 	// navigates to.
@@ -25,9 +25,9 @@ type FailedToolCall struct {
 	TurnOrdinal int
 
 	// ToolUseID is the provider's id, empty for a source that minted none —
-	// jeff leaves it empty on 633 of 742 calls. It is what the TUI matches a
-	// rendered tool_use block against, so a row without one simply does not
-	// get marked rather than marking the wrong block.
+	// jeff leaves it empty on 633 of 742 calls. It is what a consumer joins
+	// this row against an id recorded elsewhere with; a row without one can
+	// only be identified by TurnID and TurnOrdinal above.
 	ToolUseID string
 
 	// ToolName is what failed, which is the first thing a reader wants.
@@ -53,9 +53,11 @@ type FailedToolCall struct {
 // than to the archive's 279,383 tool uses.
 //
 // For a caller labelling one page of a session, GetFailedToolCallsForTurns
-// narrows that further; this one is for the callers that mean the session —
-// get_session_summary counts its failures, and the TUI conversation view marks
-// a whole session's blocks.
+// narrows that further; this one is for a caller that means the session, which
+// today is get_session_summary counting its failures. The TUI conversation view
+// used to read it too, and stopped when it began reading whole calls from
+// SessionToolCallsByTurn — a call read from its own row carries its own
+// is_error, so nothing is left to match up (#179).
 func (db *DB) GetFailedToolCalls(sessionID string) ([]FailedToolCall, error) {
 	rows, err := db.Query(failedToolCallsSQL, sessionID)
 	if err != nil {

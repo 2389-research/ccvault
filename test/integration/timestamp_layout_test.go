@@ -55,6 +55,14 @@ var timestampLayoutAllowlist = []string{
 	// nanosecond field from a user, which is not a kindness.
 	"internal/search/query.go",
 
+	// systemd's wire format, not the archive's. `systemctl show` renders
+	// ExecMainExitTimestamp as "Wed 2026-10-28 09:15:00 UTC", in the
+	// machine's own zone, and that is the value parseSystemdTimestamp reads.
+	// Nothing it touches came out of a DATETIME column: the archive's own
+	// staleness is read by db.LastSyncedAt, which goes through
+	// db.ParseTimestamp like everything else.
+	"internal/schedule/systemd.go",
+
 	// Round-trips its own rendering. periodTerms re-reads the "2006-01-02"
 	// that periodFilterDate just produced, to walk a calendar range a day at
 	// a time. Both ends are this file's own constant; no stored value is
