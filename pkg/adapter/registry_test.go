@@ -59,6 +59,23 @@ func TestRegistry_RegisterAndGet(t *testing.T) {
 	}
 }
 
+// TestRegistry_RegisteredNames covers what the registry could not answer
+// before: which sources a build actually has. Tests that have to say something
+// about every source — which of them can be reparsed, for one — were reading
+// their own hand-written list, so a source added without touching that list
+// went unchecked.
+func TestRegistry_RegisteredNames(t *testing.T) {
+	resetRegistry()
+
+	Register("beta", func() SourceAdapter { return &stubAdapter{} })
+	Register("alpha", func() SourceAdapter { return &stubAdapter{} })
+
+	got := RegisteredNames()
+	if len(got) != 2 || got[0] != "alpha" || got[1] != "beta" {
+		t.Errorf("RegisteredNames() = %v, want [alpha beta] sorted", got)
+	}
+}
+
 func TestRegistry_GetUnknown(t *testing.T) {
 	// Reset global registry state for test isolation.
 	resetRegistry()

@@ -5,6 +5,7 @@ package adapter
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 )
 
@@ -34,6 +35,25 @@ func Get(typeName string) (SourceAdapter, error) {
 		return nil, fmt.Errorf("unknown adapter type: %q", typeName)
 	}
 	return factory(), nil
+}
+
+// RegisteredNames returns the type names of every registered adapter, sorted.
+//
+// It exists so a test can say something about *every* source rather than about
+// a list of sources somebody remembered to extend. The reparser table in
+// test/integration is the case that needed it: being absent from that table
+// used to mean being unchecked, and the thing it checks — that a source
+// recording token usage can have those counters repaired — is exactly the kind
+// of thing a new source gets wrong.
+func RegisteredNames() []string {
+	mu.RLock()
+	defer mu.RUnlock()
+	names := make([]string, 0, len(factories))
+	for name := range factories {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // resetRegistry clears all registered adapters. Used only in tests.

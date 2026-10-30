@@ -13,6 +13,7 @@ import (
 	_ "github.com/2389-research/ccvault/pkg/adapter/hex"
 	_ "github.com/2389-research/ccvault/pkg/adapter/jeff"
 	_ "github.com/2389-research/ccvault/pkg/adapter/nanoclaw"
+	_ "github.com/2389-research/ccvault/pkg/adapter/pi"
 )
 
 // TestTranscriptReparsers is the table adapter.TranscriptReparser's
@@ -35,6 +36,14 @@ import (
 //     reassembled into the transcript the adapter reads. It also records no
 //     token usage, which is why this is a note rather than a defect.
 //
+// pi is the first source added after this table grew a completeness guard, and
+// it is a "yes" on both counts: every pi assistant message carries its own
+// usage block, and the spend pi records without a message — cache warming, a
+// compaction's summarisation — is stored as a turn of its own rather than
+// folded into the turn before it, specifically so those numbers are in
+// raw_json where a re-derivation can find them. That is the codex trap below,
+// avoided on purpose.
+//
 // What implementing the interface does NOT promise is that a stored session
 // can be repaired, and codex is the standing proof. Its adapter reparses a
 // transcript correctly — splitting cached_input_tokens out of input_tokens,
@@ -52,7 +61,7 @@ import (
 // breakdown in the repair report is what tells a user which case their archive
 // is in.
 func TestTranscriptReparsers(t *testing.T) {
-	for _, tc := range []struct {
+	cases := []struct {
 		source      string
 		canReparse  bool
 		carriesCost bool
@@ -62,7 +71,26 @@ func TestTranscriptReparsers(t *testing.T) {
 		{source: "codex", canReparse: true, carriesCost: true},
 		{source: "jeff", canReparse: false, carriesCost: false},
 		{source: "hex", canReparse: false, carriesCost: false},
-	} {
+		{source: "pi", canReparse: true, carriesCost: true},
+	}
+
+	// Every registered source has to be in the table, or the table says
+	// nothing about the source that is missing from it. Being absent used to
+	// mean being unchecked, which is the same silence the comment above warns
+	// about one level up: a new source that records token usage and cannot be
+	// reparsed is a source whose sessions are understated forever, and leaving
+	// it off this list is how that would ship unnoticed.
+	listed := make(map[string]bool, len(cases))
+	for _, tc := range cases {
+		listed[tc.source] = true
+	}
+	for _, name := range adapter.RegisteredNames() {
+		if !listed[name] {
+			t.Errorf("source %q is registered but not in this table, so nothing checks whether it can be reparsed", name)
+		}
+	}
+
+	for _, tc := range cases {
 		adpt, err := adapter.Get(tc.source)
 		if err != nil {
 			t.Fatalf("Get(%q): %v", tc.source, err)
