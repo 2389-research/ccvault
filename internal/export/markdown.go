@@ -9,6 +9,7 @@ import (
 	"io"
 	"strings"
 
+	"github.com/2389-research/ccvault/internal/db"
 	"github.com/2389-research/ccvault/pkg/models"
 )
 
@@ -17,6 +18,16 @@ type MarkdownExporter struct {
 	includeToolResults bool
 	includeThinking    bool
 	includeRawJSON     bool
+
+	// toolCalls holds the session's tool calls grouped by the turn that issued
+	// them, in the order each turn made them, as read from tool_uses (#179).
+	// It is where an assistant turn's calls come from: the stored rows are
+	// filled identically by every source, where raw_json's block shape is not.
+	//
+	// Nil for a caller that supplies none, which exports a turn's prose and no
+	// calls rather than failing — a caller with no database handy can still
+	// export.
+	toolCalls map[string][]db.ToolCall
 }
 
 // MarkdownOption configures the markdown exporter
@@ -40,6 +51,19 @@ func WithThinking(include bool) MarkdownOption {
 func WithRawJSON(include bool) MarkdownOption {
 	return func(e *MarkdownExporter) {
 		e.includeRawJSON = include
+	}
+}
+
+// WithToolCalls supplies the session's tool calls grouped by the turn that
+// issued them, which is what an assistant turn's calls are rendered from.
+//
+// Read them with db.SessionToolCallsByTurn. Passing them in rather than having
+// the exporter query keeps this package free of a database handle it would
+// otherwise need only for this, and lets a caller that already holds the
+// grouping — the conversation view does — hand over what it has.
+func WithToolCalls(byTurn map[string][]db.ToolCall) MarkdownOption {
+	return func(e *MarkdownExporter) {
+		e.toolCalls = byTurn
 	}
 }
 
@@ -104,6 +128,8 @@ func (e *MarkdownExporter) Export(w io.Writer, session *models.Session, turns []
 	return nil
 }
 
+// exportTurn writes one turn. The named cases are the types with a renderer of
+// their own; everything else falls to the content fallback below.
 func (e *MarkdownExporter) exportTurn(w io.Writer, t models.Turn) error {
 	switch t.Type {
 	case "user":
@@ -114,7 +140,41 @@ func (e *MarkdownExporter) exportTurn(w io.Writer, t models.Turn) error {
 		if e.includeToolResults {
 			return e.exportToolResult(w, t)
 		}
+	default:
+		return e.exportTurnContent(w, t)
 	}
+	return nil
+}
+
+// exportTurnContent writes a turn of a type this file has no renderer for: its
+// stored content if it has any, and nothing at all if it has none.
+//
+// The switch above used to have no default, so any type outside those three was
+// dropped without a word. The design doc declared the turn types as user,
+// assistant, tool_use, tool_result and progress; measured on the author's
+// archive, tool_use and tool_result have zero rows, while `system` and
+// `attachment` are present in volume and were never declared. Nothing
+// reconciled the two, and the renderers were written from the declaration.
+//
+// The rule here is whether the turn carries text, not what its type is called.
+// That is what makes it right for a type nobody has written yet, and it happens
+// to split the archive cleanly: 51,794 nanoclaw `system` turns carry content —
+// each the agent prompt that explains why the session did anything — and the
+// ~169,000 progress, attachment and claude-code system turns carry none. A
+// renderer keyed on type names would have to be told about each of those, and
+// #179's lesson was that being told is the part that does not happen.
+func (e *MarkdownExporter) exportTurnContent(w io.Writer, t models.Turn) error {
+	if t.Content == "" {
+		return nil
+	}
+
+	// Labelled with the type as stored rather than a prettier name for it: a
+	// reader needs to know what produced the text, and this code does not know
+	// enough about a type it has no renderer for to rename it.
+	_, _ = fmt.Fprintf(w, "### ⚙️ %s\n", t.Type)
+	_, _ = fmt.Fprintf(w, "*%s*\n\n", t.Timestamp.Format("15:04:05"))
+	_, _ = fmt.Fprintf(w, "%s\n\n", t.Content)
+	_, _ = fmt.Fprintf(w, "---\n\n")
 	return nil
 }
 
@@ -135,60 +195,106 @@ func (e *MarkdownExporter) exportUserTurn(w io.Writer, t models.Turn) error {
 	return nil
 }
 
+// exportAssistantTurn writes an assistant turn: what it said, then what it
+// called.
+//
+// The two halves come from different places on purpose (#179). Prose is read
+// out of the turn's raw_json, because that is where the formatting survives —
+// the `content` column holds a flattened summary. Tool calls are read out of
+// tool_uses, because that is the one place every source agrees: codex records
+// each call on a transcript line of its own, so a codex turn's calls are not
+// in its raw_json at all, and pi writes a `toolCall` block the Claude Code
+// shape does not have. Exporting calls from the stored rows makes this right
+// for a source nobody has written yet, where a switch over block types writes
+// nothing until somebody remembers to extend it.
+//
+// Calls are written after the prose rather than interleaved with it.
+// Interleaving was only ever available for the one source whose blocks arrive
+// in order, and an assistant turn says what it is about to do before it does
+// it.
 func (e *MarkdownExporter) exportAssistantTurn(w io.Writer, t models.Turn) error {
 	_, _ = fmt.Fprintf(w, "### 🤖 Assistant\n")
 	_, _ = fmt.Fprintf(w, "*%s*\n\n", t.Timestamp.Format("15:04:05"))
 
-	// Try to parse rich content from RawJSON
-	if len(t.RawJSON) > 0 {
-		if err := e.exportAssistantRichContent(w, t.RawJSON); err == nil {
-			_, _ = fmt.Fprintf(w, "---\n\n")
-			return nil
-		}
-	}
-
-	// Fallback to plain content
-	if t.Content != "" {
-		_, _ = fmt.Fprintf(w, "%s\n\n", t.Content)
+	e.exportAssistantProse(w, t)
+	for _, call := range e.toolCalls[t.ID] {
+		e.exportToolUse(w, call.ToolName, json.RawMessage(call.InputJSON))
 	}
 
 	_, _ = fmt.Fprintf(w, "---\n\n")
 	return nil
 }
 
-func (e *MarkdownExporter) exportAssistantRichContent(w io.Writer, rawJSON json.RawMessage) error {
+// exportAssistantProse writes what an assistant turn said — its text and its
+// thinking, not its calls.
+//
+// Two sources for one answer, and which one is used turns on whether the
+// turn's raw_json carried a content block this knows. It did: write those
+// blocks, and leave the `content` column alone even if no prose came out of
+// them. A turn whose only block was a `tool_use` has `content` stored as
+// ccvault's own summary of that call — "[Tool: Bash]" — and printing it
+// directly above the call it summarises is noise.
+//
+// It did not: fall back to the `content` column. This is the half #179 turned
+// on in the conversation view, and the defect this fixes in export. The old
+// code consulted `content` only when raw_json was absent or unparseable, and
+// codex's raw_json is neither — it parses perfectly into a shape with no
+// `message` object, yielding zero blocks and an empty body under the turn's
+// header, for all 7,035 codex assistant turns in the author's archive. The
+// fallback has to fire when parsing succeeds and recognises nothing, which is
+// also what lets an unrecognised future shape degrade to its stored text
+// instead of to nothing.
+func (e *MarkdownExporter) exportAssistantProse(w io.Writer, t models.Turn) {
+	if len(t.RawJSON) > 0 && e.exportRecognisedProseBlocks(w, t.RawJSON) {
+		return
+	}
+
+	if t.Content != "" {
+		_, _ = fmt.Fprintf(w, "%s\n\n", t.Content)
+	}
+}
+
+// exportRecognisedProseBlocks writes the prose blocks of a Claude Code shaped
+// raw_json, reporting whether the shape was recognised at all.
+//
+// Recognised means a block type this switch knows appeared, empty or not —
+// including tool_use, which is exported from tool_uses but still says the shape
+// was understood. See the comment on exportAssistantProse for why that
+// distinction is the one that matters.
+func (e *MarkdownExporter) exportRecognisedProseBlocks(w io.Writer, rawJSON json.RawMessage) bool {
 	var raw struct {
 		Message struct {
 			Content []struct {
-				Type     string          `json:"type"`
-				Text     string          `json:"text,omitempty"`
-				Thinking string          `json:"thinking,omitempty"`
-				Name     string          `json:"name,omitempty"`
-				Input    json.RawMessage `json:"input,omitempty"`
+				Type     string `json:"type"`
+				Text     string `json:"text,omitempty"`
+				Thinking string `json:"thinking,omitempty"`
 			} `json:"content"`
 		} `json:"message"`
 	}
 
 	if err := json.Unmarshal(rawJSON, &raw); err != nil {
-		return err
+		return false
 	}
 
+	recognised := false
 	for _, c := range raw.Message.Content {
 		switch c.Type {
 		case "text":
+			recognised = true
 			if c.Text != "" {
 				_, _ = fmt.Fprintf(w, "%s\n\n", c.Text)
 			}
 		case "thinking":
+			recognised = true
 			if c.Thinking != "" && e.includeThinking {
 				_, _ = fmt.Fprintf(w, "<details>\n<summary>💭 Thinking</summary>\n\n%s\n\n</details>\n\n", c.Thinking)
 			}
 		case "tool_use":
-			e.exportToolUse(w, c.Name, c.Input)
+			recognised = true
 		}
 	}
 
-	return nil
+	return recognised
 }
 
 func (e *MarkdownExporter) exportToolUse(w io.Writer, toolName string, input json.RawMessage) {
@@ -198,8 +304,20 @@ func (e *MarkdownExporter) exportToolUse(w io.Writer, toolName string, input jso
 		return
 	}
 
+	// Arguments that are not a JSON object are written as the text they are.
+	// Most of the archive's codex calls are exactly that — 26,552 of 33,294 —
+	// because codex's custom_tool_call carries a plain-text body: a JavaScript
+	// snippet for `exec`, a diff for `apply_patch`. Dropping them, which is
+	// what returning here used to do, answers "a command ran" without
+	// answering which one.
+	//
+	// Previewed at the same 50 lines the Write renderer uses, that being this
+	// file's convention for a body whose substance is the point rather than a
+	// prompt to glance at. A line cut cannot split a rune, so no UTF-8
+	// repair is needed here.
 	var params map[string]interface{}
 	if err := json.Unmarshal(input, &params); err != nil {
+		_, _ = fmt.Fprintf(w, "```\n%s\n```\n\n", previewLines(string(input), 50))
 		return
 	}
 
@@ -221,13 +339,7 @@ func (e *MarkdownExporter) exportToolUse(w io.Writer, toolName string, input jso
 		if fp, ok := params["file_path"].(string); ok {
 			_, _ = fmt.Fprintf(w, "📝 Writing: `%s`\n\n", fp)
 			if content, ok := params["content"].(string); ok {
-				lines := strings.Split(content, "\n")
-				if len(lines) > 50 {
-					preview := strings.Join(lines[:50], "\n")
-					_, _ = fmt.Fprintf(w, "```\n%s\n... (%d more lines)\n```\n\n", preview, len(lines)-50)
-				} else {
-					_, _ = fmt.Fprintf(w, "```\n%s\n```\n\n", content)
-				}
+				_, _ = fmt.Fprintf(w, "```\n%s\n```\n\n", previewLines(content, 50))
 			}
 		}
 
@@ -357,6 +469,18 @@ func (e *MarkdownExporter) exportToolResult(w io.Writer, t models.Turn) error {
 
 	_, _ = fmt.Fprintf(w, "```\n%s\n```\n\n", output)
 	return nil
+}
+
+// previewLines returns the first max lines of s, followed by a line saying how
+// many were dropped. Shorter input is returned unchanged, with no notice — a
+// notice claiming a truncation that did not happen is as misleading as a
+// truncation with no notice.
+func previewLines(s string, max int) string {
+	lines := strings.Split(s, "\n")
+	if len(lines) <= max {
+		return s
+	}
+	return fmt.Sprintf("%s\n... (%d more lines)", strings.Join(lines[:max], "\n"), len(lines)-max)
 }
 
 // extractUserContent extracts text from user message raw JSON
