@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/2389-research/ccvault/pkg/models"
 	"github.com/2389-research/ccvault/pkg/toolpayload"
@@ -333,6 +334,30 @@ func parseTurnInternal(data []byte) (*models.Turn, *models.RawTurn, bool, error)
 	// Extract content based on type
 	turn.Content = extractContent(raw)
 
+	// The one place ccvault assigns a type the transcript did not literally
+	// state, and the reason it has to.
+	//
+	// Claude Code writes a tool result as a message with role "user" on a line
+	// of type "user" — the API shape, where a result is something the caller
+	// hands back to the model. Copied verbatim, that files every tool result
+	// in the archive as a message the person typed: 315,985 of them in the
+	// author's 52,375 sessions, 145,798 of which came out with no content at
+	// all and rendered as a bare `User` header with nothing beneath it (#185).
+	// Meanwhile `tool_result`, the type the TUI, the exporter and the MCP
+	// schema were all written for, had zero rows.
+	//
+	// The test is that *every* block is a tool_result. A line carrying prose
+	// beside a result is a user message with a result attached, and retagging
+	// it would file the person's words under a machine's answer — see
+	// TestParseTurn_MixedProseAndToolResultStaysUser.
+	//
+	// Applied after extractContent on purpose: the content of such a line is
+	// the result's text and extractUserContent is what reads it, so the switch
+	// there still keys on the transcript's own "user".
+	if raw.Type == "user" && isToolResultOnlyUserLine(raw) {
+		turn.Type = "tool_result"
+	}
+
 	// Extract token usage for assistant messages
 	if raw.Type == "assistant" && raw.Message != nil {
 		var msg models.RawAssistantMessage
@@ -574,14 +599,14 @@ func ExtractToolUses(turns []models.Turn) []models.ToolUse {
 // it. Content is left raw because the sources use both shapes: a JSON string
 // (129,296 of the author's results) and an array of content blocks (130,516).
 //
-// Deliberately separate from models.UserContentBlock, whose Content is typed
-// as a string. Retyping that field would change what extractUserContent
-// produces for every turn carrying an array-valued result, and so rewrite
-// turns.content — and turns_fts behind it — for a third of the archive. That
-// is a real bug (see the note on TestExtractUserContent_IgnoresImageBlocks)
-// but it is not this change's bug, and the new payloads reach search through
-// their own index rather than by disturbing that one.
-// Content is left raw for the reason above; IsError is a plain bool because
+// Separate from models.UserContentBlock, whose Content is typed as a string
+// and so cannot hold the array shape at all. That typing was the archive's
+// 145,648 contentless turns, and #185 fixed it for the content path by
+// reading user blocks through userContentBlock instead; this type stays its
+// own because it reads a different field set (tool_use_id and is_error) for a
+// different purpose.
+//
+// IsError is a plain bool because
 // the key is absent far more often than present — 217,581 of the author's
 // 273,023 result blocks omit it — and Claude Code writes it only when there is
 // something to report, so absent and false are the same statement. The
@@ -643,6 +668,63 @@ func collectToolResults(turns []models.Turn) map[string]toolResult {
 	return results
 }
 
+// userContentBlock is one block of a user message's content array, read with
+// the tool_result's own nested content left raw.
+//
+// Deliberately not models.UserContentBlock, whose Content is typed as a
+// string. Claude Code writes a tool_result's content both ways — a JSON string
+// (11,000 of 11,408 blocks in the author's live transcripts) and an array of
+// content blocks (408) — and a string-typed field makes the whole block array
+// fail to unmarshal whenever the array shape appears. That failure is the
+// archive's 145,648 contentless turns, and it takes any prose on the same line
+// down with it.
+//
+// models.UserContentBlock is left alone because the two adapters that use it
+// read only Type and IsError from it, and widening it there would buy nothing.
+type userContentBlock struct {
+	Type      string          `json:"type"`
+	Text      string          `json:"text"`
+	Content   json.RawMessage `json:"content"`
+	ToolUseID string          `json:"tool_use_id"`
+}
+
+// parseUserBlocks reads a user message's content as an array of blocks,
+// reporting whether it was one at all.
+func parseUserBlocks(content json.RawMessage) ([]userContentBlock, bool) {
+	var blocks []userContentBlock
+	if err := json.Unmarshal(content, &blocks); err != nil {
+		return nil, false
+	}
+	return blocks, true
+}
+
+// isToolResultOnlyUserLine reports whether a transcript line's user message
+// consists entirely of tool_result blocks — the condition under which
+// parseTurnInternal retags the turn as a tool result. See the comment there.
+//
+// An empty block array is not a tool result. Nor is a plain-string message,
+// nor one with no message at all: those are the archive's pasted screenshots,
+// PDFs and oversized-line placeholders, which carry no result and never did.
+func isToolResultOnlyUserLine(raw models.RawTurn) bool {
+	if raw.Message == nil {
+		return false
+	}
+	var msg models.RawUserMessage
+	if err := json.Unmarshal(raw.Message, &msg); err != nil {
+		return false
+	}
+	blocks, ok := parseUserBlocks(msg.Content)
+	if !ok || len(blocks) == 0 {
+		return false
+	}
+	for _, block := range blocks {
+		if block.Type != "tool_result" {
+			return false
+		}
+	}
+	return true
+}
+
 // extractUserContent extracts text from user message content
 // Content can be a plain string or an array of content blocks
 func extractUserContent(content json.RawMessage) string {
@@ -657,34 +739,105 @@ func extractUserContent(content json.RawMessage) string {
 	}
 
 	// Try parsing as an array of content blocks
-	var blocks []models.UserContentBlock
-	if err := json.Unmarshal(content, &blocks); err == nil {
-		var parts []string
-		for _, block := range blocks {
-			switch block.Type {
-			case "text":
-				if block.Text != "" {
-					parts = append(parts, block.Text)
-				}
-			case "tool_result":
-				// Tool results are usually system content, include for context
-				if block.Content != "" {
-					parts = append(parts, fmt.Sprintf("[Tool Result: %s]", truncate(block.Content, 200)))
-				}
+	blocks, ok := parseUserBlocks(content)
+	if !ok {
+		return ""
+	}
+
+	var parts []string
+	for _, block := range blocks {
+		switch block.Type {
+		case "text":
+			if block.Text != "" {
+				parts = append(parts, block.Text)
+			}
+		case "tool_result":
+			if preview := toolResultPreview(block.Content); preview != "" {
+				parts = append(parts, preview)
 			}
 		}
-		return strings.Join(parts, "\n")
 	}
-
-	return ""
+	return strings.Join(parts, "\n")
 }
 
-// truncate truncates a string to max length with ellipsis
-func truncate(s string, maxLen int) string {
-	if len(s) <= maxLen {
+// toolResultPreview summarises a tool_result block's content for
+// turns.content, empty when there is nothing to summarise.
+//
+// A preview and not the body, which is the decision issue #185 forces. The
+// whole result text already lives twice over: verbatim in turns.raw_json, and
+// in tool_uses.result_content under issue #28's storage policy with an FTS
+// index of its own. Measured on the author's archive, storing the bodies here
+// as well would add 453 MB to a turns.content that holds 296 MB today and
+// duplicate every one of those bytes into turns_fts, where they would compete
+// with the prose that index exists to find. A bounded preview is what the
+// column has carried for these turns since the beginning; the type is what was
+// wrong.
+//
+// Image-bearing results get no preview at all. The payload is base64 and must
+// not reach the FTS index (#28 detects it by shape, not by tool name), and a
+// preview that kept a screenshot's caption while dropping the screenshot is a
+// misleading partial — 191 of the archive's affected rows are exactly that.
+func toolResultPreview(content json.RawMessage) string {
+	text, ok := toolResultText(content)
+	if !ok || text == "" {
+		return ""
+	}
+	return fmt.Sprintf("[Tool Result: %s]", truncateRunes(text, 200))
+}
+
+// toolResultText reads the text a tool_result block carries, reporting false
+// when the content holds an image payload and so must not be summarised.
+//
+// Both shapes the transcripts use: a JSON string, and an array of blocks whose
+// text blocks are joined. A tool_reference block, which names a tool and
+// carries no text, contributes nothing — 287 of the archive's rows are a list
+// of those and legitimately have no content.
+func toolResultText(content json.RawMessage) (string, bool) {
+	if len(content) == 0 {
+		return "", false
+	}
+
+	var str string
+	if err := json.Unmarshal(content, &str); err == nil {
+		return str, true
+	}
+
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(content, &blocks); err != nil {
+		return "", false
+	}
+
+	var parts []string
+	for _, block := range blocks {
+		switch block.Type {
+		case "image":
+			return "", false
+		case "text":
+			if block.Text != "" {
+				parts = append(parts, block.Text)
+			}
+		}
+	}
+	return strings.Join(parts, "\n"), true
+}
+
+// truncateRunes truncates a string to maxRunes characters with an ellipsis.
+//
+// Characters and not bytes, for two reasons that both bite. A byte cut can
+// land inside a multi-byte rune and put invalid UTF-8 into turns.content and
+// the FTS index behind it. And migration 017 reproduces this same string in
+// SQL, where substr()'s unit is the character: 67,845 of the 145,006 rows that
+// migration fills carry a non-ASCII character inside the first 200, so a byte
+// cut here would disagree with it on 47% of them.
+func truncateRunes(s string, maxRunes int) string {
+	if utf8.RuneCountInString(s) <= maxRunes {
 		return s
 	}
-	return s[:maxLen-3] + "..."
+	runes := []rune(s)
+	return string(runes[:maxRunes-3]) + "..."
 }
 
 // formatToolUse formats a tool use with key parameters
