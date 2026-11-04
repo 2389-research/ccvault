@@ -128,6 +128,8 @@ func (e *MarkdownExporter) Export(w io.Writer, session *models.Session, turns []
 	return nil
 }
 
+// exportTurn writes one turn. The named cases are the types with a renderer of
+// their own; everything else falls to the content fallback below.
 func (e *MarkdownExporter) exportTurn(w io.Writer, t models.Turn) error {
 	switch t.Type {
 	case "user":
@@ -138,7 +140,41 @@ func (e *MarkdownExporter) exportTurn(w io.Writer, t models.Turn) error {
 		if e.includeToolResults {
 			return e.exportToolResult(w, t)
 		}
+	default:
+		return e.exportTurnContent(w, t)
 	}
+	return nil
+}
+
+// exportTurnContent writes a turn of a type this file has no renderer for: its
+// stored content if it has any, and nothing at all if it has none.
+//
+// The switch above used to have no default, so any type outside those three was
+// dropped without a word. The design doc declared the turn types as user,
+// assistant, tool_use, tool_result and progress; measured on the author's
+// archive, tool_use and tool_result have zero rows, while `system` and
+// `attachment` are present in volume and were never declared. Nothing
+// reconciled the two, and the renderers were written from the declaration.
+//
+// The rule here is whether the turn carries text, not what its type is called.
+// That is what makes it right for a type nobody has written yet, and it happens
+// to split the archive cleanly: 51,794 nanoclaw `system` turns carry content —
+// each the agent prompt that explains why the session did anything — and the
+// ~169,000 progress, attachment and claude-code system turns carry none. A
+// renderer keyed on type names would have to be told about each of those, and
+// #179's lesson was that being told is the part that does not happen.
+func (e *MarkdownExporter) exportTurnContent(w io.Writer, t models.Turn) error {
+	if t.Content == "" {
+		return nil
+	}
+
+	// Labelled with the type as stored rather than a prettier name for it: a
+	// reader needs to know what produced the text, and this code does not know
+	// enough about a type it has no renderer for to rename it.
+	_, _ = fmt.Fprintf(w, "### ⚙️ %s\n", t.Type)
+	_, _ = fmt.Fprintf(w, "*%s*\n\n", t.Timestamp.Format("15:04:05"))
+	_, _ = fmt.Fprintf(w, "%s\n\n", t.Content)
+	_, _ = fmt.Fprintf(w, "---\n\n")
 	return nil
 }
 

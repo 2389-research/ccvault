@@ -211,36 +211,74 @@ func (m *ConversationModel) copyToClipboard() tea.Msg {
 		return copyCompleteMsg{err: fmt.Errorf("no conversation to copy")}
 	}
 
-	// Build plain text content
-	var b strings.Builder
-	for _, t := range m.turns {
-		switch t.Type {
-		case "user":
-			b.WriteString("[USER] ")
-			b.WriteString(t.Timestamp.Format("15:04:05"))
-			b.WriteString("\n")
-			b.WriteString(t.Content)
-			b.WriteString("\n\n")
-		case "assistant":
-			b.WriteString("[ASSISTANT] ")
-			b.WriteString(t.Timestamp.Format("15:04:05"))
-			b.WriteString("\n")
-			b.WriteString(t.Content)
-			b.WriteString("\n\n")
-		case "tool_result":
-			b.WriteString("[TOOL RESULT] ")
-			b.WriteString(t.Timestamp.Format("15:04:05"))
-			b.WriteString("\n")
-			b.WriteString(t.Content)
-			b.WriteString("\n\n")
-		}
-	}
-
-	if err := clipboard.WriteAll(b.String()); err != nil {
+	if err := clipboard.WriteAll(m.plainTextTranscript()); err != nil {
 		return copyCompleteMsg{err: fmt.Errorf("copy to clipboard: %w", err)}
 	}
 
 	return copyCompleteMsg{count: len(m.turns)}
+}
+
+// plainTextTranscript is the loaded conversation as unstyled text, which is
+// what the clipboard gets.
+//
+// Separate from copyToClipboard so it can be asserted on without writing to
+// the machine's clipboard during a test run.
+//
+// A type with no label of its own is labelled with the type as stored and
+// copied if it carries content, the same rule renderConversation applies — see
+// turnTypeLabel. Copying used to drop those turns, so pasting a nanoclaw
+// session into a bug report lost the prompt that explained it.
+func (m *ConversationModel) plainTextTranscript() string {
+	var b strings.Builder
+	for _, t := range m.turns {
+		label, ok := turnTypeLabel(t)
+		if !ok {
+			continue
+		}
+
+		b.WriteString(label)
+		b.WriteString(" ")
+		b.WriteString(t.Timestamp.Format("15:04:05"))
+		b.WriteString("\n")
+		b.WriteString(t.Content)
+		b.WriteString("\n\n")
+	}
+	return b.String()
+}
+
+// turnTypeLabel is the bracketed label a turn is shown under, and whether it is
+// shown at all.
+//
+// The three named types have a label and a renderer of their own. Everything
+// else is labelled with the type as stored — a reader needs to know what
+// produced the text, and nothing here knows enough about a type it has no
+// renderer for to rename it — and is shown only if it carries content.
+//
+// Keying the decision on content rather than on the type name is the point.
+// docs/plans/2026-02-13-ccvault-design.md declared the turn types as user,
+// assistant, tool_use, tool_result and progress; measured on the author's
+// archive, tool_use and tool_result have no rows at all, while `system` and
+// `attachment` are present in volume and were never declared. Both switches in
+// this file were written from the declaration and had no default, so every
+// undeclared type was dropped without a word.
+//
+// Content splits the archive cleanly where type names do not: 51,794 nanoclaw
+// `system` turns carry content — each the agent prompt that explains why the
+// session did anything — and the ~169,000 progress, attachment and
+// claude-code system turns carry none. A switch extended one type name at a
+// time would need telling about each, and #179's lesson was that being told is
+// the part that does not happen.
+func turnTypeLabel(t models.Turn) (string, bool) {
+	switch t.Type {
+	case "user":
+		return "[USER]", true
+	case "assistant":
+		return "[ASSISTANT]", true
+	case "tool_result":
+		return "[TOOL RESULT]", true
+	default:
+		return "[" + strings.ToUpper(t.Type) + "]", t.Content != ""
+	}
 }
 
 // Update handles conversation view events
@@ -443,6 +481,21 @@ func (m *ConversationModel) renderConversation() string {
 				b.WriteString(result)
 				b.WriteString("\n\n")
 			}
+
+		default:
+			// A type with no renderer of its own: show its stored content if it
+			// has any, and nothing at all if it has none. See turnTypeLabel for
+			// why the decision is content and not the type name.
+			label, show := turnTypeLabel(t)
+			if !show {
+				continue
+			}
+			b.WriteString(secondaryStyle.Render(label))
+			b.WriteString(" ")
+			b.WriteString(timestampStyle.Render(t.Timestamp.Format("15:04:05")))
+			b.WriteString("\n")
+			b.WriteString(m.renderMarkdown(t.Content))
+			b.WriteString("\n\n")
 		}
 	}
 

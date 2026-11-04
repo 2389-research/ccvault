@@ -447,20 +447,30 @@ func TestToolResult_TruncatesOnlyPast100Lines(t *testing.T) {
 
 // --- turn routing -------------------------------------------------------
 
-// exportTurn routes on Type, and a type it does not know must be skipped
-// rather than rendered as one of the others. Note the type is "human", the
-// value a vacuous fixture in this repo used where real transcripts say
-// "user" (#107) -- so this also pins that "human" is NOT a user turn.
-func TestExportTurn_UnknownTypeIsSkipped(t *testing.T) {
+// exportTurn routes on Type, and a type it has no renderer for must not be
+// exported as one of the ones it does: an unknown type gets the content
+// fallback, never the 👤 User or 🤖 Assistant header.
+//
+// What the fallback itself does with such a turn -- export its content, or
+// skip it for having none -- is pinned in contentfallback_test.go. A test
+// asserting an unknown type produced no output at all used to live here, and
+// it was pinning the defect: it is what said the archive's 51,794 nanoclaw
+// system turns were correctly dropped.
+func TestExportTurn_UnknownTypeIsNotExportedAsAKnownOne(t *testing.T) {
 	for _, typ := range []string{"human", "system", ""} {
 		t.Run(typ, func(t *testing.T) {
 			out := renderTurn(t, NewMarkdownExporter(), models.Turn{
 				ID:      "turn-x",
 				Type:    typ,
-				Content: "content-should-not-render",
+				Content: "content-of-an-unknown-type",
 			})
-			if out != "" {
-				t.Errorf("turn type %q produced output:\n%s", typ, out)
+			if !strings.Contains(out, "content-of-an-unknown-type") {
+				t.Fatalf("turn type %q exported nothing, so the assertions below are vacuous:\n%s", typ, out)
+			}
+			for _, header := range []string{"👤 User", "🤖 Assistant", "📤 Tool Result"} {
+				if strings.Contains(out, header) {
+					t.Errorf("turn type %q exported under the %q header:\n%s", typ, header, out)
+				}
 			}
 		})
 	}
