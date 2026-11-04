@@ -196,7 +196,9 @@ func (m *ConversationModel) exportSession() tea.Msg {
 	defer func() { _ = f.Close() }()
 
 	// Export
-	exporter := export.NewMarkdownExporter()
+	// The same grouping the view renders from, so an exported file says what
+	// the screen said.
+	exporter := export.NewMarkdownExporter(export.WithToolCalls(m.toolCalls))
 	if err := exporter.Export(f, m.session, m.turns, projectPath); err != nil {
 		return exportCompleteMsg{err: err}
 	}

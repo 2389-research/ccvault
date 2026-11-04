@@ -1525,10 +1525,19 @@ func (s *Server) getSession(args map[string]interface{}) (interface{}, error) {
 		}, nil
 	}
 
+	// What each turn called, read from tool_uses rather than out of the turn's
+	// raw_json: that is the one place every source records a call (#179), and
+	// a codex turn's calls are not in its raw_json at all.
+	toolCalls, err := s.db.SessionToolCallsByTurn(sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get tool calls: %w", err)
+	}
+
 	// Export to markdown for smaller sessions
 	var buf strings.Builder
 	exporter := export.NewMarkdownExporter(
 		export.WithThinking(false), // Skip thinking to reduce size
+		export.WithToolCalls(toolCalls),
 	)
 	if err := exporter.Export(&buf, session, turns, projectPath); err != nil {
 		return nil, fmt.Errorf("export failed: %w", err)
@@ -2076,11 +2085,19 @@ func (s *Server) promptReviewSession(args map[string]interface{}) (promptGetResu
 		s.log("%s", projectWarning)
 	}
 
+	// What each turn called, from tool_uses (#179) — a review prompt that
+	// omitted a codex session's calls would be reviewing its prose alone.
+	toolCalls, err := s.db.SessionToolCallsByTurn(sessionID)
+	if err != nil {
+		return promptGetResult{}, fmt.Errorf("get tool calls: %w", err)
+	}
+
 	// Export to markdown for easier reading; the markdown IS the prompt,
 	// so a failed export must error rather than produce an empty review
 	var buf strings.Builder
 	exporter := export.NewMarkdownExporter(
 		export.WithThinking(false), // Skip thinking for summary
+		export.WithToolCalls(toolCalls),
 	)
 	if err := exporter.Export(&buf, session, turns, projectPath); err != nil {
 		return promptGetResult{}, fmt.Errorf("export session markdown: %w", err)

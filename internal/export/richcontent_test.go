@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/2389-research/ccvault/internal/db"
 	"github.com/2389-research/ccvault/pkg/models"
 )
 
@@ -117,12 +118,43 @@ func TestRichContent_UnknownBlockTypeIsSkipped(t *testing.T) {
 
 // --- tool_use renderers -------------------------------------------------
 
+// toolUseTurn builds the assistant turn a claude-code call arrives on: a
+// tool_use block in raw_json, which is the shape that says "this turn called
+// something" -- but is no longer where the call is read from (#179).
 func toolUseTurn(t *testing.T, name string, input map[string]any) models.Turn {
 	t.Helper()
 
 	return assistantTurn(t, map[string]any{
 		"type": "tool_use", "name": name, "input": input,
 	})
+}
+
+// renderToolCall exports an assistant turn that issued one call, seeded the way
+// the exporter now reads calls: out of tool_uses, handed over by WithToolCalls
+// (#179). The matching tool_use block is still in the turn's raw_json, because
+// that is what claude-code stores -- so these cases also pin that one call is
+// not written twice.
+//
+// A nil input means the source recorded no arguments, which is stored as an
+// empty input_json rather than as the JSON literal "null".
+func renderToolCall(t *testing.T, name string, input map[string]any) string {
+	t.Helper()
+
+	turn := toolUseTurn(t, name, input)
+
+	var inputJSON string
+	if input != nil {
+		raw, err := json.Marshal(input)
+		if err != nil {
+			t.Fatalf("marshal tool input: %v", err)
+		}
+		inputJSON = string(raw)
+	}
+
+	e := NewMarkdownExporter(WithToolCalls(map[string][]db.ToolCall{
+		turn.ID: {{ToolName: name, InputJSON: inputJSON}},
+	}))
+	return renderTurn(t, e, turn)
 }
 
 // Each tool has its own renderer pulling named fields out of the input. The
@@ -154,7 +186,7 @@ func TestToolUse_RendersEachToolsSalientFields(t *testing.T) {
 			[]string{"📋 Task:", "do a thing", "Task Prompt", "the full prompt"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			out := renderTurn(t, NewMarkdownExporter(), toolUseTurn(t, tc.name, tc.input))
+			out := renderToolCall(t, tc.name, tc.input)
 			for _, want := range tc.want {
 				if !strings.Contains(out, want) {
 					t.Errorf("output is missing %q:\n%s", want, out)
@@ -168,11 +200,10 @@ func TestToolUse_RendersEachToolsSalientFields(t *testing.T) {
 // because the alternative is a transcript naming a tool and nothing about
 // what it was asked to do.
 func TestToolUse_UnknownToolFallsBackToListingStringParams(t *testing.T) {
-	out := renderTurn(t, NewMarkdownExporter(),
-		toolUseTurn(t, "SomeFutureTool", map[string]any{
-			"target": "the-target-value",
-			"count":  7, // non-string, deliberately dropped by the renderer
-		}))
+	out := renderToolCall(t, "SomeFutureTool", map[string]any{
+		"target": "the-target-value",
+		"count":  7, // non-string, deliberately dropped by the renderer
+	})
 
 	if !strings.Contains(out, "🔧 Tool: SomeFutureTool") {
 		t.Errorf("tool name missing:\n%s", out)
@@ -183,8 +214,7 @@ func TestToolUse_UnknownToolFallsBackToListingStringParams(t *testing.T) {
 }
 
 func TestToolUse_NoInputRendersOnlyTheHeader(t *testing.T) {
-	out := renderTurn(t, NewMarkdownExporter(),
-		assistantTurn(t, map[string]any{"type": "tool_use", "name": "Bash"}))
+	out := renderToolCall(t, "Bash", nil)
 
 	if !strings.Contains(out, "🔧 Tool: Bash") {
 		t.Errorf("tool header missing:\n%s", out)
@@ -206,10 +236,9 @@ func TestToolUse_WritePreviewTruncatesOnlyPast50Lines(t *testing.T) {
 		lines50[i] = fmt.Sprintf("line %d", i)
 	}
 
-	at := renderTurn(t, NewMarkdownExporter(),
-		toolUseTurn(t, "Write", map[string]any{
-			"file_path": "/tmp/x", "content": strings.Join(lines50, "\n"),
-		}))
+	at := renderToolCall(t, "Write", map[string]any{
+		"file_path": "/tmp/x", "content": strings.Join(lines50, "\n"),
+	})
 	if strings.Contains(at, "more lines") {
 		t.Errorf("exactly 50 lines was truncated:\n%s", at)
 	}
@@ -217,10 +246,9 @@ func TestToolUse_WritePreviewTruncatesOnlyPast50Lines(t *testing.T) {
 		t.Errorf("the 50th line is missing:\n%s", at)
 	}
 
-	over := renderTurn(t, NewMarkdownExporter(),
-		toolUseTurn(t, "Write", map[string]any{
-			"file_path": "/tmp/x", "content": strings.Join(append(lines50, "line 50"), "\n"),
-		}))
+	over := renderToolCall(t, "Write", map[string]any{
+		"file_path": "/tmp/x", "content": strings.Join(append(lines50, "line 50"), "\n"),
+	})
 	if !strings.Contains(over, "... (1 more lines)") {
 		t.Errorf("51 lines did not report exactly 1 dropped line:\n%s", over)
 	}
@@ -242,12 +270,11 @@ func TestToolUse_EditTruncatesStringsAt200Characters(t *testing.T) {
 	oldFill := strings.Repeat("O", 200)
 	newFill := strings.Repeat("N", 200)
 
-	out := renderTurn(t, NewMarkdownExporter(),
-		toolUseTurn(t, "Edit", map[string]any{
-			"file_path":  "/tmp/y",
-			"old_string": oldFill + "OLDTAIL",
-			"new_string": newFill + "NEWTAIL",
-		}))
+	out := renderToolCall(t, "Edit", map[string]any{
+		"file_path":  "/tmp/y",
+		"old_string": oldFill + "OLDTAIL",
+		"new_string": newFill + "NEWTAIL",
+	})
 
 	if strings.Contains(out, "OLDTAIL") {
 		t.Errorf("old_string past 200 chars survived truncation:\n%s", out)
@@ -264,10 +291,9 @@ func TestToolUse_EditTruncatesStringsAt200Characters(t *testing.T) {
 }
 
 func TestToolUse_EditLeavesShortStringsIntact(t *testing.T) {
-	out := renderTurn(t, NewMarkdownExporter(),
-		toolUseTurn(t, "Edit", map[string]any{
-			"file_path": "/tmp/y", "old_string": "short before", "new_string": "short after",
-		}))
+	out := renderToolCall(t, "Edit", map[string]any{
+		"file_path": "/tmp/y", "old_string": "short before", "new_string": "short after",
+	})
 
 	if strings.Contains(out, "...") {
 		t.Errorf("a short string was truncated:\n%s", out)
@@ -278,8 +304,7 @@ func TestToolUse_EditLeavesShortStringsIntact(t *testing.T) {
 func TestToolUse_TaskTruncatesThePromptAt500Characters(t *testing.T) {
 	long := strings.Repeat("b", 500) + "TAIL"
 
-	out := renderTurn(t, NewMarkdownExporter(),
-		toolUseTurn(t, "Task", map[string]any{"description": "d", "prompt": long}))
+	out := renderToolCall(t, "Task", map[string]any{"description": "d", "prompt": long})
 
 	if strings.Contains(out, "TAIL") {
 		t.Errorf("prompt text past 500 chars survived truncation:\n%s", out)
@@ -291,8 +316,7 @@ func TestToolUse_TaskTruncatesThePromptAt500Characters(t *testing.T) {
 
 // The generic renderer truncates each string param at 100 characters.
 func TestToolUse_GenericRendererTruncatesParamsAt100Characters(t *testing.T) {
-	out := renderTurn(t, NewMarkdownExporter(),
-		toolUseTurn(t, "Unknown", map[string]any{"k": strings.Repeat("c", 100) + "TAIL"}))
+	out := renderToolCall(t, "Unknown", map[string]any{"k": strings.Repeat("c", 100) + "TAIL"})
 
 	if strings.Contains(out, "TAIL") {
 		t.Errorf("param text past 100 chars survived truncation:\n%s", out)
