@@ -67,7 +67,32 @@ func WithToolCalls(byTurn map[string][]db.ToolCall) MarkdownOption {
 	}
 }
 
-// NewMarkdownExporter creates a new markdown exporter
+// NewMarkdownExporter creates a new markdown exporter.
+//
+// includeToolResults stays true, and #185 is why that is now a decision rather
+// than an inheritance. The default was written when `tool_result` had no rows,
+// so it governed nothing; retagging the archive's 315,985 mislabeled results
+// made it govern every export.
+//
+// It stays true because the alternative hides the substance of an agent
+// session behind a flag nobody knows to pass. The test failure, the grep hits,
+// the error message that explains why the assistant did the next thing — an
+// assistant turn that says "let me read ipc.ts" followed by nothing is not a
+// transcript of what happened.
+//
+// The volume is bounded and was measured rather than feared. Each result is
+// previewed at 100 lines and image payloads are dropped by shape, so four real
+// sessions exported 1.33x, 1.35x, 2.91x and 3.11x their previous size — 54 KB
+// to 74 KB in the largest, 18 KB to 53 KB in the steepest. Bigger files, not
+// unusable ones.
+//
+// And neither default regresses, which is what settles it. With results off,
+// the export is still better than before #185: the blank `### 👤 User` headers
+// are gone, and one real nanoclaw session came out smaller than it used to be
+// (20,329 bytes against 22,082) with 38 empty headers removed. So a reader who
+// wants the old volume has --tool-results=false and loses nothing, while a
+// default of false would leave the person who does not know the flag exists
+// still reading the bug this fixed.
 func NewMarkdownExporter(opts ...MarkdownOption) *MarkdownExporter {
 	e := &MarkdownExporter{
 		includeToolResults: true,
@@ -317,14 +342,14 @@ func (e *MarkdownExporter) exportToolUse(w io.Writer, toolName string, input jso
 	// repair is needed here.
 	var params map[string]interface{}
 	if err := json.Unmarshal(input, &params); err != nil {
-		_, _ = fmt.Fprintf(w, "```\n%s\n```\n\n", previewLines(string(input), 50))
+		writeFenced(w, "", previewLines(string(input), 50))
 		return
 	}
 
 	switch toolName {
 	case "Bash":
 		if cmd, ok := params["command"].(string); ok {
-			_, _ = fmt.Fprintf(w, "```bash\n%s\n```\n\n", cmd)
+			writeFenced(w, "bash", cmd)
 		}
 		if desc, ok := params["description"].(string); ok && desc != "" {
 			_, _ = fmt.Fprintf(w, "> %s\n\n", desc)
@@ -339,7 +364,7 @@ func (e *MarkdownExporter) exportToolUse(w io.Writer, toolName string, input jso
 		if fp, ok := params["file_path"].(string); ok {
 			_, _ = fmt.Fprintf(w, "📝 Writing: `%s`\n\n", fp)
 			if content, ok := params["content"].(string); ok {
-				_, _ = fmt.Fprintf(w, "```\n%s\n```\n\n", previewLines(content, 50))
+				writeFenced(w, "", previewLines(content, 50))
 			}
 		}
 
@@ -351,13 +376,15 @@ func (e *MarkdownExporter) exportToolUse(w io.Writer, toolName string, input jso
 			if len(old) > 200 {
 				old = old[:200] + "..."
 			}
-			_, _ = fmt.Fprintf(w, "**Replace:**\n```\n%s\n```\n\n", old)
+			_, _ = fmt.Fprintf(w, "**Replace:**\n")
+			writeFenced(w, "", old)
 		}
 		if newStr, ok := params["new_string"].(string); ok {
 			if len(newStr) > 200 {
 				newStr = newStr[:200] + "..."
 			}
-			_, _ = fmt.Fprintf(w, "**With:**\n```\n%s\n```\n\n", newStr)
+			_, _ = fmt.Fprintf(w, "**With:**\n")
+			writeFenced(w, "", newStr)
 		}
 
 	case "Glob":
@@ -408,25 +435,123 @@ func (e *MarkdownExporter) exportToolUse(w io.Writer, toolName string, input jso
 	}
 }
 
+// exportToolResult writes what a tool returned.
+//
+// Three sources, in order of how likely they are to hold the answer. The
+// Claude Code shape first: a tool result is a message whose content blocks are
+// tool_result blocks, and #185 is what made turns of this type exist at all —
+// before it the type had no rows and this renderer had never run. Then the
+// $.toolUseId/$.data shape, which is what this function used to read on its
+// own and which the design doc described; no source in the repo writes it, so
+// it is tried second rather than first. Then the turn's stored content, which
+// is a bounded preview and is all a turn has left when its oversized line was
+// replaced by a placeholder.
 func (e *MarkdownExporter) exportToolResult(w io.Writer, t models.Turn) error {
-	if len(t.RawJSON) == 0 {
+	output := toolResultOutput(t.RawJSON)
+	if output == "" {
+		output = t.Content
+	}
+	if output == "" {
 		return nil
 	}
 
+	_, _ = fmt.Fprintf(w, "#### 📤 Tool Result\n\n")
+
+	// Previewed rather than dumped. Tool output runs to tens of thousands of
+	// lines — a test run, a file read — at the same 100 lines the tool-input
+	// renderer uses for a body whose substance is the point.
+	writeFenced(w, "", previewLines(output, 100))
+	return nil
+}
+
+// toolResultOutput reads a tool result's body out of a turn's raw JSON, empty
+// when neither known shape carries one.
+func toolResultOutput(rawJSON json.RawMessage) string {
+	if len(rawJSON) == 0 {
+		return ""
+	}
+
+	if body := claudeToolResultBody(rawJSON); body != "" {
+		return body
+	}
+	return legacyToolResultBody(rawJSON)
+}
+
+// claudeToolResultBody joins the bodies of a message's tool_result blocks.
+//
+// Image payloads are dropped and their captions kept. This is a rendered page
+// and not an index, so the partial that issue #28 refuses to store is the
+// right thing to show: 1-2 MB of base64 pasted inline answers nothing, and
+// "Screenshot taken at 1440x700" answers what the call did.
+func claudeToolResultBody(rawJSON json.RawMessage) string {
+	var raw struct {
+		Message struct {
+			Content []struct {
+				Type    string          `json:"type"`
+				Content json.RawMessage `json:"content"`
+			} `json:"content"`
+		} `json:"message"`
+	}
+
+	if err := json.Unmarshal(rawJSON, &raw); err != nil {
+		return ""
+	}
+
+	var parts []string
+	for _, block := range raw.Message.Content {
+		if block.Type != "tool_result" {
+			continue
+		}
+		if body := resultBlockText(block.Content); body != "" {
+			parts = append(parts, body)
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+// resultBlockText reads one tool_result block's content, which the transcripts
+// write either as a JSON string or as an array of content blocks.
+func resultBlockText(content json.RawMessage) string {
+	if len(content) == 0 {
+		return ""
+	}
+
+	var str string
+	if err := json.Unmarshal(content, &str); err == nil {
+		return str
+	}
+
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(content, &blocks); err != nil {
+		return ""
+	}
+
+	var parts []string
+	for _, b := range blocks {
+		if b.Type == "text" && b.Text != "" {
+			parts = append(parts, b.Text)
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+// legacyToolResultBody reads the $.toolUseId/$.data shape the design doc
+// declared for a tool_result turn. Kept because it is what this renderer was
+// written against and its tests pin the field precedence; no source in the
+// repo emits it.
+func legacyToolResultBody(rawJSON json.RawMessage) string {
 	var raw struct {
 		ToolUseID string          `json:"toolUseId"`
 		Data      json.RawMessage `json:"data"`
 	}
 
-	if err := json.Unmarshal(t.RawJSON, &raw); err != nil {
-		return nil
+	if err := json.Unmarshal(rawJSON, &raw); err != nil || len(raw.Data) == 0 {
+		return ""
 	}
 
-	if len(raw.Data) == 0 {
-		return nil
-	}
-
-	// Try to extract output
 	var data struct {
 		Output   string `json:"output"`
 		Content  string `json:"content"`
@@ -437,38 +562,46 @@ func (e *MarkdownExporter) exportToolResult(w io.Writer, t models.Turn) error {
 	}
 
 	if err := json.Unmarshal(raw.Data, &data); err != nil {
-		return nil
+		return ""
 	}
 
-	var output string
 	switch {
 	case data.Output != "":
-		output = data.Output
+		return data.Output
 	case data.Stdout != "":
-		output = data.Stdout
 		if data.Stderr != "" {
-			output += "\n" + data.Stderr
+			return data.Stdout + "\n" + data.Stderr
 		}
+		return data.Stdout
 	case data.Content != "":
-		output = data.Content
+		return data.Content
 	case data.Result != "":
-		output = data.Result
+		return data.Result
 	}
+	return ""
+}
 
-	if output == "" {
-		return nil
+// writeFenced writes body as a fenced code block, with lang as its info
+// string, choosing a fence long enough to contain it.
+//
+// The length is the point. Every fence in this file used to be exactly three
+// backticks, and the bodies are tool payloads: 10,514 of the archive's
+// retagged tool results carry a triple-backtick fence of their own and 1,152
+// of its tool inputs do — a Read of a markdown file, a Bash cat of a README.
+// An inner fence closed the block early, so the rest of the result rendered as
+// markdown and the real closing fence opened a new block that swallowed every
+// turn after it. CommonMark resolves this by letting the opening fence be
+// longer than anything inside, which is what this does.
+//
+// One function rather than the fix at each of the six call sites: a fence
+// somebody adds later is the one that would be forgotten, and #179's lesson
+// was that being told is the part that does not happen.
+func writeFenced(w io.Writer, lang, body string) {
+	fence := "```"
+	for strings.Contains(body, fence) {
+		fence += "`"
 	}
-
-	_, _ = fmt.Fprintf(w, "#### 📤 Tool Result\n\n")
-
-	// Truncate very long outputs
-	lines := strings.Split(output, "\n")
-	if len(lines) > 100 {
-		output = strings.Join(lines[:100], "\n") + fmt.Sprintf("\n... (%d more lines)", len(lines)-100)
-	}
-
-	_, _ = fmt.Fprintf(w, "```\n%s\n```\n\n", output)
-	return nil
+	_, _ = fmt.Fprintf(w, "%s%s\n%s\n%s\n\n", fence, lang, body, fence)
 }
 
 // previewLines returns the first max lines of s, followed by a line saying how

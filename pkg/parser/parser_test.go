@@ -742,9 +742,10 @@ func TestParseSessionReaderWithLimits_TruncatesLargeRawJSON(t *testing.T) {
 // (which feeds the FTS index) — otherwise a 12 MB base64 blob would
 // bloat search results with unsearchable noise.
 //
-// UserContentBlock.Content is typed as string, so a JSON array in that
-// slot causes the whole []UserContentBlock unmarshal to fail; the
-// function then returns "". This test pins that behavior.
+// The array shape is read now rather than failing to unmarshal (#185),
+// so the exclusion is a rule and not an accident: toolResultText
+// reports an image-bearing result as unsummarisable and the function
+// returns "". This test pins that behavior.
 func TestExtractUserContent_IgnoresImageBlocks(t *testing.T) {
 	// Distinctive marker to prove the payload is not surfaced anywhere.
 	needle := "BASE64PAYLOADCANARYAAAAAAAAAAAAAAAAAA"
