@@ -342,14 +342,14 @@ func (e *MarkdownExporter) exportToolUse(w io.Writer, toolName string, input jso
 	// repair is needed here.
 	var params map[string]interface{}
 	if err := json.Unmarshal(input, &params); err != nil {
-		_, _ = fmt.Fprintf(w, "```\n%s\n```\n\n", previewLines(string(input), 50))
+		writeFenced(w, "", previewLines(string(input), 50))
 		return
 	}
 
 	switch toolName {
 	case "Bash":
 		if cmd, ok := params["command"].(string); ok {
-			_, _ = fmt.Fprintf(w, "```bash\n%s\n```\n\n", cmd)
+			writeFenced(w, "bash", cmd)
 		}
 		if desc, ok := params["description"].(string); ok && desc != "" {
 			_, _ = fmt.Fprintf(w, "> %s\n\n", desc)
@@ -364,7 +364,7 @@ func (e *MarkdownExporter) exportToolUse(w io.Writer, toolName string, input jso
 		if fp, ok := params["file_path"].(string); ok {
 			_, _ = fmt.Fprintf(w, "📝 Writing: `%s`\n\n", fp)
 			if content, ok := params["content"].(string); ok {
-				_, _ = fmt.Fprintf(w, "```\n%s\n```\n\n", previewLines(content, 50))
+				writeFenced(w, "", previewLines(content, 50))
 			}
 		}
 
@@ -376,13 +376,15 @@ func (e *MarkdownExporter) exportToolUse(w io.Writer, toolName string, input jso
 			if len(old) > 200 {
 				old = old[:200] + "..."
 			}
-			_, _ = fmt.Fprintf(w, "**Replace:**\n```\n%s\n```\n\n", old)
+			_, _ = fmt.Fprintf(w, "**Replace:**\n")
+			writeFenced(w, "", old)
 		}
 		if newStr, ok := params["new_string"].(string); ok {
 			if len(newStr) > 200 {
 				newStr = newStr[:200] + "..."
 			}
-			_, _ = fmt.Fprintf(w, "**With:**\n```\n%s\n```\n\n", newStr)
+			_, _ = fmt.Fprintf(w, "**With:**\n")
+			writeFenced(w, "", newStr)
 		}
 
 	case "Glob":
@@ -458,7 +460,7 @@ func (e *MarkdownExporter) exportToolResult(w io.Writer, t models.Turn) error {
 	// Previewed rather than dumped. Tool output runs to tens of thousands of
 	// lines — a test run, a file read — at the same 100 lines the tool-input
 	// renderer uses for a body whose substance is the point.
-	_, _ = fmt.Fprintf(w, "```\n%s\n```\n\n", previewLines(output, 100))
+	writeFenced(w, "", previewLines(output, 100))
 	return nil
 }
 
@@ -577,6 +579,29 @@ func legacyToolResultBody(rawJSON json.RawMessage) string {
 		return data.Result
 	}
 	return ""
+}
+
+// writeFenced writes body as a fenced code block, with lang as its info
+// string, choosing a fence long enough to contain it.
+//
+// The length is the point. Every fence in this file used to be exactly three
+// backticks, and the bodies are tool payloads: 10,514 of the archive's
+// retagged tool results carry a triple-backtick fence of their own and 1,152
+// of its tool inputs do — a Read of a markdown file, a Bash cat of a README.
+// An inner fence closed the block early, so the rest of the result rendered as
+// markdown and the real closing fence opened a new block that swallowed every
+// turn after it. CommonMark resolves this by letting the opening fence be
+// longer than anything inside, which is what this does.
+//
+// One function rather than the fix at each of the six call sites: a fence
+// somebody adds later is the one that would be forgotten, and #179's lesson
+// was that being told is the part that does not happen.
+func writeFenced(w io.Writer, lang, body string) {
+	fence := "```"
+	for strings.Contains(body, fence) {
+		fence += "`"
+	}
+	_, _ = fmt.Fprintf(w, "%s%s\n%s\n%s\n\n", fence, lang, body, fence)
 }
 
 // previewLines returns the first max lines of s, followed by a line saying how

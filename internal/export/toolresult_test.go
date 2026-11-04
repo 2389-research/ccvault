@@ -153,3 +153,60 @@ func TestExportToolResult_PreviewsLongBody(t *testing.T) {
 		t.Errorf("rendered %d output lines, want at most 100", n)
 	}
 }
+
+// TestExportToolResult_FenceOutlastsBackticksInTheBody is a defect this PR
+// made reachable. The body was wrapped in a fixed three-backtick fence, and
+// tool output carries triple-backtick fences of its own routinely — a Read of
+// a markdown file, a Bash cat of a README. 10,514 of the archive's retagged
+// tool results hold one, and 1,152 of its tool inputs do.
+//
+// An inner fence closes the block early: the rest of the result renders as
+// markdown, and the real closing fence opens a new block that swallows every
+// turn after it. The fence has to outlast the longest backtick run in the body.
+func TestExportToolResult_FenceOutlastsBackticksInTheBody(t *testing.T) {
+	body := "Here is a snippet:\\n```go\\nfunc main() {}\\n```\\nand that is all"
+	raw := `{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":"` + body + `"}]},"uuid":"u","timestamp":"2026-10-21T19:51:59.142Z","sessionId":"s"}`
+
+	var buf bytes.Buffer
+	e := NewMarkdownExporter()
+	if err := e.exportTurn(&buf, claudeToolResultTurn(raw, "")); err != nil {
+		t.Fatalf("exportTurn: %v", err)
+	}
+
+	got := buf.String()
+	if !strings.Contains(got, "func main() {}") {
+		t.Fatalf("body not rendered:\n%s", got)
+	}
+	// The fences that open and close the block must be longer than anything
+	// inside it, so the block stays one block.
+	if !strings.Contains(got, "````\n") {
+		t.Errorf("the fence does not outlast the body's own fence:\n%s", got)
+	}
+	// The body's own fences survive verbatim inside the longer one.
+	if !strings.Contains(got, "\n```go\n") {
+		t.Errorf("the body's opening fence did not survive:\n%s", got)
+	}
+	// And the block is one block: exactly one opening and one closing fence of
+	// four backticks, with everything else between them.
+	if n := strings.Count(got, "````"); n != 2 {
+		t.Errorf("found %d four-backtick fences, want exactly 2:\n%s", n, got)
+	}
+}
+
+// TestExportToolUse_FenceOutlastsBackticksInTheBody is the same defect in the
+// renderer beside it, reachable before this PR: a tool argument that is not a
+// JSON object is written as the text it is, and 1,152 of the archive's inputs
+// carry a fence.
+func TestExportToolUse_FenceOutlastsBackticksInTheBody(t *testing.T) {
+	var buf bytes.Buffer
+	e := NewMarkdownExporter()
+	e.exportToolUse(&buf, "apply_patch", []byte("```\nnot json, a diff\n```"))
+
+	got := buf.String()
+	if !strings.Contains(got, "not json, a diff") {
+		t.Fatalf("body not rendered:\n%s", got)
+	}
+	if !strings.Contains(got, "````\n") {
+		t.Errorf("the fence does not outlast the body's own fence:\n%s", got)
+	}
+}
