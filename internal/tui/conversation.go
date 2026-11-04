@@ -737,26 +737,132 @@ func (m *ConversationModel) formatToolUseBlock(toolName string, input json.RawMe
 	return b.String()
 }
 
-// renderToolResult renders a tool result with output
+// renderToolResult renders what a tool returned.
+//
+// Three sources, in order of how likely they are to hold the answer. The
+// Claude Code shape first: a tool result is a message whose content blocks are
+// tool_result blocks, and #185 is what made turns of this type exist at all —
+// before it the type had no rows and this renderer had never run. Then the
+// $.toolUseId/$.data shape, which is what this function used to read on its
+// own and which the design doc described; no source in the repo writes it, so
+// it is tried second rather than first. Then the turn's stored content, which
+// is a bounded preview and is all a turn has left when its oversized line was
+// replaced by a placeholder.
+//
+// Falling back to content rather than returning the empty string is what keeps
+// such a turn in the view at all: renderConversation skips a tool_result whose
+// render comes out empty, so an empty return deletes the turn from the
+// conversation instead of showing it with nothing under it.
 func (m *ConversationModel) renderToolResult(t models.Turn) string {
-	if len(t.RawJSON) == 0 {
-		return t.Content
+	output := toolResultOutput(t.RawJSON)
+	if output == "" {
+		output = t.Content
+	}
+	if output == "" {
+		return ""
 	}
 
+	// Truncated at 1,000 characters, counted as characters rather than bytes
+	// so a cut cannot land inside a multi-byte rune and leave the terminal a
+	// fragment to draw. ToValidUTF8 besides, because the body is tool output
+	// nobody validated. The whole of it is in the turn's raw_json for a reader
+	// who needs it.
+	runes := []rune(output)
+	if len(runes) > 1000 {
+		output = string(runes[:1000]) + "\n... (truncated)"
+	}
+	output = strings.ToValidUTF8(output, "")
+
+	return codeStyle.Render(wrapText(output, m.width-4))
+}
+
+// toolResultOutput reads a tool result's body out of a turn's raw JSON, empty
+// when neither known shape carries one.
+func toolResultOutput(rawJSON json.RawMessage) string {
+	if len(rawJSON) == 0 {
+		return ""
+	}
+
+	if body := claudeToolResultBody(rawJSON); body != "" {
+		return body
+	}
+	return legacyToolResultBody(rawJSON)
+}
+
+// claudeToolResultBody joins the bodies of a message's tool_result blocks.
+//
+// Image payloads are dropped and their captions kept. This is a view and not
+// an index, so the partial that issue #28 refuses to store is the right thing
+// to show: 1-2 MB of base64 answers nothing, and "Screenshot taken at
+// 1440x700" answers what the call did.
+func claudeToolResultBody(rawJSON json.RawMessage) string {
+	var raw struct {
+		Message struct {
+			Content []struct {
+				Type    string          `json:"type"`
+				Content json.RawMessage `json:"content"`
+			} `json:"content"`
+		} `json:"message"`
+	}
+
+	if err := json.Unmarshal(rawJSON, &raw); err != nil {
+		return ""
+	}
+
+	var parts []string
+	for _, block := range raw.Message.Content {
+		if block.Type != "tool_result" {
+			continue
+		}
+		if body := resultBlockText(block.Content); body != "" {
+			parts = append(parts, body)
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+// resultBlockText reads one tool_result block's content, which the transcripts
+// write either as a JSON string or as an array of content blocks.
+func resultBlockText(content json.RawMessage) string {
+	if len(content) == 0 {
+		return ""
+	}
+
+	var str string
+	if err := json.Unmarshal(content, &str); err == nil {
+		return str
+	}
+
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(content, &blocks); err != nil {
+		return ""
+	}
+
+	var parts []string
+	for _, b := range blocks {
+		if b.Type == "text" && b.Text != "" {
+			parts = append(parts, b.Text)
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+// legacyToolResultBody reads the $.toolUseId/$.data shape the design doc
+// declared for a tool_result turn. Kept because it is what this renderer was
+// written against; no source in the repo emits it.
+func legacyToolResultBody(rawJSON json.RawMessage) string {
 	var raw struct {
 		ToolUseID string          `json:"toolUseId"`
 		Data      json.RawMessage `json:"data"`
 	}
 
-	if err := json.Unmarshal(t.RawJSON, &raw); err != nil {
-		return t.Content
-	}
-
-	if len(raw.Data) == 0 {
+	if err := json.Unmarshal(rawJSON, &raw); err != nil || len(raw.Data) == 0 {
 		return ""
 	}
 
-	// Try to extract output from data
 	var data struct {
 		Output   string `json:"output"`
 		Content  string `json:"content"`
@@ -767,38 +873,24 @@ func (m *ConversationModel) renderToolResult(t models.Turn) string {
 	}
 
 	if err := json.Unmarshal(raw.Data, &data); err != nil {
-		// Just show truncated raw data
-		result := string(raw.Data)
-		if len(result) > 500 {
-			result = result[:500] + "..."
-		}
-		return dimStyle.Render(wrapText(result, m.width-4))
+		// A data object this does not understand: show it as the text it is.
+		return string(raw.Data)
 	}
 
-	var output string
 	switch {
 	case data.Output != "":
-		output = data.Output
+		return data.Output
 	case data.Stdout != "":
-		output = data.Stdout
 		if data.Stderr != "" {
-			output += "\n" + data.Stderr
+			return data.Stdout + "\n" + data.Stderr
 		}
+		return data.Stdout
 	case data.Content != "":
-		output = data.Content
+		return data.Content
 	case data.Result != "":
-		output = data.Result
+		return data.Result
 	}
-
-	if output == "" {
-		return ""
-	}
-
-	if len(output) > 1000 {
-		output = output[:1000] + "\n... (truncated)"
-	}
-
-	return codeStyle.Render(wrapText(output, m.width-4))
+	return ""
 }
 
 // renderMarkdown renders markdown text with glamour
