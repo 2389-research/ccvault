@@ -522,11 +522,19 @@ func checkpointIfWAL(ctx context.Context, q sqlRunner) error {
 // space would quietly downgrade a WAL archive. journal_mode lives in the
 // file header, so it survives the close.
 func restoreWALMode(ctx context.Context, dbPath string) error {
-	pool, err := sql.Open("sqlite", "file:"+dbPath)
+	// connectionDSN rather than a hand-rolled one: this is the second pool
+	// ccvault opens on the archive, and the settings it needs are the same
+	// ones every other connection gets, journal_size_limit included.
+	pool, err := sql.Open("sqlite", connectionDSN(dbPath))
 	if err != nil {
 		return fmt.Errorf("reopen compacted database: %w", err)
 	}
+	pool.SetMaxOpenConns(1)
 	defer func() { _ = pool.Close() }()
+
+	if err := persistWAL(ctx, pool); err != nil {
+		return err
+	}
 
 	var mode string
 	if err := pool.QueryRowContext(ctx, "PRAGMA journal_mode=WAL").Scan(&mode); err != nil {
@@ -534,6 +542,14 @@ func restoreWALMode(ctx context.Context, dbPath string) error {
 	}
 	if !strings.EqualFold(mode, "wal") {
 		return fmt.Errorf("restore WAL mode after compaction: journal_mode is %q (the compacted data is intact)", mode)
+	}
+
+	// journal_mode=WAL only writes the file header; the -wal and -shm files
+	// do not exist until something uses them, so a persisted WAL would have
+	// nothing to persist and the sidecars would still be missing after this
+	// close. A checkpoint creates both without writing any archive data.
+	if err := checkpointIfWAL(ctx, pool); err != nil {
+		return fmt.Errorf("create the write-ahead log of the compacted database (the compacted data is intact): %w", err)
 	}
 	return nil
 }

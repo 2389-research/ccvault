@@ -318,9 +318,62 @@ func TestCompact_LeavesNoTemporaryFilesBehind(t *testing.T) {
 	for _, e := range entries {
 		switch e.Name() {
 		case "ccvault.db":
+		// The sidecars of a WAL archive are not leftovers: a read-only
+		// opener cannot create them, so compaction has to leave them in
+		// place the way every Open* does. What this test is actually for is
+		// the .compacting scratch copy and its own journals.
+		case "ccvault.db-wal", "ccvault.db-shm":
 		default:
 			t.Errorf("unexpected leftover file in data dir: %s", e.Name())
 		}
+	}
+}
+
+// TestCompact_KeepsWALFilesForReadOnlyOpeners is the compaction half of
+// TestCloseKeepsWALFilesForReadOnlyOpeners. Compaction removes the sidecars
+// on purpose — they describe the file it is about to replace — and then puts
+// the compacted copy back into WAL mode, so it is the one command that can
+// leave a WAL archive without the files a read-only opener needs.
+//
+// Asserting they exist, not merely that they are allowed to: the
+// leftover-files test above permits them, which is not the same as requiring
+// them, and the whole bug is that nothing required them.
+func TestCompact_KeepsWALFilesForReadOnlyOpeners(t *testing.T) {
+	dataDir := bloatDB(t, 60, 5)
+	dbPath := filepath.Join(dataDir, dbFileName)
+
+	if _, err := Compact(dataDir); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+
+	// Stat before opening anything. modernc's own SQLite creates both
+	// sidecars on any open, read-only ones included, so a connection made
+	// first would manufacture the files this test is here to find.
+	for _, suffix := range []string{"-wal", "-shm"} {
+		fi, err := os.Stat(dbPath + suffix)
+		if err != nil {
+			t.Errorf("%s after compaction: %v (a read-only opener cannot create it)", suffix, err)
+			continue
+		}
+		if suffix == "-wal" && fi.Size() != 0 {
+			t.Errorf("%s is %d bytes after compaction, want 0 (journal_size_limit truncates it)", suffix, fi.Size())
+		}
+	}
+
+	// journal_mode is read over a read-only handle for the same reason the
+	// production code does it: asking for it on a read-write connection
+	// would set the very thing being checked.
+	ro, err := sql.Open("sqlite", "file:"+dbPath+"?mode=ro")
+	if err != nil {
+		t.Fatalf("open read-only: %v", err)
+	}
+	defer func() { _ = ro.Close() }()
+	var mode string
+	if err := ro.QueryRow("PRAGMA journal_mode").Scan(&mode); err != nil {
+		t.Fatalf("read journal_mode after compaction: %v", err)
+	}
+	if !strings.EqualFold(mode, "wal") {
+		t.Errorf("journal_mode after compaction = %q, want wal", mode)
 	}
 }
 

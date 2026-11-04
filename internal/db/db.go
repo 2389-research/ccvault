@@ -481,8 +481,17 @@ func persistWAL(ctx context.Context, sqlDB *sql.DB) error {
 		if !ok {
 			return fmt.Errorf("persist wal: driver connection %T has no FileControl", dc)
 		}
-		if _, err := fc.FileControlPersistWAL("main", 1); err != nil {
+		// The returned mode is what the VFS has after the call, so it is the
+		// read-back — no second query needed. Checking it is the same
+		// discipline as verifyConnectionPragmas: sqlite3_file_control reports
+		// SQLITE_OK from a VFS that ignored the op entirely, so without this
+		// a `?vfs=` override would silently restore the bug this prevents.
+		mode, err := fc.FileControlPersistWAL("main", 1)
+		if err != nil {
 			return fmt.Errorf("persist wal: %w", err)
+		}
+		if mode != 1 {
+			return fmt.Errorf("persist wal: the VFS reports persist_wal is %d, want 1", mode)
 		}
 		return nil
 	})

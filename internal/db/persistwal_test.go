@@ -1,5 +1,5 @@
 // ABOUTME: Tests that the WAL files survive Open/Close so read-only openers work
-// ABOUTME: Reproduces SQLITE_CANTOPEN for ?mode=ro after the last writer closes
+// ABOUTME: Asserts the sidecars exist before any connection could recreate them
 
 package db
 
@@ -34,6 +34,12 @@ func TestCloseKeepsWALFilesForReadOnlyOpeners(t *testing.T) {
 		t.Errorf("-wal is %d bytes after close, want 0 (journal_size_limit truncates it)", fi.Size())
 	}
 
+	// A smoke test, not the regression. modernc's bundled SQLite creates the
+	// sidecars itself on any open, read-only ones included, so this query
+	// succeeds with or without the fix — which is why the stat calls above
+	// come first and are what actually pins the behaviour. The failure this
+	// guards against is only observable from an external SQLite build
+	// (macOS system 3.51.0, Python's sqlite3), which no Go test can reach.
 	ro, err := sql.Open("sqlite", "file:"+path+"?mode=ro")
 	if err != nil {
 		t.Fatalf("open read-only: %v", err)
