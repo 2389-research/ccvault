@@ -1871,25 +1871,55 @@ var showCmd = &cobra.Command{
 		fmt.Println(strings.Repeat("=", 60))
 		fmt.Println()
 
-		for _, t := range turns {
-			switch t.Type {
-			case "user":
-				fmt.Printf("[USER] %s\n", t.Timestamp.Format("15:04:05"))
-				fmt.Println(t.Content)
-				fmt.Println()
-			case "assistant":
-				fmt.Printf("[ASSISTANT] %s\n", t.Timestamp.Format("15:04:05"))
-				content := t.Content
-				if len(content) > 500 {
-					content = content[:500] + "\n... (truncated)"
-				}
-				fmt.Println(content)
-				fmt.Println()
-			}
-		}
+		printSessionTurns(turns)
 
 		return nil
 	},
+}
+
+// printSessionTurns writes a session's conversation, one turn per block.
+//
+// The rule is #184's, which `show` never got: a turn is shown if it carries
+// text, labelled with the type as stored. The switch here used to list `user`
+// and `assistant` and have no default, so every other type was dropped without
+// a word — the same defect #184 fixed in the exporter and the conversation
+// view, measured there as 51,794 nanoclaw `system` turns silently missing.
+//
+// #185 is what made it cost something new. Retagging the archive's 315,985
+// mislabeled tool results would otherwise have removed them from `show`
+// altogether, where before they appeared — badly — under a `[USER]` header.
+//
+// `user` and `assistant` print their header whatever their content, because a
+// reader counting a conversation's shape needs those two even when the turn's
+// only block was a pasted screenshot with no words in it.
+func printSessionTurns(turns []models.Turn) {
+	for _, t := range turns {
+		label := "[" + strings.ToUpper(t.Type) + "]"
+		switch t.Type {
+		case "user", "assistant":
+		default:
+			if t.Content == "" {
+				continue
+			}
+		}
+
+		fmt.Printf("%s %s\n", label, t.Timestamp.Format("15:04:05"))
+		fmt.Println(truncateRunes(t.Content, 500))
+		fmt.Println()
+	}
+}
+
+// truncateRunes cuts s to maxRunes characters and says so.
+//
+// Characters rather than bytes: a byte cut can land inside a multi-byte rune
+// and leave the terminal a fragment to draw. The whole of the turn is in the
+// archive for a reader who needs it, and `ccvault export` writes it.
+func truncateRunes(s string, maxRunes int) string {
+	runes := []rune(s)
+	if len(runes) <= maxRunes {
+		return s
+	}
+	return string(runes[:maxRunes]) + "\n... (truncated)"
 }
 
 var exportCmd = &cobra.Command{
