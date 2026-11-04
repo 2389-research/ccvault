@@ -523,10 +523,28 @@ func (s *Server) handleToolsList(req *jsonRPCRequest) {
 						Type:        "number",
 						Description: "Turns per page (default: 20, max: 50)",
 					},
+					// Deliberately unconstrained. This used to carry
+					// Enum: ["user", "assistant", "tool_result"], which was
+					// wrong in both directions: `tool_result` has no rows in
+					// the author's 50,000-session archive — it was declared in
+					// the design doc and no source emits it — while `system`
+					// and `attachment` have tens of thousands and went
+					// unadvertised. The filter is `AND type = ?` and accepts
+					// any string, so the enum named a capability that did not
+					// exist and withheld two that did, and contradicted
+					// get_session_summary beside it, which reports every type
+					// a session holds.
+					//
+					// Relisting today's types would move the error rather than
+					// fix it: an adapter can add a type at any time, and a
+					// given archive may hold none of the ones named. The
+					// description points at the tool that answers it from the
+					// rows.
 					"type": {
-						Type:        "string",
-						Description: "Filter by turn type",
-						Enum:        []string{"user", "assistant", "tool_result"},
+						Type: "string",
+						Description: "Filter by turn type, e.g. \"user\", \"assistant\", \"system\". Any type the " +
+							"archive stores is accepted; which types a session actually holds, with counts, " +
+							"comes from get_session_summary.",
 					},
 				},
 				Required: []string{"session_id"},
@@ -1525,10 +1543,19 @@ func (s *Server) getSession(args map[string]interface{}) (interface{}, error) {
 		}, nil
 	}
 
+	// What each turn called, read from tool_uses rather than out of the turn's
+	// raw_json: that is the one place every source records a call (#179), and
+	// a codex turn's calls are not in its raw_json at all.
+	toolCalls, err := s.db.SessionToolCallsByTurn(sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get tool calls: %w", err)
+	}
+
 	// Export to markdown for smaller sessions
 	var buf strings.Builder
 	exporter := export.NewMarkdownExporter(
 		export.WithThinking(false), // Skip thinking to reduce size
+		export.WithToolCalls(toolCalls),
 	)
 	if err := exporter.Export(&buf, session, turns, projectPath); err != nil {
 		return nil, fmt.Errorf("export failed: %w", err)
@@ -2076,11 +2103,19 @@ func (s *Server) promptReviewSession(args map[string]interface{}) (promptGetResu
 		s.log("%s", projectWarning)
 	}
 
+	// What each turn called, from tool_uses (#179) — a review prompt that
+	// omitted a codex session's calls would be reviewing its prose alone.
+	toolCalls, err := s.db.SessionToolCallsByTurn(sessionID)
+	if err != nil {
+		return promptGetResult{}, fmt.Errorf("get tool calls: %w", err)
+	}
+
 	// Export to markdown for easier reading; the markdown IS the prompt,
 	// so a failed export must error rather than produce an empty review
 	var buf strings.Builder
 	exporter := export.NewMarkdownExporter(
 		export.WithThinking(false), // Skip thinking for summary
+		export.WithToolCalls(toolCalls),
 	)
 	if err := exporter.Export(&buf, session, turns, projectPath); err != nil {
 		return promptGetResult{}, fmt.Errorf("export session markdown: %w", err)

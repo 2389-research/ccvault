@@ -1949,10 +1949,19 @@ Examples:
 			}
 		}
 
+		// What each turn called, read from tool_uses rather than out of the
+		// turn's raw_json: that is the one place every source records a call
+		// (#179), and a codex turn's calls are not in its raw_json at all.
+		toolCalls, err := database.SessionToolCallsByTurn(sessionID)
+		if err != nil {
+			return fmt.Errorf("get tool calls: %w", err)
+		}
+
 		// Create exporter
 		exporter := export.NewMarkdownExporter(
 			export.WithThinking(includeThinking),
 			export.WithToolResults(includeToolResults),
+			export.WithToolCalls(toolCalls),
 		)
 
 		// Determine output destination
