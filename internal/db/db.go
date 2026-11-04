@@ -11,7 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	_ "modernc.org/sqlite"
+	sqlite "modernc.org/sqlite"
 )
 
 // Connection settings every ccvault connection must end up with. They are
@@ -53,6 +53,13 @@ const (
 	// committed transactions; the archive is a derived cache of the JSONL
 	// files, so a re-sync rebuilds anything lost.
 	synchronousNormal = 1
+
+	// walSizeLimitBytes is PRAGMA journal_size_limit. Every Open* sets
+	// SQLITE_FCNTL_PERSIST_WAL so ccvault.db-wal outlives the connection, and
+	// a persisted WAL keeps its high-water size unless a limit is set. With
+	// any limit, SQLite truncates the WAL to zero bytes on a clean close and
+	// to this size after a checkpoint resets it.
+	walSizeLimitBytes = 64 << 20
 )
 
 // connectionDSN builds the DSN for the archive.
@@ -82,8 +89,8 @@ const (
 // that forgets it — it discovers the DATETIME columns from the schema rather
 // than from a list someone has to remember to extend.
 func connectionDSN(dbPath string) string {
-	return fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(%d)&_pragma=synchronous(NORMAL)&_pragma=recursive_triggers(%d)",
-		dbPath, busyTimeoutMS, recursiveTriggersOn)
+	return fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(%d)&_pragma=synchronous(NORMAL)&_pragma=recursive_triggers(%d)&_pragma=journal_size_limit(%d)",
+		dbPath, busyTimeoutMS, recursiveTriggersOn, walSizeLimitBytes)
 }
 
 // DB wraps the SQLite database connection
@@ -203,6 +210,17 @@ func open(dataDir string, access archiveAccess) (*DB, error) {
 	sqlDB.SetMaxOpenConns(1)
 	sqlDB.SetMaxIdleConns(1)
 
+	// Keep ccvault.db-wal and -shm on disk after close. SQLite deletes both
+	// when the last connection to a WAL database closes, and a read-only
+	// opener (`sqlite3 -readonly`, `?mode=ro`) cannot recreate them, so every
+	// such reader fails with "unable to open database file" (SQLITE_CANTOPEN)
+	// until some read-write open runs. The pool holds one connection, so
+	// setting it here covers every statement this process runs.
+	if err := persistWAL(context.Background(), sqlDB); err != nil {
+		_ = sqlDB.Close()
+		return nil, err
+	}
+
 	// Read the settings back off the connection instead of trusting the DSN.
 	if err := verifyConnectionPragmas(context.Background(), sqlDB); err != nil {
 		_ = sqlDB.Close()
@@ -275,6 +293,10 @@ func verifyConnectionPragmas(ctx context.Context, q sqlRunner) error {
 	if err := q.QueryRowContext(ctx, "PRAGMA recursive_triggers").Scan(&recursiveTriggers); err != nil {
 		return fmt.Errorf("read back recursive_triggers: %w", err)
 	}
+	var walSizeLimit int64
+	if err := q.QueryRowContext(ctx, "PRAGMA journal_size_limit").Scan(&walSizeLimit); err != nil {
+		return fmt.Errorf("read back journal_size_limit: %w", err)
+	}
 
 	var mismatches []string
 	if !strings.EqualFold(journal, "wal") {
@@ -288,6 +310,9 @@ func verifyConnectionPragmas(ctx context.Context, q sqlRunner) error {
 	}
 	if recursiveTriggers != recursiveTriggersOn {
 		mismatches = append(mismatches, fmt.Sprintf("recursive_triggers is %d, want %d", recursiveTriggers, recursiveTriggersOn))
+	}
+	if walSizeLimit != walSizeLimitBytes {
+		mismatches = append(mismatches, fmt.Sprintf("journal_size_limit is %d, want %d", walSizeLimit, walSizeLimitBytes))
 	}
 
 	if len(mismatches) > 0 {
@@ -442,4 +467,32 @@ func (db *DB) WithTxContext(ctx context.Context, fn func(*sql.Tx) error) error {
 	}
 
 	return tx.Commit()
+}
+
+// persistWAL sets SQLITE_FCNTL_PERSIST_WAL on the pool's connection.
+func persistWAL(ctx context.Context, sqlDB *sql.DB) error {
+	conn, err := sqlDB.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("persist wal: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+	return conn.Raw(func(dc any) error {
+		fc, ok := dc.(sqlite.FileControl)
+		if !ok {
+			return fmt.Errorf("persist wal: driver connection %T has no FileControl", dc)
+		}
+		// The returned mode is what the VFS has after the call, so it is the
+		// read-back — no second query needed. Checking it is the same
+		// discipline as verifyConnectionPragmas: sqlite3_file_control reports
+		// SQLITE_OK from a VFS that ignored the op entirely, so without this
+		// a `?vfs=` override would silently restore the bug this prevents.
+		mode, err := fc.FileControlPersistWAL("main", 1)
+		if err != nil {
+			return fmt.Errorf("persist wal: %w", err)
+		}
+		if mode != 1 {
+			return fmt.Errorf("persist wal: the VFS reports persist_wal is %d, want 1", mode)
+		}
+		return nil
+	})
 }

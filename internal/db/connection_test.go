@@ -1,5 +1,5 @@
 // ABOUTME: Tests that the connection pragmas Open asks for are actually in effect
-// ABOUTME: Pins journal_mode, synchronous and busy_timeout read back from a real Open
+// ABOUTME: Pins journal_mode, synchronous, busy_timeout and journal_size_limit from a real Open
 
 package db
 
@@ -53,6 +53,14 @@ func TestOpenAppliesConnectionPragmas(t *testing.T) {
 	}
 	if recursiveTriggers != recursiveTriggersOn {
 		t.Errorf("recursive_triggers = %d, want %d", recursiveTriggers, recursiveTriggersOn)
+	}
+
+	var walSizeLimit int64
+	if err := db.QueryRow("PRAGMA journal_size_limit").Scan(&walSizeLimit); err != nil {
+		t.Fatalf("pragma journal_size_limit: %v", err)
+	}
+	if walSizeLimit != walSizeLimitBytes {
+		t.Errorf("journal_size_limit = %d, want %d", walSizeLimit, walSizeLimitBytes)
 	}
 }
 
@@ -141,7 +149,7 @@ func TestVerifyConnectionPragmasRejectsIgnoredOptions(t *testing.T) {
 	if err == nil {
 		t.Fatal("verifyConnectionPragmas accepted a connection where every option was ignored")
 	}
-	for _, want := range []string{"journal_mode", "busy_timeout", "recursive_triggers"} {
+	for _, want := range []string{"journal_mode", "busy_timeout", "recursive_triggers", "journal_size_limit"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not name %s", err, want)
 		}
