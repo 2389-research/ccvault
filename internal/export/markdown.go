@@ -67,7 +67,32 @@ func WithToolCalls(byTurn map[string][]db.ToolCall) MarkdownOption {
 	}
 }
 
-// NewMarkdownExporter creates a new markdown exporter
+// NewMarkdownExporter creates a new markdown exporter.
+//
+// includeToolResults stays true, and #185 is why that is now a decision rather
+// than an inheritance. The default was written when `tool_result` had no rows,
+// so it governed nothing; retagging the archive's 315,985 mislabeled results
+// made it govern every export.
+//
+// It stays true because the alternative hides the substance of an agent
+// session behind a flag nobody knows to pass. The test failure, the grep hits,
+// the error message that explains why the assistant did the next thing — an
+// assistant turn that says "let me read ipc.ts" followed by nothing is not a
+// transcript of what happened.
+//
+// The volume is bounded and was measured rather than feared. Each result is
+// previewed at 100 lines and image payloads are dropped by shape, so four real
+// sessions exported 1.33x, 1.35x, 2.91x and 3.11x their previous size — 54 KB
+// to 74 KB in the largest, 18 KB to 53 KB in the steepest. Bigger files, not
+// unusable ones.
+//
+// And neither default regresses, which is what settles it. With results off,
+// the export is still better than before #185: the blank `### 👤 User` headers
+// are gone, and one real nanoclaw session came out smaller than it used to be
+// (20,329 bytes against 22,082) with 38 empty headers removed. So a reader who
+// wants the old volume has --tool-results=false and loses nothing, while a
+// default of false would leave the person who does not know the flag exists
+// still reading the bug this fixed.
 func NewMarkdownExporter(opts ...MarkdownOption) *MarkdownExporter {
 	e := &MarkdownExporter{
 		includeToolResults: true,

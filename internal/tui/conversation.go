@@ -762,11 +762,22 @@ func (m *ConversationModel) renderToolResult(t models.Turn) string {
 		return ""
 	}
 
-	// Truncated at 1,000 characters, counted as characters rather than bytes
-	// so a cut cannot land inside a multi-byte rune and leave the terminal a
-	// fragment to draw. ToValidUTF8 besides, because the body is tool output
-	// nobody validated. The whole of it is in the turn's raw_json for a reader
-	// who needs it.
+	// Shown unconditionally, with no toggle, which #185 makes a decision
+	// rather than an inheritance: this renderer had no rows until the retag.
+	// The view already shows every other type that carries text (#184), so
+	// suppressing the one type that holds what the tools answered would be the
+	// inconsistency. Measured, the results take 20,478 characters of a real
+	// nanoclaw session against 14,516 in its other turns' content, and 42,820
+	// against 67,233 across three claude-code sessions — a substantial share of
+	// a view whose subject is what the agent did. A keybinding to hide them is
+	// human-facing surface nobody has asked for, and nothing yet measures the
+	// view as too noisy to read.
+	//
+	// Truncated at 1,000 characters — the existing cap, left where it was.
+	// Counted as characters rather than bytes so a cut cannot land inside a
+	// multi-byte rune and leave the terminal a fragment to draw. ToValidUTF8
+	// besides, because the body is tool output nobody validated. The whole of
+	// it is in the turn's raw_json for a reader who needs it.
 	runes := []rune(output)
 	if len(runes) > 1000 {
 		output = string(runes[:1000]) + "\n... (truncated)"
