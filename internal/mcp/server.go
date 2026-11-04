@@ -523,10 +523,28 @@ func (s *Server) handleToolsList(req *jsonRPCRequest) {
 						Type:        "number",
 						Description: "Turns per page (default: 20, max: 50)",
 					},
+					// Deliberately unconstrained. This used to carry
+					// Enum: ["user", "assistant", "tool_result"], which was
+					// wrong in both directions: `tool_result` has no rows in
+					// the author's 50,000-session archive — it was declared in
+					// the design doc and no source emits it — while `system`
+					// and `attachment` have tens of thousands and went
+					// unadvertised. The filter is `AND type = ?` and accepts
+					// any string, so the enum named a capability that did not
+					// exist and withheld two that did, and contradicted
+					// get_session_summary beside it, which reports every type
+					// a session holds.
+					//
+					// Relisting today's types would move the error rather than
+					// fix it: an adapter can add a type at any time, and a
+					// given archive may hold none of the ones named. The
+					// description points at the tool that answers it from the
+					// rows.
 					"type": {
-						Type:        "string",
-						Description: "Filter by turn type",
-						Enum:        []string{"user", "assistant", "tool_result"},
+						Type: "string",
+						Description: "Filter by turn type, e.g. \"user\", \"assistant\", \"system\". Any type the " +
+							"archive stores is accepted; which types a session actually holds, with counts, " +
+							"comes from get_session_summary.",
 					},
 				},
 				Required: []string{"session_id"},
