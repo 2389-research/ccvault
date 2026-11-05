@@ -381,11 +381,12 @@ func TestCompact_FailedRunKeepsWALFiles(t *testing.T) {
 	dataDir := bloatDB(t, 60, 5)
 	dbPath := filepath.Join(dataDir, dbFileName)
 
+	errInjected := errors.New("injected failure before the swap")
 	_, err := Compact(dataDir, withAfterCopy(func(string) error {
-		return errors.New("injected failure before the swap")
+		return errInjected
 	}))
-	if err == nil {
-		t.Fatal("compact succeeded, want the injected failure")
+	if !errors.Is(err, errInjected) {
+		t.Fatalf("compact error = %v, want the injected failure", err)
 	}
 
 	for _, suffix := range []string{"-wal", "-shm"} {
