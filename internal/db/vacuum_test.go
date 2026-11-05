@@ -377,6 +377,25 @@ func TestCompact_KeepsWALFilesForReadOnlyOpeners(t *testing.T) {
 	}
 }
 
+func TestCompact_FailedRunKeepsWALFiles(t *testing.T) {
+	dataDir := bloatDB(t, 60, 5)
+	dbPath := filepath.Join(dataDir, dbFileName)
+
+	errInjected := errors.New("injected failure before the swap")
+	_, err := Compact(dataDir, withAfterCopy(func(string) error {
+		return errInjected
+	}))
+	if !errors.Is(err, errInjected) {
+		t.Fatalf("compact error = %v, want the injected failure", err)
+	}
+
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if _, err := os.Stat(dbPath + suffix); err != nil {
+			t.Errorf("%s after a failed compaction: %v (a read-only opener cannot create it)", suffix, err)
+		}
+	}
+}
+
 func TestCompact_AlreadyCompactDatabaseSucceeds(t *testing.T) {
 	dataDir := bloatDB(t, 60, 60) // nothing deleted, so near-zero waste
 

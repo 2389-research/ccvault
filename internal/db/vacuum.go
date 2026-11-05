@@ -209,6 +209,12 @@ func Compact(dataDir string, opts ...CompactOption) (CompactResult, error) {
 	}
 	defer func() { _ = closePool() }()
 
+	// Without this, a run that refuses before the swap deletes the sidecars
+	// when it closes. Set before pinning, so the pinned connection has it.
+	if err := persistWAL(ctx, pool); err != nil {
+		return result, err
+	}
+
 	// Pin one connection: locking_mode is per-connection, so the lock has to
 	// be taken and held on the same handle that does the copy.
 	conn, err := pool.Conn(ctx)
